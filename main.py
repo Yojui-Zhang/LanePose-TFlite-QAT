@@ -1,17 +1,26 @@
 # qat_tf/qat_distill.py
 import os, glob
+
+os.environ["KERAS_BACKEND"] = "tensorflow"
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
+
 import tensorflow as tf
+from tensorflow import keras as K
+from tensorflow.keras import layers as L
 import tensorflow_model_optimization as tfmot
+
+
+
 import numpy as np
 import cv2
-import keras as K
-import u_8_s_pose_keras_qat as U
 
+import u_8_s_pose_keras_qat as cfg
 import config
 
 from importlib import reload
 from pathlib import Path
-from process import build_dataset, try_load_keras_model, distill_loss, _split_outputs, distill_loss_pose, distill_loss, rep_data_gen
+from process import build_dataset, try_load_keras_model, distill_loss, _split_outputs, distill_loss_pose, distill_loss, rep_data_gen, normalize_teacher_pred
 
 
 
@@ -32,17 +41,33 @@ def main():
 
 # =====================================
     # Student：Keras 可量化
-    reload(U)  # 確保載到最新
-    student = U.build_u8s_pose(
+    reload(cfg)  # 確保載到最新
+    
+    student = cfg.build_u8s_pose(
         input_shape=(config.IMGSZ, config.IMGSZ, 3),
         num_classes=config.NUM_CLS,
         num_kpt=config.NUM_KPT,
         kpt_vals=config.KPT_VALS
     )
+# ===============
+    # bad = []
+    # for l in student.submodules:
+    #     mod = getattr(l, "__module__", "")
+    #     if "tf_keras" not in mod:  # or: if not mod.startswith("tf_keras")
+    #         bad.append((l.name, l.__class__.__name__, mod))
+    # print(f"[CHECK] total layers: {len(student.submodules)}, offending: {len(bad)}")
+    # for name, cls, mod in bad[:20]:
+    #     print("  OFFENDER:", name, cls, mod)
+# ===============
 
-    print(type(student), isinstance(student, K.Model), getattr(student, "_is_graph_network", None))
+    # print(type(student), isinstance(student, K.Model), getattr(student, "_is_graph_network", None))
 
+    
     student = tfmot.quantization.keras.quantize_model(student)
+
+    # 檢查 QAT 層是否插入
+    qlayers = [l for l in student.submodules if "Quantize" in l.__class__.__name__]
+    print("[CHECK] quantization layers count:", len(qlayers))
 
 # =====================================
 
@@ -63,7 +88,7 @@ def main():
     #         return
 # =====================================
     # 權重對齊（clone_model 通常會複製權重；這裡保險起見再 copy 一次）
-    student.set_weights(teacher.get_weights())
+    # student.set_weights(teacher.get_weights())
 
     opt = tf.keras.optimizers.Adam(1e-4)
 
@@ -79,7 +104,7 @@ def main():
         return loss
 
     # 2) 建立無標註影像資料流（用你的訓練/驗證影像路徑萬用字元）
-    ds, n_files = build_dataset(img_glob="your_train_images/**/*.jpg", batch=config.BATCH)
+    ds, n_files = build_dataset(img_glob=config.REP_DIR, batch=config.BATCH)
     steps_per_epoch = max(1, n_files // config.BATCH)
 
     # =================== 一次性自檢開始 =======================
@@ -103,14 +128,14 @@ def main():
     # 前向一次，檢查 Teacher/Student 輸出 shape
     y_t_dbg = _pick_tensor(teacher(sample, training=False))
     y_s_dbg = _pick_tensor(student(sample, training=False))
-    print("[CHECK] teacher out:", y_t_dbg.shape, y_t_dbg.dtype)
+    print("\n\n[CHECK] teacher out:", y_t_dbg.shape, y_t_dbg.dtype)
     print("[CHECK] student out:", y_s_dbg.shape, y_s_dbg.dtype)
 
     # 針對 YOLO-Pose：確認最後維度是否符合 [5 + NUM_CLS + NUM_KPT*KPT_VALS]
     expected = 5 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
     feat_dim = int(y_t_dbg.shape[-1])
     if feat_dim != expected:
-        print(f"[WARN] teacher 最後維度={feat_dim} != 預期={expected}，"
+        print(f"\n[WARN] teacher 最後維度={feat_dim} != 預期={expected}，"
               f"請調整 _split_outputs() 的切片索引或確認實際輸出佈局。")
 
     # 乾跑一次 train_step，確認梯度可回傳、loss 無 NaN/Inf

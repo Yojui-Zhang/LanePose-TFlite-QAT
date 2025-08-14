@@ -1,7 +1,7 @@
 
-tensorflow==2.15.*
-tf-keras==2.15.*
 tensorflow-model-optimization==0.8.0
 ultralytics==8.3.166
 opencv-python
 numpy
+tf-keras==2.15.0
+tensorflow==2.15.0

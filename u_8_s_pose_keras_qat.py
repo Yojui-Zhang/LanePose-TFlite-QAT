@@ -1,94 +1,56 @@
 """
-Keras reimplementation of a lightweight YOLOv8s-Pose (anchor-free) forward model
-that outputs a single tensor shaped [B, N, 5 + num_classes + num_kpt*kpt_vals]
-with N = sum(H_i*W_i) over strides {8, 16, 32}. This is designed to be
-compatible with TensorFlow Model Optimization (tfmot) QAT and your distillation
-loop (teacher graph SavedModel -> student Keras model).
-
-Notes
------
-- Boxes are predicted as raw XYWH (no DFL). Obj, cls, and kpt score are logits.
-- Per-scale predictions are concatenated along the N dimension (B,N,C).
-- Backbone/neck loosely follow YOLOv8s (C2f + SPPF + PAN-FPN), but simplified.
-- Keep activations as SiLU (a.k.a. Swish) to match Ultralytics.
-- All layers are standard Keras so tfmot can insert fake-quant nodes.
-- **Keras 3 friendly**: avoid `tf.*` graph ops on KerasTensor; use `keras.layers`.
-
-Author: ChatGPT (GPT-5 Thinking)
+Pure-functional Keras builder for a lightweight YOLOv8s-Pose head.
+Uses ONLY built-in tf_keras layers so TFMOT can auto-quantize.
+Output: [B, N, 5 + num_classes + num_kpt*kpt_vals]
 """
+import os, sys
+os.environ["KERAS_BACKEND"] = "tensorflow"
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
+# ----------------------------------------------
 
 from typing import Tuple
 import tensorflow as tf
+from tensorflow import keras as K
 from tensorflow.keras import layers as L
+import tensorflow_model_optimization as tfmot
 
-# ---------------------------- Building Blocks ---------------------------- #
 
-def SiLU(x):
-    return tf.nn.silu(x)
+def conv_bn_act(x, out_ch: int, k: int = 3, s: int = 1, name: str = None):
+    x = L.Conv2D(out_ch, k, strides=s, padding='same', use_bias=False,
+                 name=None if not name else f"{name}/conv")(x)
+    x = L.BatchNormalization(name=None if not name else f"{name}/bn")(x)
+    # use built-in swish to avoid Lambda
+    x = L.Activation('swish', name=None if not name else f"{name}/swish")(x)
+    return x
 
-class ConvBNAct(L.Layer):
-    def __init__(self, out_ch: int, k: int = 3, s: int = 1, name: str = None):
-        super().__init__(name=name)
-        p = 'same'
-        self.conv = L.Conv2D(out_ch, k, strides=s, padding=p, use_bias=False)
-        self.bn = L.BatchNormalization()
+def c2f_block(x, out_ch: int, n: int = 2, name: str = None):
+    y = conv_bn_act(x, out_ch, k=1, s=1, name=None if not name else f"{name}/cv1")
+    parts = [y]
+    for i in range(n):
+        y = conv_bn_act(y, out_ch, k=3, s=1, name=None if not name else f"{name}/m{i}")
+        parts.append(y)
+    z = L.Concatenate(axis=-1, name=None if not name else f"{name}/concat")(parts)
+    z = conv_bn_act(z, out_ch, k=1, s=1, name=None if not name else f"{name}/cv2")
+    return z
 
-    def call(self, x, training=False):
-        x = self.conv(x)
-        x = self.bn(x, training=training)
-        return SiLU(x)
+def sppf_block(x, out_ch: int, k: int = 5, name: str = None):
+    x1 = conv_bn_act(x, out_ch, k=1, s=1, name=None if not name else f"{name}/cv1")
+    p1 = L.MaxPool2D(pool_size=k, strides=1, padding='same',
+                     name=None if not name else f"{name}/p1")(x1)
+    p2 = L.MaxPool2D(pool_size=k, strides=1, padding='same',
+                     name=None if not name else f"{name}/p2")(p1)
+    p3 = L.MaxPool2D(pool_size=k, strides=1, padding='same',
+                     name=None if not name else f"{name}/p3")(p2)
+    cat = L.Concatenate(axis=-1, name=None if not name else f"{name}/cat")([x1, p1, p2, p3])
+    y = conv_bn_act(cat, out_ch, k=1, s=1, name=None if not name else f"{name}/cv2")
+    return y
 
-class C2f(L.Layer):
-    """Simplified C2f (Cross-Stage Partial w/ more fusions).
-    Args:
-        out_ch: output channels
-        n: number of internal convs
-    """
-    def __init__(self, out_ch: int, n: int = 2, name: str = None):
-        super().__init__(name=name)
-        self.cv1 = ConvBNAct(out_ch, k=1, s=1)
-        self.m = [ConvBNAct(out_ch, k=3, s=1) for _ in range(n)]
-        self.cv2 = ConvBNAct(out_ch, k=1, s=1)
-        self.concat = L.Concatenate(axis=-1)
-
-    def call(self, x, training=False):
-        y = self.cv1(x, training=training)
-        parts = [y]
-        for block in self.m:
-            y = block(y, training=training)
-            parts.append(y)
-        x = self.concat(parts)
-        return self.cv2(x, training=training)
-
-class SPPF(L.Layer):
-    """Spatial Pyramid Pooling - Fast (as used by YOLOv5/8).
-    Use three maxpools with k=5 and concat.
-    """
-    def __init__(self, out_ch: int, k: int = 5, name: str = None):
-        super().__init__(name=name)
-        self.cv1 = ConvBNAct(out_ch, k=1, s=1)
-        self.pool = L.MaxPool2D(pool_size=k, strides=1, padding='same')
-        self.cv2 = ConvBNAct(out_ch, k=1, s=1)
-        self.concat = L.Concatenate(axis=-1)
-
-    def call(self, x, training=False):
-        x = self.cv1(x, training=training)
-        y1 = self.pool(x)
-        y2 = self.pool(y1)
-        y3 = self.pool(y2)
-        x = self.concat([x, y1, y2, y3])
-        return self.cv2(x, training=training)
-
-# ---------------------------- Model Builder ---------------------------- #
-
-def _make_head(x, out_ch: int, mid_ch: int):
-    """Detection head for a single scale. Keep logits for obj/cls/kpt score.
-    Returns per-cell predictions with shape [B, H, W, out_ch].
-    """
-    x = ConvBNAct(mid_ch, k=3, s=1)(x)
-    x = ConvBNAct(mid_ch, k=3, s=1)(x)
-    return L.Conv2D(out_ch, 1, padding='same')(x)  # logits for cls/obj/kpt score, raw for bbox
-
+def make_head(x, out_ch: int, mid_ch: int, name: str):
+    x = conv_bn_act(x, mid_ch, k=3, s=1, name=f"{name}/h1")
+    x = conv_bn_act(x, mid_ch, k=3, s=1, name=f"{name}/h2")
+    x = L.Conv2D(out_ch, 1, padding='same', name=f"{name}/out")(x)
+    return x
 
 def build_u8s_pose(
     input_shape: Tuple[int, int, int] = (640, 640, 3),
@@ -98,80 +60,60 @@ def build_u8s_pose(
     width_mult: float = 1.0,
     depth_mult: float = 1.0,
 ):
-    """Build a YOLOv8s-Pose-like Keras model (anchor-free) for QAT distillation.
-
-    Output: Tensor [B, N, C] where C = 5 + num_classes + num_kpt*kpt_vals.
-            The 5 = [x, y, w, h, obj_logit].
-    """
     C = 5 + num_classes + num_kpt * kpt_vals
 
-    def ch(c):
-        return max(8, int(c * width_mult))
-
-    def n(d):
-        return max(1, int(d * depth_mult))
+    def ch(c): return max(8, int(c * width_mult))
+    def n(d):  return max(1, int(d * depth_mult))
 
     inp = L.Input(shape=input_shape, name='images')
 
-    # ---------------- Backbone ----------------
-    x = ConvBNAct(ch(64), k=3, s=2, name='stem') (inp)      # 320x320
-    x = C2f(ch(64),  n(2), name='c2f_1')        (x)
+    # Backbone
+    x  = conv_bn_act(inp, ch(64),  k=3, s=2, name='stem')
+    x  = c2f_block(x, ch(64),  n(2), name='c2f_1')
 
-    x = ConvBNAct(ch(128), k=3, s=2, name='down_2')(x)      # 160x160
-    x = C2f(ch(128), n(3), name='c2f_2')        (x)
+    x  = conv_bn_act(x, ch(128), k=3, s=2, name='down_2')
+    x  = c2f_block(x, ch(128), n(3), name='c2f_2')
 
-    x = ConvBNAct(ch(256), k=3, s=2, name='down_3')(x)      # 80x80
-    c3 = C2f(ch(256), n(3), name='c2f_3')       (x)         # save for FPN (P3 base)
+    x  = conv_bn_act(x, ch(256), k=3, s=2, name='down_3')
+    c3 = c2f_block(x, ch(256), n(3), name='c2f_3')
 
-    x = ConvBNAct(ch(512), k=3, s=2, name='down_4')(c3)     # 40x40
-    c4 = C2f(ch(512), n(3), name='c2f_4')       (x)         # save for FPN (P4 base)
+    x  = conv_bn_act(c3, ch(512), k=3, s=2, name='down_4')
+    c4 = c2f_block(x, ch(512), n(3), name='c2f_4')
 
-    x = ConvBNAct(ch(512), k=3, s=2, name='down_5')(c4)     # 20x20
-    x = C2f(ch(512), n(3), name='c2f_5')        (x)
-    c5 = SPPF(ch(512), name='sppf')             (x)         # deepest (P5 base)
+    x  = conv_bn_act(c4, ch(512), k=3, s=2, name='down_5')
+    x  = c2f_block(x, ch(512), n(3), name='c2f_5')
+    c5 = sppf_block(x, ch(512), name='sppf')
 
-    # ---------------- Neck (FPN + PAN) ----------------
+    # Neck
     concat = L.Concatenate(axis=-1)
+    p5_up  = L.UpSampling2D(name='p5_up')(c5)
+    p4_td  = c2f_block(concat([p5_up, c4]), ch(256), n(2), name='p4_td')
 
-    # Top-down
-    p5_up = L.UpSampling2D()(c5)                               # 40x40
-    p4_td = C2f(ch(256), n(2), name='p4_td')(concat([p5_up, c4]))
+    p4_up  = L.UpSampling2D(name='p4_up')(p4_td)
+    p3_out = c2f_block(concat([p4_up, c3]), ch(128), n(2), name='p3_out')
 
-    p4_up = L.UpSampling2D()(p4_td)                            # 80x80
-    p3_out = C2f(ch(128), n(2), name='p3_out')(concat([p4_up, c3]))
+    p3_dn  = conv_bn_act(p3_out, ch(256), k=3, s=2, name='p3_down')
+    p4_out = c2f_block(concat([p3_dn, p4_td]), ch(256), n(2), name='p4_out')
 
-    # Bottom-up
-    p3_dn = ConvBNAct(ch(256), k=3, s=2, name='p3_down')(p3_out)  # 40x40
-    p4_out = C2f(ch(256), n(2), name='p4_out')(concat([p3_dn, p4_td]))
+    p4_dn  = conv_bn_act(p4_out, ch(512), k=3, s=2, name='p4_down')
+    p5_out = c2f_block(concat([p4_dn, c5]), ch(512), n(2), name='p5_out')
 
-    p4_dn = ConvBNAct(ch(512), k=3, s=2, name='p4_down')(p4_out)   # 20x20
-    p5_out = C2f(ch(512), n(2), name='p5_out')(concat([p4_dn, c5]))
+    # Head
+    out_p3 = make_head(p3_out, C, ch(128), name='head_p3')
+    out_p4 = make_head(p4_out, C, ch(256), name='head_p4')
+    out_p5 = make_head(p5_out, C, ch(512), name='head_p5')
 
-    # ---------------- Head (per-scale) ----------------
-    mid_p3, mid_p4, mid_p5 = ch(128), ch(256), ch(512)
-    out_p3 = _make_head(p3_out, C, mid_p3)  # [B,80,80,C]
-    out_p4 = _make_head(p4_out, C, mid_p4)  # [B,40,40,C]
-    out_p5 = _make_head(p5_out, C, mid_p5)  # [B,20,20,C]
+    # Flatten HW -> N，避免 Lambda：用 Reshape
+    f3 = L.Reshape(target_shape=(-1, C), name='flat_p3')(out_p3)
+    f4 = L.Reshape(target_shape=(-1, C), name='flat_p4')(out_p4)
+    f5 = L.Reshape(target_shape=(-1, C), name='flat_p5')(out_p5)
+    out = L.Concatenate(axis=1, name='preds')([f3, f4, f5])
 
-    def flatten_hw(x):
-        shp = tf.shape(x)
-        b, h, w, c = shp[0], shp[1], shp[2], shp[3]
-        x = tf.reshape(x, [b, h * w, c])
-        return x
+    return K.Model(inp, out, name='u8s_pose_keras')
 
-    f3 = L.Lambda(flatten_hw, name='flat_p3')(out_p3)
-    f4 = L.Lambda(flatten_hw, name='flat_p4')(out_p4)
-    f5 = L.Lambda(flatten_hw, name='flat_p5')(out_p5)
-    out = L.Concatenate(axis=1, name='preds')([f3, f4, f5])  # [B, 8400, C]
-
-    model = tf.keras.Model(inp, out, name='u8s_pose_keras')
-    return model
-
-
-# ---------------------------- Quick Self-Test ---------------------------- #
 if __name__ == '__main__':
     m = build_u8s_pose((640,640,3), num_classes=7, num_kpt=15, kpt_vals=3)
     m.summary(line_length=120)
     x = tf.random.uniform([2,640,640,3], 0, 1, dtype=tf.float32)
     y = m(x)
-    print('Output shape:', y.shape)  # expect (2, 8400, 5 + 7 + 15*3) = (2, 8400, 57)
+    print('Output shape:', y.shape)

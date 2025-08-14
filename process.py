@@ -36,6 +36,10 @@ def tf_parse(path):
 
 def build_dataset(img_glob, batch=config.BATCH, shuffle=True, repeat=True):
     files = sorted(glob.glob(img_glob))
+
+    if len(files) == 0:
+        raise FileNotFoundError(f"No images found for pattern: {img_glob}")
+
     ds = tf.data.Dataset.from_tensor_slices(files)
     if shuffle: ds = ds.shuffle(len(files))
     ds = ds.map(tf_parse, num_parallel_calls=tf.data.AUTOTUNE)
@@ -43,29 +47,115 @@ def build_dataset(img_glob, batch=config.BATCH, shuffle=True, repeat=True):
     if repeat: ds = ds.repeat()
     return ds, len(files)
 
+def normalize_teacher_pred(y, expected_C):
+    """
+    y: tensor with shape [B, ?, ?]
+    expected_C: int, 預期的 channel 數 (C)
+    returns: tensor shaped [B, N, expected_C]
+    """
+    # 確保是 tensor
+    y = tf.convert_to_tensor(y)
+
+    # 檢查 rank
+    rank = tf.rank(y)
+    if rank != 3:
+        raise ValueError(f"normalize_teacher_pred requires rank-3 tensor, got rank={int(rank)}")
+
+    # 使用動態 shape（支援 tf.function）
+    sh = tf.shape(y)               # [B, A, Bdim] or [B, N, C] ...
+    b = sh[0]
+    dim1 = sh[1]
+    dim2 = sh[2]
+    expected = tf.constant(expected_C, dtype=tf.int32)
+
+    # case 1: already [B, N, C] (最後維度等於 expected)
+    cond_last_is_expected = tf.equal(dim2, expected)
+
+    def _ret_as_is():
+        return y
+
+    # case 2: maybe [B, C, N] -> transpose to [B, N, C]
+    def _try_transpose():
+        y_t = tf.transpose(y, perm=[0, 2, 1])
+        # 確認 transpose 後最後維度為 expected
+        cond_after = tf.equal(tf.shape(y_t)[2], expected)
+        # 如果仍不符合，raise（在 tf.function 裡用 assert）
+        with tf.control_dependencies([tf.debugging.assert_equal(tf.shape(y_t)[2], expected,
+                                                               message="transpose did not produce expected C")]):
+            return tf.identity(y_t)
+
+    # if last dim already expected -> return y, else try transpose (will assert if fails)
+    result = tf.cond(cond_last_is_expected, _ret_as_is, _try_transpose)
+
+    return result
+
+
 # ---------- 載入 Keras 模型（優先 .keras / Keras SavedModel） ----------
+
 def try_load_keras_model(export_dir):
-    # 1) 直接用 keras loader
+    # 1) 優先用 tf.keras loader（若 SavedModel 是 Keras 格式就會成功）
     try:
         m = tf.keras.models.load_model(export_dir)
+        print("[INFO] Loaded with tf.keras.models.load_model")
         return m, True
-    except Exception:
-        pass
-    # 2) 退回 SavedModel signature -> 包成 Keras 可呼叫模型（可能無法被 tfmot 量化）
+    except Exception as e:
+        print("[INFO] tf.keras.models.load_model failed, falling back to saved_model signature:", e)
+
+    # 2) 用 saved_model.signatures["serving_default"] 包成 Keras-like wrapper
     saved = tf.saved_model.load(export_dir)
+    if "serving_default" not in saved.signatures:
+        raise RuntimeError("SavedModel has no 'serving_default' signature, can't wrap automatically.")
     fn = saved.signatures["serving_default"]
-    # 建立一個薄包裝層：輸入 [B,H,W,3] -> dict -> 取第一個輸出張量
+
+    # 取得 signature 的輸入/輸出名稱
+    input_keys = list(fn.structured_input_signature[1].keys())
+    if len(input_keys) != 1:
+        raise RuntimeError("SavedModel serving_default expects multiple inputs; wrapper only supports single-image input signatures.")
+    input_name = input_keys[0]
+
+    out_keys = list(fn.structured_outputs.keys())
+    if len(out_keys) == 0:
+        raise RuntimeError("SavedModel serving_default has no outputs.")
+    output_key = out_keys[0]
+
+    # 由 signature 的輸出推斷輸出 single-sample shape/dtype
+    out_spec_proto = fn.structured_outputs[output_key]
+    try:
+        out_shape_list = out_spec_proto.shape.as_list()  # e.g. [1, 56, 8400]
+    except Exception:
+        out_shape_list = list(out_spec_proto.shape)
+
+    out_dtype = out_spec_proto.dtype
+
+    # single-sample output spec: 去掉 batch 維 (index 0)
+    single_out_shape = tuple(out_shape_list[1:])  # e.g. (56, 8400)
+    single_out_spec = tf.TensorSpec(shape=single_out_shape, dtype=out_dtype)
+
     class SMWrapper(tf.keras.Model):
-        def __init__(self, concrete_fn):
+        def __init__(self, concrete_fn, input_name, output_key, single_out_spec):
             super().__init__()
             self.fn = concrete_fn
+            self.input_name = input_name
+            self.output_key = output_key
+            self.single_out_spec = single_out_spec
+
         @tf.function
         def call(self, x):
-            outs = self.fn(x)
-            # 取第一個 key（依實際 keys 調整）
-            key = list(outs.keys())[0]
-            return outs[key]
-    return SMWrapper(fn), False
+            # x: [B,H,W,3] float32
+            def single_fn(img):
+                img = tf.expand_dims(img, 0)  # -> [1,H,W,3]
+                out = self.fn(**{self.input_name: img})
+                # out[self.output_key] shape [1, ...]
+                return out[self.output_key][0]  # squeeze batch dim -> shape single_out_shape
+
+            # 使用 tf.map_fn 在 batch 維度上逐張呼叫 single_fn
+            mapped = tf.map_fn(single_fn, x, fn_output_signature=self.single_out_spec)
+            # mapped shape: [B, ...] ，直接回傳
+            return mapped
+
+    wrapped = SMWrapper(fn, input_name, output_key, single_out_spec)
+    print(f"[INFO] Wrapped SavedModel signature into Keras-like model. input_name={input_name}, output_key={output_key}, single_out_shape={single_out_shape}")
+    return wrapped, False
 
 # ---------- 蒸餾損失（簡化版） ----------
 def distill_loss(y_t, y_s, num_cls=config.NUM_CLS):
