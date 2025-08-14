@@ -1,16 +1,17 @@
 import tensorflow as tf
 
 IMGSZ = 640
-BATCH = 8
-EPOCHS = 10  # 可先跑 5~10 看收斂
+BATCH = 4
+EPOCHS = 2  # 可先跑 5~10 看收斂
 
-REP_DIR = "../dataset/lanepose/20220830/images/*.jpg"  # 代表集資料夾（放 500~1000 張）
+
+REP_DIR = "../dataset/lanepose/test/images/*.jpg"  # 代表集資料夾（放 500~1000 張）
 
 EXPORTED_DIR = "./lanepose20250807_s_model_640_640_6c_v1_saved_model/"  # Ultralytics 匯出路徑
 TFLITE_OUT = "./output/best_qat_int8.tflite"
 
 # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
-NUM_CLS = 7          # 你的資料集類別數
+NUM_CLS = 6          # 你的資料集類別數(0 ~ 6 = 7, -> ans = 6)
 NUM_KPT = 15         # 你的關鍵點數
 KPT_VALS = 3         # YOLOv8-Pose 預設每點 3 個值: (x, y, score/logit)
 # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝

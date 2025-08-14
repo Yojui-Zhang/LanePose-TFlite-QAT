@@ -3,17 +3,34 @@ Pure-functional Keras builder for a lightweight YOLOv8s-Pose head.
 Uses ONLY built-in tf_keras layers so TFMOT can auto-quantize.
 Output: [B, N, 5 + num_classes + num_kpt*kpt_vals]
 """
+# === TOP-OF-FILE SHIM: put this at the very top of main.py BEFORE any import of tfmot/keras/etc ===
 import os, sys
-os.environ["KERAS_BACKEND"] = "tensorflow"
+
+# Prefer tf.keras (legacy) and try to avoid independent keras
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
+os.environ["KERAS_BACKEND"] = "tensorflow"
 
-# ----------------------------------------------
-
-from typing import Tuple
+# Import tensorflow early
 import tensorflow as tf
 from tensorflow import keras as K
+
+# Force any "import keras" in other libs to resolve to tf.keras
+sys.modules["keras"] = K
+sys.modules["keras.models"] = K.models
+sys.modules["keras.layers"] = K.layers
+sys.modules["keras.activations"] = K.activations
+sys.modules["keras.initializers"] = K.initializers
+sys.modules["keras.utils"] = K.utils
+sys.modules["keras.losses"] = K.losses
+sys.modules["keras.backend"] = K.backend
+# ===========================================================
+
 from tensorflow.keras import layers as L
 import tensorflow_model_optimization as tfmot
+
+
+from typing import Tuple
+
 
 
 def conv_bn_act(x, out_ch: int, k: int = 3, s: int = 1, name: str = None):

@@ -47,46 +47,40 @@ def build_dataset(img_glob, batch=config.BATCH, shuffle=True, repeat=True):
     if repeat: ds = ds.repeat()
     return ds, len(files)
 
+
 def normalize_teacher_pred(y, expected_C):
     """
-    y: tensor with shape [B, ?, ?]
-    expected_C: int, 預期的 channel 數 (C)
-    returns: tensor shaped [B, N, expected_C]
+    將 teacher 輸出標準化為 [B, N, C]。
+    - 若輸入已是 [B, N, C]（最後維度 == expected_C），直接回傳。
+    - 若輸入是 [B, C, N]，嘗試 transpose -> [B, N, C] 並檢查最後維度是否為 expected_C。
+    - 否則在 graph 中會觸發 assert（會中止），並給出有意義錯誤訊息。
+    注意：此實作完全使用 TF ops，可在 @tf.function 中呼叫。
     """
-    # 確保是 tensor
     y = tf.convert_to_tensor(y)
+    # 確保 rank==3（會在 graph 中觸發檢查）
+    tf.debugging.assert_rank(y, 3, message="normalize_teacher_pred: input rank must be 3 (B,?,?)")
 
-    # 檢查 rank
-    rank = tf.rank(y)
-    if rank != 3:
-        raise ValueError(f"normalize_teacher_pred requires rank-3 tensor, got rank={int(rank)}")
-
-    # 使用動態 shape（支援 tf.function）
-    sh = tf.shape(y)               # [B, A, Bdim] or [B, N, C] ...
-    b = sh[0]
+    # 動態 shape
+    sh = tf.shape(y)
     dim1 = sh[1]
     dim2 = sh[2]
-    expected = tf.constant(expected_C, dtype=tf.int32)
+    expected = tf.cast(expected_C, dtype=dim2.dtype)
 
-    # case 1: already [B, N, C] (最後維度等於 expected)
+    # 判斷最後維度是否等於 expected_C
     cond_last_is_expected = tf.equal(dim2, expected)
 
-    def _ret_as_is():
+    def _return_as_is():
         return y
 
-    # case 2: maybe [B, C, N] -> transpose to [B, N, C]
-    def _try_transpose():
-        y_t = tf.transpose(y, perm=[0, 2, 1])
-        # 確認 transpose 後最後維度為 expected
-        cond_after = tf.equal(tf.shape(y_t)[2], expected)
-        # 如果仍不符合，raise（在 tf.function 裡用 assert）
-        with tf.control_dependencies([tf.debugging.assert_equal(tf.shape(y_t)[2], expected,
-                                                               message="transpose did not produce expected C")]):
-            return tf.identity(y_t)
+    def _try_transpose_and_check():
+        y_t = tf.transpose(y, perm=[0, 2, 1])  # [B, N, C] <- [B, C, N]
+        # 檢查 transpose 後最後維度是 expected_C，若不是會觸發 assert
+        tf.debugging.assert_equal(tf.shape(y_t)[2], expected,
+                                  message=("normalize_teacher_pred: after transpose, "
+                                           "last dim != expected_C"))
+        return y_t
 
-    # if last dim already expected -> return y, else try transpose (will assert if fails)
-    result = tf.cond(cond_last_is_expected, _ret_as_is, _try_transpose)
-
+    result = tf.cond(cond_last_is_expected, _return_as_is, _try_transpose_and_check)
     return result
 
 
