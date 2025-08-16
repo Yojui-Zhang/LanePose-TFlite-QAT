@@ -1,14 +1,14 @@
 import tensorflow as tf
 
 IMGSZ = 640
-BATCH = 4
-EPOCHS = 2  # 可先跑 5~10 看收斂
+BATCH = 2
+EPOCHS = 1  # 可先跑 5~10 看收斂
 
 
 REP_DIR = "../dataset/lanepose/test/images/*.jpg"  # 代表集資料夾（放 500~1000 張）
 
 EXPORTED_DIR = "./lanepose20250807_s_model_640_640_6c_v1_saved_model/"  # Ultralytics 匯出路徑
-TFLITE_OUT = "./output/best_qat_int8.tflite"
+TFLITE_OUT = "./output"
 
 # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
 NUM_CLS = 6          # 你的資料集類別數(0 ~ 6 = 7, -> ans = 6)
