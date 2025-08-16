@@ -6,8 +6,8 @@ import config
 # =============================================
 def distill_loss(y_t, y_s, num_cls=config.NUM_CLS):
     # 預期輸出 shape: [B, N, 5+num_cls] = [xywh, obj, cls...]
-    box_t, obj_t, cls_t = y_t[..., :4], y_t[..., 4:5], y_t[..., 5:5+num_cls]
-    box_s, obj_s, cls_s = y_s[..., :4], y_s[..., 4:5], y_s[..., 5:5+num_cls]
+    box_t, obj_t, cls_t = y_t[..., :4], y_t[..., 4:5], y_t[..., 5:4+num_cls]
+    box_s, obj_s, cls_s = y_s[..., :4], y_s[..., 4:5], y_s[..., 5:4+num_cls]
 
     box_l = tf.reduce_mean(tf.abs(box_t - box_s))
 
@@ -25,15 +25,22 @@ def distill_loss(y_t, y_s, num_cls=config.NUM_CLS):
 # =============================================
 
 def _split_outputs(y, num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS):
-    """把 [B,N,5+num_cls+num_kpt*kpt_vals] 切成 box/obj/cls/kpt(xy,s)"""
-    box = y[..., :4]                  # [B,N,4]
-    obj = y[..., 4:5]                 # [B,N,1]
-    cls = y[..., 5:5+num_cls]         # [B,N,num_cls]
-    kpt = y[..., 5+num_cls : 5+num_cls + num_kpt*kpt_vals]  # [B,N,num_kpt*kpt_vals]
-    kpt = tf.reshape(kpt, [-1, tf.shape(y)[1], num_kpt, kpt_vals])  # [B,N,K,3]
-    kxy = kpt[..., :2]                # [B,N,K,2]
-    ks  = kpt[..., 2:3]               # [B,N,K,1]  (關鍵點 score/logit)
+    C = tf.shape(y)[-1]
+    expect_no_obj   = 4 + num_cls + num_kpt * kpt_vals
+    expect_with_obj = 5 + num_cls + num_kpt * kpt_vals
+    has_obj = tf.equal(C, expect_with_obj)
+
+    box = y[..., :4]
+    cls_base  = tf.where(has_obj, 5, 4)
+    kpt_base  = cls_base + num_cls
+    obj = tf.cond(has_obj, lambda: y[..., 4:5], lambda: tf.zeros_like(y[..., :1]))
+    cls = y[..., cls_base:cls_base+num_cls]
+    kpt = y[..., kpt_base:kpt_base+num_kpt*kpt_vals]
+    kpt = tf.reshape(kpt, [-1, tf.shape(y)[1], num_kpt, kpt_vals])
+    kxy = kpt[..., :2]
+    ks  = kpt[..., 2:3]
     return box, obj, cls, kxy, ks
+
 
 def kl_div_weighted(p_t, p_s, weight):
     # 手寫 KL，支援 sample-wise 權重

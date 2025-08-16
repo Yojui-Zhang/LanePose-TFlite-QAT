@@ -22,8 +22,15 @@ def letterbox(img, new_size=config.IMGSZ):
                              cv2.BORDER_CONSTANT, value=(114,114,114))
     return img
 
+def _decode_path(p):
+    if isinstance(p, bytes):
+        return p.decode('utf-8')
+    return str(p)
+
 def parse_img(path):
-    bgr = cv2.imread(path.decode())
+
+    p = _decode_path(path)
+    bgr = cv2.imread(p)
     rgb = bgr[:, :, ::-1]
     img = letterbox(rgb, config.IMGSZ).astype(np.float32) / 255.0
     return img
@@ -153,8 +160,13 @@ def try_load_keras_model(export_dir):
 
 # ---------- 代表集 generator（給 TFLite） ----------
 def rep_data_gen():
-    paths = sorted(glob.glob(str(Path(config.REP_DIR) / "*")))
+    paths = sorted(glob.glob(config.REP_DIR))     # ← 這行改了
+
+    num_picture = 0
     for p in paths:
-        img = parse_img(p)  # float32 [H,W,3] /255
+        img = parse_img(p)                        # float32 [H,W,3] /255
         img = np.expand_dims(img, 0).astype(np.float32)
         yield [img]
+        num_picture += 1
+
+    print(f"\n\nRead the data = {num_picture}\n")

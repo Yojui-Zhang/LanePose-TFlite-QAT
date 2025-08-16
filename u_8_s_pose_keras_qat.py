@@ -1,7 +1,7 @@
 """
 Pure-functional Keras builder for a lightweight YOLOv8s-Pose head.
 Uses ONLY built-in tf_keras layers so TFMOT can auto-quantize.
-Output: [B, N, 5 + num_classes + num_kpt*kpt_vals]
+Output: [B, N, 4 + num_classes + num_kpt*kpt_vals]
 """
 # === TOP-OF-FILE SHIM: put this at the very top of main.py BEFORE any import of tfmot/keras/etc ===
 import os, sys
@@ -36,7 +36,7 @@ REG_MAX = 16
 NC = config.NUM_CLS
 NK = config.NUM_KPT
 KPT_DIM = config.KPT_VALS
-RAW_C = 4 * REG_MAX + 1 + NC + NK * KPT_DIM  # 每個格點的 raw 通道數
+RAW_C = 4 * REG_MAX + NC + NK * KPT_DIM  # 每個格點的 raw 通道數
 
 def conv_bn_act(x, out_ch: int, k: int = 3, s: int = 1, name: str = None):
     x = L.Conv2D(out_ch, k, strides=s, padding='same', use_bias=False,
@@ -90,9 +90,9 @@ def dfl_pose_head(p3, p4, p5, ch=128):
     reg4 = L.Conv2D(4*REG_MAX, 1, name='head.regout.p4')(r4)
     reg5 = L.Conv2D(4*REG_MAX, 1, name='head.regout.p5')(r5)
 
-    co3  = L.Conv2D(1+NC, 1, name='head.coout.p3')(c3)
-    co4  = L.Conv2D(1+NC, 1, name='head.coout.p4')(c4)
-    co5  = L.Conv2D(1+NC, 1, name='head.coout.p5')(c5)
+    co3  = L.Conv2D(NC, 1, name='head.coout.p3')(c3)
+    co4  = L.Conv2D(NC, 1, name='head.coout.p4')(c4)
+    co5  = L.Conv2D(NC, 1, name='head.coout.p5')(c5)
 
     kp3  = L.Conv2D(NK*KPT_DIM, 1, name='head.kptout.p3')(k3)
     kp4  = L.Conv2D(NK*KPT_DIM, 1, name='head.kptout.p4')(k4)
@@ -117,7 +117,7 @@ def build_u8s_pose(
     width_mult: float = 1.0,
     depth_mult: float = 1.0,
 ):
-    C = 5 + num_classes + num_kpt * kpt_vals
+    C = 4 + num_classes + num_kpt * kpt_vals
 
     def ch(c): return max(8, int(c * width_mult))
     def n(d):  return max(1, int(d * depth_mult))

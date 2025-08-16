@@ -39,17 +39,26 @@ PORDER = (0, 1, 2)
 GRID_MODES = (('col', 1, 0), ('row', 0, 0), ('col', 1, 0))
 
 # BEST channel mapping (official i -> your qat j)
+# CHANNEL_MAPPING = [
+#     0, 32, 50, 44, 33, 11, 1, 3, 25, 26, 4, 35, 14, 22, 53, 52,
+#     13, 23, 30, 5, 29, 27, 9, 34, 45, 7, 24, 21, 40, 17, 38, 48,
+#     31, 39, 37, 15, 54, 8, 28, 12, 16, 49, 2, 47, 51, 41, 10, 19,
+#     18, 6, 55, 20, 46, 36, 42, 43
+# ]
 CHANNEL_MAPPING = [
-    0, 32, 50, 44, 33, 11, 1, 3, 25, 26, 4, 35, 14, 22, 53, 52,
-    13, 23, 30, 5, 29, 27, 9, 34, 45, 7, 24, 21, 40, 17, 38, 48,
-    31, 39, 37, 15, 54, 8, 28, 12, 16, 49, 2, 47, 51, 41, 10, 19,
-    18, 6, 55, 20, 46, 36, 42, 43
+    0,1,2,3,4,5,6,7,8,9,
+    10,11,12,13,14,15,16,17,18,19,
+    20,21,22,23,24,25,26,27,28,29,
+    30,31,32,33,34,35,36,37,38,39,
+    40,41,42,43,44,45,46,47,48,49,
+    50,51,52,53,54,55
 ]
 
+
 # 如果你的 head 輸出是 xywh（多數情況），開啟這個把它轉成 [l,t,r,b]（以 grid center、stride 為基準）
-XYWH_TO_LTRB = True
+XYWH_TO_LTRB = False
 # 若你的 xywh 是 0~1 範圍（常見：/255 後的輸入），開啟這個把 xywh 乘上 IMGSZ 轉像素
-XYWH_IS_NORMALIZED_01 = True
+XYWH_IS_NORMALIZED_01 = False
 # ------------------------------------------------------------------------------------------------
 
 
@@ -82,7 +91,7 @@ def build_student_qat():
 
 def run_qat(student, teacher, ds, steps_per_epoch):
     opt = tf.keras.optimizers.Adam(1e-4)
-    expected_C = 5 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
+    expected_C = 4 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
 
     @tf.function
     def train_step(batch_imgs):
@@ -304,25 +313,37 @@ class ExportModule(tf.Module):
             # replace first 4 channels with ltrb distances
             out_nc = tf.concat([box_ltrb, out_nc[:, :, 4:]], axis=-1)
 
+        raw_xywh = out_nc[:, :, 0:4]
+        xy = tf.math.sigmoid(raw_xywh[:, :, 0:2])
+        wh = tf.math.sigmoid(raw_xywh[:, :, 2:4])
+        out_nc = tf.concat([tf.concat([xy, wh], axis=-1), out_nc[:, :, 4:]], axis=-1)
+
         # --- activations for objectness / cls / keypoint v
         C = self.C
         nc = int(config.NUM_CLS)
         kdim = int(config.KPT_VALS)
-        nk = (C - 5 - nc) // kdim
-        obj = tf.math.sigmoid(out_nc[:, :, 4:5])
-        cls = tf.math.sigmoid(out_nc[:, :, 5:5+nc])
-        kpt = out_nc[:, :, 5+nc:5+nc+nk*kdim]
-        # apply sigmoid to v only
+        nk = (C - 4 - nc) // kdim
+
+        # 先取出 logits
+        cls_logit = out_nc[:, :, 4:4+nc]        # <-- class 緊接在 xywh 後
+        kpt      = out_nc[:, :, 4+nc:4+nc+nk*kdim]
+
+        # 從舊 teacher 的語義推斷：class 應該是已 gated 的 conf
+        # 若你仍有 obj logit，可在 head 內部先算 conf = sigmoid(obj)*sigmoid(raw_cls)
+        # 但匯出這層只保留 class 機率，不保留獨立 obj 通道
+        cls = tf.math.sigmoid(cls_logit)
+
+        # keypoint 只對 v 走 sigmoid
         N_dyn = tf.shape(out_nc)[1]
         kpt4 = tf.reshape(kpt, [-1, N_dyn, nk, kdim])
         xy = kpt4[..., :2]
         v  = tf.math.sigmoid(kpt4[..., 2:3])
         kpt = tf.reshape(tf.concat([xy, v], axis=-1), [-1, N_dyn, nk*kdim])
 
-        pred_ultra = tf.concat([out_nc[:, :, 0:4], obj, cls, kpt], axis=-1)  # (B,N,C)
-        out_cn = tf.transpose(pred_ultra, [0, 2, 1])  # (B,C,N)
-        out_cn = tf.reshape(out_cn, [1, C, -1])
-        return {"output0": out_cn}
+        # 產生和舊模型一致的輸出：[xywh, cls, kpt]
+        pred_ultra = tf.concat([out_nc[:, :, 0:4], cls, kpt], axis=-1)  # (B,N, 4+nc+nk*kdim)
+        out_cn = tf.transpose(pred_ultra, [0, 2, 1])                    # (B,C,N)
+        return {"output0": tf.reshape(out_cn, [1, C, -1])}
 
 
 def main():
@@ -348,7 +369,7 @@ def main():
     N4 = (config.IMGSZ // 16) * (config.IMGSZ // 16)  # 40*40
     N5 = (config.IMGSZ // 32) * (config.IMGSZ // 32)  # 20*20
     N = N3 + N4 + N5
-    C = 5 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
+    C = 4 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
     print("Expected N, C:", N, C)
 
     # 6) Strip QAT wrappers
