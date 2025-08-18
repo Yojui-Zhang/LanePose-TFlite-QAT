@@ -2,28 +2,6 @@
 import tensorflow as tf
 import config
 
-
-# =============================================
-def distill_loss(y_t, y_s, num_cls=config.NUM_CLS):
-    # 預期輸出 shape: [B, N, 5+num_cls] = [xywh, obj, cls...]
-    box_t, obj_t, cls_t = y_t[..., :4], y_t[..., 4:5], y_t[..., 5:4+num_cls]
-    box_s, obj_s, cls_s = y_s[..., :4], y_s[..., 4:5], y_s[..., 5:4+num_cls]
-
-    box_l = tf.reduce_mean(tf.abs(box_t - box_s))
-
-    bce = tf.keras.losses.BinaryCrossentropy(from_logits=True)
-    obj_l = bce(obj_t, obj_s)
-
-    # 溫度可調，例如 2.0
-    p_t = tf.nn.softmax(cls_t)
-    p_s = tf.nn.softmax(cls_s)
-    kl = tf.keras.losses.KLDivergence()
-    cls_l = kl(p_t, p_s)
-
-    return box_l + obj_l + cls_l
-
-# =============================================
-
 def _split_outputs(y, num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS):
     C = tf.shape(y)[-1]
     expect_no_obj   = 4 + num_cls + num_kpt * kpt_vals
@@ -59,7 +37,11 @@ def distill_loss_pose(y_teacher, y_student,
     box_s, obj_s, cls_s, kxy_s, ks_s = _split_outputs(y_student, num_cls, num_kpt, kpt_vals)
 
     # 物件度權重（抑制背景框）
-    w_obj = tf.stop_gradient(tf.nn.sigmoid(obj_t))  # [B,N,1]
+    # w_obj = tf.stop_gradient(tf.nn.sigmoid(obj_t))  # [B,N,1]
+    # 老師沒有 obj 通道時，用 class 機率當權重
+    p_t = tf.nn.softmax(cls_t)
+    w_obj = tf.reduce_max(p_t, axis=-1, keepdims=True)  # [B,N,1]
+
 
     # Box: L1，加權
     box_l = tf.reduce_mean(w_obj * tf.abs(box_t - box_s))

@@ -45,12 +45,35 @@ def build_dataset(img_glob, batch=config.BATCH, shuffle=True, repeat=True):
 
     if len(files) == 0:
         raise FileNotFoundError(f"No images found for pattern: {img_glob}")
+    else:
+        print(f"Read image:{len(files)}")
 
     ds = tf.data.Dataset.from_tensor_slices(files)
     if shuffle: ds = ds.shuffle(len(files))
     ds = ds.map(tf_parse, num_parallel_calls=tf.data.AUTOTUNE)
     ds = ds.batch(batch).prefetch(tf.data.AUTOTUNE)
+    # ds = ds.batch(batch).prefetch(0)
     if repeat: ds = ds.repeat()
+# ========================================
+    # # 建議順序：... .shuffle(...).repeat().batch(...).prefetch(...)
+    # ds = ds.batch(batch, drop_remainder=True)
+
+    # # 固定一個小 prefetch buffer，避免觸發 RAM 預算警告
+    # ds = ds.prefetch(1)
+
+    # # (可選) 開 auto-tune 但加大 RAM 預算（新一點的 TF 版本才支援）
+    # opt = tf.data.Options()
+    # try:
+    #     opt.autotune.enabled = True
+    #     opt.autotune.ram_budget = 512 * 1024 * 1024   # 512 MB
+    # except Exception:
+    #     pass
+    # ds = ds.with_options(opt)
+
+    # if repeat: 
+    #     ds = ds.repeat()
+# ========================================
+
     return ds, len(files)
 
 

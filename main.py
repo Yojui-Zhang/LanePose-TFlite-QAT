@@ -16,6 +16,10 @@ sys.modules["keras.losses"] = K.losses
 sys.modules["keras.backend"] = K.backend
 # =====================================================================================
 
+# from tensorflow.keras import mixed_precision
+# mixed_precision.set_global_policy("mixed_float16")  # ← AMP 開啟
+
+
 from tensorflow.keras import layers as L
 import tensorflow_model_optimization as tfmot
 from pathlib import Path
@@ -30,37 +34,6 @@ from process import (
     rep_data_gen, normalize_teacher_pred
 )
 from loss import distill_loss_pose
-
-# ---------------------------- alignment knobs (from your search) ----------------------------
-# BEST P-order: (0, 1, 2)  -> P3, P4, P5
-PORDER = (0, 1, 2)
-
-# BEST grid modes: (('col',1,0), ('row',0,0), ('col',1,0)) for P3, P4, P5
-GRID_MODES = (('col', 1, 0), ('row', 0, 0), ('col', 1, 0))
-
-# BEST channel mapping (official i -> your qat j)
-# CHANNEL_MAPPING = [
-#     0, 32, 50, 44, 33, 11, 1, 3, 25, 26, 4, 35, 14, 22, 53, 52,
-#     13, 23, 30, 5, 29, 27, 9, 34, 45, 7, 24, 21, 40, 17, 38, 48,
-#     31, 39, 37, 15, 54, 8, 28, 12, 16, 49, 2, 47, 51, 41, 10, 19,
-#     18, 6, 55, 20, 46, 36, 42, 43
-# ]
-CHANNEL_MAPPING = [
-    0,1,2,3,4,5,6,7,8,9,
-    10,11,12,13,14,15,16,17,18,19,
-    20,21,22,23,24,25,26,27,28,29,
-    30,31,32,33,34,35,36,37,38,39,
-    40,41,42,43,44,45,46,47,48,49,
-    50,51,52,53,54,55
-]
-
-
-# 如果你的 head 輸出是 xywh（多數情況），開啟這個把它轉成 [l,t,r,b]（以 grid center、stride 為基準）
-XYWH_TO_LTRB = False
-# 若你的 xywh 是 0~1 範圍（常見：/255 後的輸入），開啟這個把 xywh 乘上 IMGSZ 轉像素
-XYWH_IS_NORMALIZED_01 = False
-# ------------------------------------------------------------------------------------------------
-
 
 def enable_gpu_mem_growth():
     gpus = tf.config.list_physical_devices('GPU')
@@ -88,33 +61,111 @@ def build_student_qat():
     print("[CHECK] quantization layers count:", len(qlayers))
     return student
 
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+
+# def run_qat(student, teacher, ds, steps_per_epoch):
+#     opt = tf.keras.optimizers.Adam(config.end_lr)
+#     expected_C = 4 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
+
+#     @tf.function
+#     def train_step(batch_imgs):
+#         # 老師放到 Tape 外，並切斷梯度
+#         y_t = teacher(batch_imgs, training=False)
+#         y_t = tf.stop_gradient(normalize_teacher_pred(y_t, expected_C=expected_C))
+#         with tf.GradientTape() as tape:
+#             y_s = student(batch_imgs, training=True)
+#             loss = distill_loss_pose(y_t, y_s, config.NUM_CLS, config.NUM_KPT, config.KPT_VALS)
+#         grads = tape.gradient(loss, student.trainable_variables)
+#         opt.apply_gradients(zip(grads, student.trainable_variables))
+#         return loss
+
+#     # dry-run
+#     it = iter(ds)
+#     sample = next(it)
+#     y_tn = normalize_teacher_pred(teacher(sample, training=False), expected_C=expected_C)
+#     y_sn = (student(sample, training=False))
+#     print("[CHECK] teacher out (normalized):", y_tn.shape, y_tn.dtype)
+#     print("[CHECK] student out (probe):     ", y_sn.shape, y_sn.dtype)
+#     l = float(train_step(sample))
+#     print(f"[CHECK] dry-run distill_loss={l:.6f}")
+
+#     # epochs
+#     for e in range(config.EPOCHS):
+#         it = iter(ds)
+#         for _ in range(steps_per_epoch):
+#             imgs = next(it)
+#             loss = train_step(imgs)
+#         print(f"Epoch {e+1}/{config.EPOCHS}  distill_loss={float(loss):.4f}")
+
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
 
 def run_qat(student, teacher, ds, steps_per_epoch):
-    opt = tf.keras.optimizers.Adam(1e-4)
+
+    # 1) 冷凍 BN（QAT 推薦）
+    for l in student.submodules:
+        if isinstance(l, tf.keras.layers.BatchNormalization):
+            l.trainable = False
+
+    # 2) 定義 Warmup + Cosine 的 LR Schedule
+    class WarmupCosine(tf.keras.optimizers.schedules.LearningRateSchedule):
+        def __init__(self, base_lr, end_lr, warmup_steps, total_steps):
+            super().__init__()
+            self.base_lr = float(base_lr)
+            self.end_lr = float(end_lr)
+            self.warmup_steps = int(warmup_steps)
+            self.total_steps  = int(max(total_steps, warmup_steps + 1))
+
+        def __call__(self, step):
+            step = tf.cast(step, tf.float32)
+            ws = tf.cast(self.warmup_steps, tf.float32)
+            ts = tf.cast(self.total_steps, tf.float32)
+            warm = self.base_lr * (step + 1.0) / tf.maximum(ws, 1.0)
+            t = (step - ws) / tf.maximum(ts - ws, 1.0)
+            cos = self.end_lr + 0.5 * (self.base_lr - self.end_lr) * (1.0 + tf.cos(np.pi * t))
+            return tf.where(step < ws, warm, cos)
+
+        def get_config(self):
+            return {
+                "base_lr": self.base_lr,
+                "end_lr": self.end_lr,
+                "warmup_steps": self.warmup_steps,
+                "total_steps": self.total_steps,
+            }
+
+    # 3) 取得步數與超參（config 若沒這些欄位就給預設）
+    steps_per_epoch = int(steps_per_epoch)
+    total_steps = max(1, int(getattr(config, "EPOCHS", 20)) * steps_per_epoch)
+    warmup_steps = min(1000, max(1, total_steps // 10))
+
+    base_lr = config.base_lr   # 批次小就降到 2e-3
+    end_lr  = config.end_lr
+    momentum = config.momentum
+
+    schedule = WarmupCosine(base_lr=base_lr, end_lr=end_lr,
+                            warmup_steps=warmup_steps, total_steps=total_steps)
+
+    # 4) 建立 SGD（用 schedule，不要呼叫 lr_fn(...)）
+    opt = tf.keras.optimizers.SGD(
+        learning_rate=schedule,
+        momentum=momentum,
+        nesterov=True,
+        clipnorm=1.0,
+    )
+
     expected_C = 4 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
 
     @tf.function
     def train_step(batch_imgs):
+        # 老師放到 Tape 外，並切斷梯度
+        y_t = teacher(batch_imgs, training=False)
+        y_t = tf.stop_gradient(normalize_teacher_pred(y_t, expected_C=expected_C))
         with tf.GradientTape() as tape:
-            y_t = teacher(batch_imgs, training=False)
-            y_t = normalize_teacher_pred(y_t, expected_C=expected_C)   # -> [B,N,C]
             y_s = student(batch_imgs, training=True)
             loss = distill_loss_pose(y_t, y_s, config.NUM_CLS, config.NUM_KPT, config.KPT_VALS)
         grads = tape.gradient(loss, student.trainable_variables)
         opt.apply_gradients(zip(grads, student.trainable_variables))
         return loss
 
-    # dry-run
-    it = iter(ds)
-    sample = next(it)
-    y_tn = normalize_teacher_pred(teacher(sample, training=False), expected_C=expected_C)
-    y_sn = (student(sample, training=False))
-    print("[CHECK] teacher out (normalized):", y_tn.shape, y_tn.dtype)
-    print("[CHECK] student out (probe):     ", y_sn.shape, y_sn.dtype)
-    l = float(train_step(sample))
-    print(f"[CHECK] dry-run distill_loss={l:.6f}")
-
-    # epochs
     for e in range(config.EPOCHS):
         it = iter(ds)
         for _ in range(steps_per_epoch):
@@ -122,6 +173,7 @@ def run_qat(student, teacher, ds, steps_per_epoch):
             loss = train_step(imgs)
         print(f"Epoch {e+1}/{config.EPOCHS}  distill_loss={float(loss):.4f}")
 
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
 
 def choose_student_split_order(student_infer, teacher, sample_one, N3, N4, N5, expected_C):
     # Teacher normalized
@@ -185,8 +237,8 @@ class ExportModule(tf.Module):
        - final (1,C,N) with name 'output0'
     """
     def __init__(self, model, C, lens_perm, reorder_idx,
-                 grid_modes=GRID_MODES, porder=PORDER, ch_map=CHANNEL_MAPPING,
-                 xywh_to_ltrb=XYWH_TO_LTRB, xywh_is_norm01=XYWH_IS_NORMALIZED_01):
+                 grid_modes=config.GRID_MODES, porder=config.PORDER, ch_map=config.CHANNEL_MAPPING,
+                 xywh_to_ltrb=config.XYWH_TO_LTRB, xywh_is_norm01=config.XYWH_IS_NORMALIZED_01):
         super().__init__()
         self.model = model
         self.C = int(C)
@@ -394,8 +446,8 @@ def main():
     # 8) Export SavedModel (float I/O, fixed batch=1)
     export_mod = ExportModule(
         student_infer, C=C, lens_perm=lens_perm, reorder_idx=reorder_idx,
-        grid_modes=GRID_MODES, porder=PORDER, ch_map=CHANNEL_MAPPING,
-        xywh_to_ltrb=XYWH_TO_LTRB, xywh_is_norm01=XYWH_IS_NORMALIZED_01
+        grid_modes=config.GRID_MODES, porder=config.PORDER, ch_map=config.CHANNEL_MAPPING,
+        xywh_to_ltrb=config.XYWH_TO_LTRB, xywh_is_norm01=config.XYWH_IS_NORMALIZED_01
     )
 
     SAVE_DIR = str(Path(config.TFLITE_OUT) / "qat_saved_model_fixed_fpIO")
