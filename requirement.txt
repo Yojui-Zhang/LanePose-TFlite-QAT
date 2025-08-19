@@ -2,6 +2,8 @@
 tensorflow-model-optimization==0.8.0
 opencv-python
 numpy
+tqdm
+matplotlib
 tf-keras==2.15.0
 tensorflow==2.15.0
 
