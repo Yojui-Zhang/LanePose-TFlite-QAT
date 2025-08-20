@@ -26,7 +26,6 @@ sys.modules["keras.backend"] = K.backend
 # ===========================================================
 
 from tensorflow.keras import layers as L
-import tensorflow_model_optimization as tfmot
 
 from typing import Tuple
 import config
