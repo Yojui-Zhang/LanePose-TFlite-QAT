@@ -339,7 +339,7 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
         kd_raw = out[1] if isinstance(out, (list, tuple)) and len(out) == 2 else out
 
         # ★ 保證 BNC + 重排
-        kd_BNC = _ensure_BNC(kd_raw, C)
+        kd_BNC = _ensure_BNC(kd_raw, expected_C)
         kd_BNC = _reorder_N_blocks(kd_BNC)
         s_box, s_cls_logit, s_kxy, s_ksc_logit = align_student_to_domain(
             kd_BNC, NUM_CLS, NUM_KPT, KPT_VALS, batch_imgs=x_eval, target_domain_is_pixel=False
