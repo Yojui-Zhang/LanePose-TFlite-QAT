@@ -7,7 +7,7 @@ Training Settings
 '''
 IMGSZ = 640
 BATCH = 2
-EPOCHS = 5              # 可先跑 5~10 看收斂
+EPOCHS = 20              # 可先跑 5~10 看收斂
 
 base_lr = 0.01
 end_lr = 0.001
@@ -17,7 +17,7 @@ BNSTOP__ = True         # 凍結 BN , Ture不凍結/ False凍結
 USE_AMP = False         # 設定為 True 以啟用混合精度訓練 (Tensor 版本不支援)
 
 PLOT_Switch = False     # 是否繪製數據圖, 若 matplotlib 版本不符可關閉
-EXPORT_ONLY = True      # True 是否只進行輸出測試（.ckpt）, False 進行蒸餾QAT輸出
+EXPORT_ONLY = False      # True 是否只進行輸出測試（.ckpt）, False 進行蒸餾QAT輸出
 
 
 '''
@@ -63,10 +63,10 @@ KPT_VALS = 3         # YOLOv8-Pose 預設每點 3 個值: (x, y, score/logit)
 
 # Weigth
 W_BOX = 7.0
-W_OBJ = 1.5
+W_OBJ = 1.0          # 沒有
 W_CLS = 1.0
 W_KPT_XY = 12.0
-W_KPT_S  = 1.0  # 關鍵點 score/logit 權重
+W_KPT_V  = 1.0       # 關鍵點 score/logit 權重
 
 
 '''
@@ -78,7 +78,6 @@ BCE = tf.keras.losses.BinaryCrossentropy(from_logits=True)
 C = 4 + NUM_CLS + NUM_KPT * KPT_VALS
 
 PORDER = (0, 1, 2)
-# GRID_MODES = (('row',0,0), ('row',0,0), ('row',0,0))
 GRID_MODES = (('col',1,0), ('row',0,0), ('col',1,0))
 
 CHANNEL_MAPPING = list(range(C))

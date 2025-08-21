@@ -9,10 +9,10 @@ def try_load_keras_model(export_dir):
     # 1) 優先用 tf.keras loader（若 SavedModel 是 Keras 格式就會成功）
     try:
         m = tf.keras.models.load_model(export_dir)
-        print("[INFO] Loaded with tf.keras.models.load_model")
+        print("\n[INFO] Loaded with tf.keras.models.load_model")
         return m, True
     except Exception as e:
-        print("[INFO] tf.keras.models.load_model failed, falling back to saved_model signature:", e)
+        print("\n[INFO] tf.keras.models.load_model failed, falling back to saved_model signature:", e)
 
     # 2) 用 saved_model.signatures["serving_default"] 包成 Keras-like wrapper
     saved = tf.saved_model.load(export_dir)
@@ -67,5 +67,5 @@ def try_load_keras_model(export_dir):
             return mapped
 
     wrapped = SMWrapper(fn, input_name, output_key, single_out_spec)
-    print(f"[INFO] Wrapped SavedModel signature into Keras-like model. input_name={input_name}, output_key={output_key}, single_out_shape={single_out_shape}")
+    print(f"\n[INFO] Wrapped SavedModel signature into Keras-like model. input_name={input_name}, output_key={output_key}, single_out_shape={single_out_shape}")
     return wrapped, False

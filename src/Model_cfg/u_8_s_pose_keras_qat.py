@@ -71,7 +71,7 @@ def sppf_block(x, out_ch: int, k: int = 5, name: str = None):
 def make_head(x, out_ch: int, mid_ch: int, name: str):
     x = conv_bn_act(x, mid_ch, k=3, s=1, name=f"{name}/h1")
     x = conv_bn_act(x, mid_ch, k=3, s=1, name=f"{name}/h2")
-    x = L.Conv2D(out_ch, 1, padding='same', name=f"{name}/out")(x)
+    x = L.Conv2D(out_ch, 1, padding='same', activation=None, name=f"{name}/out")(x)
     return x
 
 def dfl_pose_head(p3, p4, p5, ch=128):
@@ -168,6 +168,75 @@ def build_u8s_pose(
     # out = L.Concatenate(axis=1, name='preds')([out_p3, out_p4, out_p5])
 
     return K.Model(inp, out, name='u8s_pose_keras')
+
+def build_u8s_pose_dual(
+    input_shape: Tuple[int, int, int] = (640, 640, 3),
+    num_classes: int = 7,
+    num_kpt: int = 15,
+    kpt_vals: int = 3,
+    width_mult: float = 1.0,
+    depth_mult: float = 1.0,
+):
+    C = 4 + num_classes + num_kpt * kpt_vals
+    def ch(c): return max(8, int(c * width_mult))
+    def n(d):  return max(1, int(d * depth_mult))
+
+    inp = L.Input(shape=input_shape, name='images')
+
+    # Backbone
+    x  = conv_bn_act(inp, ch(64),  k=3, s=2, name='stem')
+    x  = c2f_block(x, ch(64),  n(2), name='c2f_1')
+
+    x  = conv_bn_act(x, ch(128), k=3, s=2, name='down_2')
+    x  = c2f_block(x, ch(128), n(3), name='c2f_2')
+
+    x  = conv_bn_act(x, ch(256), k=3, s=2, name='down_3')
+    c3 = c2f_block(x, ch(256), n(3), name='c2f_3')
+
+    x  = conv_bn_act(c3, ch(512), k=3, s=2, name='down_4')
+    c4 = c2f_block(x, ch(512), n(3), name='c2f_4')
+
+    x  = conv_bn_act(c4, ch(512), k=3, s=2, name='down_5')
+    x  = c2f_block(x, ch(512), n(3), name='c2f_5')
+    c5 = sppf_block(x, ch(512), name='sppf')
+
+    # Neck
+    concat = L.Concatenate(axis=-1)
+    p5_up  = L.UpSampling2D(name='p5_up')(c5)
+    p4_td  = c2f_block(concat([p5_up, c4]), ch(256), n(2), name='p4_td')
+
+    p4_up  = L.UpSampling2D(name='p4_up')(p4_td)
+    p3_out = c2f_block(concat([p4_up, c3]), ch(128), n(2), name='p3_out')
+
+    p3_dn  = conv_bn_act(p3_out, ch(256), k=3, s=2, name='p3_down')
+    p4_out = c2f_block(concat([p3_dn, p4_td]), ch(256), n(2), name='p4_out')
+
+    p4_dn  = conv_bn_act(p4_out, ch(512), k=3, s=2, name='p4_down')
+    p5_out = c2f_block(concat([p4_dn, c5]), ch(512), n(2), name='p5_out')
+
+    # ===== Deploy head（給部署、會量化）=====
+    dep_p3 = make_head(p3_out, C, ch(128), name='deploy_head_p3')
+    dep_p4 = make_head(p4_out, C, ch(256), name='deploy_head_p4')
+    dep_p5 = make_head(p5_out, C, ch(512), name='deploy_head_p5')
+
+    dep_f3 = L.Reshape(target_shape=(-1, C), name='deploy_flat_p3')(dep_p3)
+    dep_f4 = L.Reshape(target_shape=(-1, C), name='deploy_flat_p4')(dep_p4)
+    dep_f5 = L.Reshape(target_shape=(-1, C), name='deploy_flat_p5')(dep_p5)
+    deploy_preds = L.Concatenate(axis=1, name='deploy_preds')([dep_f3, dep_f4, dep_f5])
+
+    # ===== KD head（給蒸餾、保持浮點輸出）=====
+    kd_p3 = make_head(p3_out, C, ch(128), name='kd_head_p3')
+    kd_p4 = make_head(p4_out, C, ch(256), name='kd_head_p4')
+    kd_p5 = make_head(p5_out, C, ch(512), name='kd_head_p5')
+
+    kd_f3 = L.Reshape(target_shape=(-1, C), name='kd_flat_p3')(kd_p3)
+    kd_f4 = L.Reshape(target_shape=(-1, C), name='kd_flat_p4')(kd_p4)
+    kd_f5 = L.Reshape(target_shape=(-1, C), name='kd_flat_p5')(kd_p5)
+    kd_preds = L.Concatenate(axis=1, name='kd_preds')([kd_f3, kd_f4, kd_f5])             # (B,N,C)
+
+    return K.Model(inp, [deploy_preds, kd_preds], name='u8s_pose_keras_dual')
+
+
 
 if __name__ == '__main__':
     m = build_u8s_pose((config.IMGSZ,config.IMGSZ,3), num_classes=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS)

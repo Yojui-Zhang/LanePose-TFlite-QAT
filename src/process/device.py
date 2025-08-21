@@ -32,15 +32,15 @@ def enable_gpu_mem_growth():
     """設定 GPU 記憶體為動態增長模式。"""
     gpus = tf.config.list_physical_devices('GPU')
     if not gpus:
-        print("⚠️ No GPU detected. Running on CPU.")
+        print("\n⚠️ No GPU detected. Running on CPU.")
         return
     try:
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
         lg = tf.config.list_logical_devices('GPU')
-        print(f"✅ {len(gpus)} Physical GPUs, {len(lg)} Logical GPUs. Memory growth enabled.")
+        print(f"\n✅ {len(gpus)} Physical GPUs, {len(lg)} Logical GPUs. Memory growth enabled.")
     except RuntimeError as e:
-        print(f"❌ TF GPU config error: {e}")
+        print(f"\n❌ TF GPU config error: {e}")
 
 
 '''
@@ -56,8 +56,8 @@ def setup_mixed_precision():
             from tensorflow.keras import mixed_precision
             policy = mixed_precision.Policy('mixed_float16')
             mixed_precision.set_global_policy(policy)
-            print("✅ Mixed precision (AMP) enabled.")
+            print("\n✅ Mixed precision (AMP) enabled.")
         except ImportError:
-            print("⚠️ Could not import mixed_precision. Skipping AMP setup.")
+            print("\n⚠️ Could not import mixed_precision. Skipping AMP setup.")
     else:
-        print("ℹ️ Mixed precision (AMP) is disabled.")
+        print("\nℹ️ Mixed precision (AMP) is disabled.")

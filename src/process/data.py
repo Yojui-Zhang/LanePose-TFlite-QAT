@@ -68,7 +68,7 @@ def build_dataset(img_glob, batch=config.BATCH, shuffle=True, repeat=True):
         raise FileNotFoundError(f"No images found for patterns: {img_glob}")
     else:
         # 顯示讀取到的總圖片數量
-        print(f"Read image: {len(files)} from {len(patterns)} directories")
+        print(f"\nRead image: {len(files)} from {len(patterns)} directories")
 
     ds = tf.data.Dataset.from_tensor_slices(files)
     if shuffle:

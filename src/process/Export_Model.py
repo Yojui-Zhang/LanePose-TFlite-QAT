@@ -37,6 +37,7 @@ import config
 from src.Loss_function.loss import _split_outputs
 from src.process.data import rep_data_gen
 from src.process.pred_model import normalize_teacher_pred
+from src.process.Train_Model import _ensure_bhwc4
 
 '''
 ==================================================================================
@@ -173,7 +174,9 @@ def mae_student_keras_vs_teacher(student, teacher, ds, lens_perm, reorder_idx, C
     ==============================================================================
     """
     try:
-        sample_one = next(iter(ds))[:1]
+        sample_batch = next(iter(ds))
+        sample_imgs = sample_batch[0] if isinstance(sample_batch, (list, tuple)) else sample_batch
+        sample_one = _ensure_bhwc4(sample_imgs, imgsz=config.IMGSZ)
     except Exception:
         sample_one = tf.zeros([1, config.IMGSZ, config.IMGSZ, 3], tf.float32)
 
@@ -186,7 +189,14 @@ def mae_student_keras_vs_teacher(student, teacher, ds, lens_perm, reorder_idx, C
 
     @tf.function
     def _eval(x_eval):
-        y_t = normalize_teacher_pred(teacher(x_eval, training=False), expected_C=C)  # (B,N,C)，機率語義
+        y_t = normalize_teacher_pred(
+                    teacher(x_eval, training=False),
+                    expected_C=C,
+                    num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS,
+                    batch_imgs=x_eval,
+                    target_domain='unit',          # ★ 改 'pixel' 可走像素域
+                    return_detected=False
+                    )
         y_s = align_student_BNC(student(x_eval, training=False))                     # (B,N,C)，logits/未激活
 
         box_t, obj_t, cls_t, kxy_t, ks_t = _split_outputs(y_t, config.NUM_CLS, config.NUM_KPT, config.KPT_VALS)
@@ -216,7 +226,9 @@ def mae_student_savedmodel_vs_teacher(student_saved_dir, teacher, ds):
     """
     # 取 1 張樣本
     try:
-        sample_one = next(iter(ds))[:1]
+        sample_batch = next(iter(ds))
+        sample_imgs = sample_batch[0] if isinstance(sample_batch, (list, tuple)) else sample_batch
+        sample_one = _ensure_bhwc4(sample_imgs, imgsz=config.IMGSZ)
     except Exception:
         sample_one = tf.zeros([1, config.IMGSZ, config.IMGSZ, 3], tf.float32)
 
@@ -238,7 +250,14 @@ def mae_student_savedmodel_vs_teacher(student_saved_dir, teacher, ds):
         raise RuntimeError(f"Channel mismatch: got {out_cn.shape}, expected C={C}")
 
     # 老師 → normalize_teacher_pred: (1, N, C) 機率
-    te_nc = normalize_teacher_pred(teacher(sample_one, training=False), expected_C=C)
+    te_nc = normalize_teacher_pred(
+                    teacher(sample_one, training=False),
+                    expected_C=C,
+                    num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS,
+                    batch_imgs=sample_one,
+                    target_domain='unit',          # ★ 改 'pixel' 可走像素域
+                    return_detected=False
+                    )
 
     # 切片計 MAE（機率域）
     c0_box, c1_box = 0, 4
@@ -260,7 +279,9 @@ def mae_student_tflite_vs_teacher(tflite_path, teacher, ds):
     ==============================================================================
     """
     try:
-        sample_one = next(iter(ds))[:1]
+        sample_batch = next(iter(ds))
+        sample_imgs = sample_batch[0] if isinstance(sample_batch, (list, tuple)) else sample_batch
+        sample_one = _ensure_bhwc4(sample_imgs, imgsz=config.IMGSZ)
     except Exception:
         sample_one = tf.zeros([1, config.IMGSZ, config.IMGSZ, 3], tf.float32)
 
@@ -273,7 +294,14 @@ def mae_student_tflite_vs_teacher(tflite_path, teacher, ds):
     st_nc = np.transpose(out_cn, (0, 2, 1))  # -> (1, N, C), numpy
 
     # Teacher 機率
-    te_nc = normalize_teacher_pred(teacher(sample_one, training=False), expected_C=C).numpy()
+    te_nc = normalize_teacher_pred(
+                    teacher(sample_one, training=False),
+                    expected_C=C,
+                    num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS,
+                    batch_imgs=sample_one,
+                    target_domain='unit',          # ★ 改 'pixel' 可走像素域
+                    return_detected=False
+                    )
 
     # MAE
     c0_box, c1_box = 0, 4
@@ -313,7 +341,9 @@ def export_only(student, teacher, ds, output_paths, tag="export_only_diagnostics
     print(f"  - Detected Kind: {kind}")
 
     try:
-        sample_one = next(iter(ds))[:1]
+        sample_batch = next(iter(ds))
+        sample_imgs = sample_batch[0] if isinstance(sample_batch, (list, tuple)) else sample_batch
+        sample_one = _ensure_bhwc4(sample_imgs, imgsz=config.IMGSZ)
     except Exception:
         sample_one = tf.zeros([1, config.IMGSZ, config.IMGSZ, 3], tf.float32)
     print(f"  - Sanity Check: sample_one range = [{float(tf.reduce_min(sample_one)):.4f}, {float(tf.reduce_max(sample_one)):.4f}]")
@@ -408,7 +438,15 @@ def run_diagnostics_once(
 
     # ---- 3) Teacher normalized (B,N,C) -> transpose to (1,C,N) ----
     expected_C = C
-    te_nc = normalize_teacher_pred(teacher(sample_one, training=False), expected_C=expected_C).numpy()  # (1,N,C)
+    te_nc = normalize_teacher_pred(
+                        teacher(sample_one, training=False),
+                        expected_C=C,
+                        num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS,
+                        batch_imgs=sample_one,
+                        target_domain='unit',          # ★ 改 'pixel' 可走像素域
+                        return_detected=False
+                        )
+
     te_cn = np.transpose(te_nc, (0, 2, 1))  # (1, C, N)
 
     # sanity shape
@@ -464,14 +502,4 @@ def run_diagnostics_once(
         v_t = var_across_N(out_tfl, ch)
         print(f"  ch {name:>8s} | var Keras={v_k:.3e} | var TFLite={v_t:.3e}")
 
-    # quick hints
-    print("\n[Hints]")
-    print("  • TFLite≈Keras: 如果三段 MAE < 0.01~0.02，量化/匯出基本 OK。")
-    print("  • Student vs Teacher: 如果 MAE 持續 > 0.05（特別是 box/kpt），優先檢查：")
-    print("      (1) 訓練時是否已做與匯出一致的 N 對齊（P3/P4/P5 順序、row/col、flip、通道映射）")
-    print("      (2) 蒸餾前景選樣（conf 門檻或 Top-K），避免 8400 背景沖淡梯度")
-    print("      (3) BN 是否保持可訓、學習率排程是否合理")
-    print("  • Variance: 若某些通道 var ~ 0（例如 < 1e-6），表示該通道在 N 維幾乎常數，")
-    print("      需檢查監督是否對齊、或模型是否未學到該通道。")
-    print("==========================================\n")
 
