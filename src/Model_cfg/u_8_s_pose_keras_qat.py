@@ -37,42 +37,63 @@ NK = config.NUM_KPT
 KPT_DIM = config.KPT_VALS
 RAW_C = 4 * REG_MAX + NC + NK * KPT_DIM  # 每個格點的 raw 通道數
 
-def conv_bn_act(x, out_ch: int, k: int = 3, s: int = 1, name: str = None):
-    x = L.Conv2D(out_ch, k, strides=s, padding='same', use_bias=False,
-                 name=None if not name else f"{name}/conv")(x)
-    x = L.BatchNormalization(name=None if not name else f"{name}/bn")(x)
-    # use built-in swish to avoid Lambda
-    x = L.Activation('swish', name=None if not name else f"{name}/swish")(x)
-    # x = L.Activation(tf.nn.silu, name=f'{name}.act{i}')(x)
-    return x
 
-def c2f_block(x, out_ch: int, n: int = 2, name: str = None):
-    y = conv_bn_act(x, out_ch, k=1, s=1, name=None if not name else f"{name}/cv1")
-    parts = [y]
-    for i in range(n):
-        y = conv_bn_act(y, out_ch, k=3, s=1, name=None if not name else f"{name}/m{i}")
-        parts.append(y)
-    z = L.Concatenate(axis=-1, name=None if not name else f"{name}/concat")(parts)
-    z = conv_bn_act(z, out_ch, k=1, s=1, name=None if not name else f"{name}/cv2")
-    return z
+class TeacherCompatHead(L.Layer):
+    """
+    直接輸出 (B, C, N) 的 head，語義與通道排序與 Ultralytics YOLOv8-pose 對齊：
+    [ x, y, w, h, cls..., kpt(x,y,v)_1, kpt(x,y,v)_2, ... ]
+    其中只有 cls 與 v 走 sigmoid，其餘維持線性。
+    """
+    def __init__(self, num_cls: int, num_kpt: int, kpt_vals: int, name="head", apply_sigmoid=True):
+        super().__init__(name=name)
+        self.num_cls  = int(num_cls)
+        self.num_kpt  = int(num_kpt)
+        self.kpt_vals = int(kpt_vals)
+        self.C = 4 + self.num_cls + self.num_kpt * self.kpt_vals
+        # 三層各自的 1×1 conv 直接出 C 個通道（不加激活，讓後面做選擇性激活）
+        self.p3_conv = L.Conv2D(self.C, 1, padding="same", use_bias=True, name=f"{name}/p3_out")
+        self.p4_conv = L.Conv2D(self.C, 1, padding="same", use_bias=True, name=f"{name}/p4_out")
+        self.p5_conv = L.Conv2D(self.C, 1, padding="same", use_bias=True, name=f"{name}/p5_out")
+        self.apply_sigmoid = bool(apply_sigmoid)
+        
+    def _apply_prob_activations(self, y):
+        box = y[..., :4]
+        cls = y[..., 4:4+self.num_cls]
+        kpt = y[..., 4+self.num_cls:]
+        if self.apply_sigmoid:
+            cls = tf.sigmoid(cls)
+        if self.kpt_vals >= 3:
+            B,H,W = tf.shape(y)[0], tf.shape(y)[1], tf.shape(y)[2]
+            kpt = tf.reshape(kpt, [B,H,W,self.num_kpt,self.kpt_vals])
+            kxy = kpt[..., :2]
+            kv  = tf.sigmoid(kpt[..., 2:3]) if self.apply_sigmoid else kpt[..., 2:3]
+            kpt = tf.concat([kxy, kv], axis=-1)
+            kpt = tf.reshape(kpt, [B,H,W,self.num_kpt*self.kpt_vals])
+        return tf.concat([box, cls, kpt], axis=-1)
 
-def sppf_block(x, out_ch: int, k: int = 5, name: str = None):
-    x1 = conv_bn_act(x, out_ch, k=1, s=1, name=None if not name else f"{name}/cv1")
-    p1 = L.MaxPool2D(pool_size=k, strides=1, padding='same',
-                     name=None if not name else f"{name}/p1")(x1)
-    p2 = L.MaxPool2D(pool_size=k, strides=1, padding='same',
-                     name=None if not name else f"{name}/p2")(p1)
-    p3 = L.MaxPool2D(pool_size=k, strides=1, padding='same',
-                     name=None if not name else f"{name}/p3")(p2)
-    cat = L.Concatenate(axis=-1, name=None if not name else f"{name}/cat")([x1, p1, p2, p3])
-    y = conv_bn_act(cat, out_ch, k=1, s=1, name=None if not name else f"{name}/cv2")
-    return y
+    @staticmethod
+    def _to_BCN(t):
+        # t: (B, H, W, C) -> (B, C, H*W)
+        return L.Lambda(
+            lambda x: tf.transpose(
+                tf.reshape(x, [tf.shape(x)[0], -1, tf.shape(x)[3]]),  # (B, H*W, C)
+                [0, 2, 1]                                            # (B, C, H*W)
+            )
+        )(t)
 
-def make_head(x, out_ch: int, mid_ch: int, name: str):
-    x = conv_bn_act(x, mid_ch, k=3, s=1, name=f"{name}/h1")
-    x = conv_bn_act(x, mid_ch, k=3, s=1, name=f"{name}/h2")
-    x = L.Conv2D(out_ch, 1, padding='same', activation=None, name=f"{name}/out")(x)
-    return x
+    def call(self, feats, training=False):
+        p3, p4, p5 = feats  # 請保證來自 P3(最高解析)→P4→P5 的順序
+        y3 = self._apply_prob_activations(self.p3_conv(p3))  # (B,H3,W3,C)
+        y4 = self._apply_prob_activations(self.p4_conv(p4))  # (B,H4,W4,C)
+        y5 = self._apply_prob_activations(self.p5_conv(p5))  # (B,H5,W5,C)
+
+        bcn3 = self._to_BCN(y3)  # (B, C, N3)
+        bcn4 = self._to_BCN(y4)  # (B, C, N4)
+        bcn5 = self._to_BCN(y5)  # (B, C, N5)
+
+        preds = L.Concatenate(axis=2, name=f"{self.name}/preds")([bcn3, bcn4, bcn5])  # (B, C, N)
+        return preds
+
 
 def dfl_pose_head(p3, p4, p5, ch=128):
     # 三個子塔：回歸(DFL)、分類/obj、關鍵點
@@ -107,6 +128,50 @@ def dfl_pose_head(p3, p4, p5, ch=128):
     o5_bnc = L.Reshape((-1, RAW_C), name='head.flat.p5')(o5)  # 20*20= 400
     # preds  = L.Concatenate(axis=1, name='head.concat.bnc')([o3_bnc, o4_bnc, o5_bnc])  # [B,8400,RAW_C]
     return o3_bnc, o4_bnc, o5_bnc
+
+
+def conv_bn_act(x, out_ch: int, k: int = 3, s: int = 1, name: str = None, act: str = "relu6"):
+    x = L.Conv2D(out_ch, k, strides=s, padding='same', use_bias=False,
+                 name=None if not name else f"{name}/conv")(x)
+    x = L.BatchNormalization(name=None if not name else f"{name}/bn")(x)
+
+    if act == "relu6":
+        x = L.ReLU(max_value=6.0, name=None if not name else f"{name}/relu6")(x)
+    elif act == "relu":
+        x = L.ReLU(name=None if not name else f"{name}/relu")(x)
+    else:
+        x = L.LeakyReLU(0.1, name=None if not name else f"{name}/lrelu")(x)
+    
+    return x
+
+def c2f_block(x, out_ch: int, n: int = 2, name: str = None):
+    y = conv_bn_act(x, out_ch, k=1, s=1, name=None if not name else f"{name}/cv1")
+    parts = [y]
+    for i in range(n):
+        y = conv_bn_act(y, out_ch, k=3, s=1, name=None if not name else f"{name}/m{i}")
+        parts.append(y)
+    z = L.Concatenate(axis=-1, name=None if not name else f"{name}/concat")(parts)
+    z = conv_bn_act(z, out_ch, k=1, s=1, name=None if not name else f"{name}/cv2")
+    return z
+
+def sppf_block(x, out_ch: int, k: int = 5, name: str = None):
+    x1 = conv_bn_act(x, out_ch, k=1, s=1, name=None if not name else f"{name}/cv1")
+    p1 = L.MaxPool2D(pool_size=k, strides=1, padding='same',
+                     name=None if not name else f"{name}/p1")(x1)
+    p2 = L.MaxPool2D(pool_size=k, strides=1, padding='same',
+                     name=None if not name else f"{name}/p2")(p1)
+    p3 = L.MaxPool2D(pool_size=k, strides=1, padding='same',
+                     name=None if not name else f"{name}/p3")(p2)
+    cat = L.Concatenate(axis=-1, name=None if not name else f"{name}/cat")([x1, p1, p2, p3])
+    y = conv_bn_act(cat, out_ch, k=1, s=1, name=None if not name else f"{name}/cv2")
+    return y
+
+def make_head(x, out_ch: int, mid_ch: int, name: str):
+    x = conv_bn_act(x, mid_ch, k=3, s=1, name=f"{name}/h1")
+    x = conv_bn_act(x, mid_ch, k=3, s=1, name=f"{name}/h2")
+    x = L.Conv2D(out_ch, 1, padding='same', activation=None, name=f"{name}/out")(x)
+    return x
+
 
 def build_u8s_pose(
     input_shape: Tuple[int, int, int] = (640, 640, 3),
@@ -214,25 +279,14 @@ def build_u8s_pose_dual(
     p4_dn  = conv_bn_act(p4_out, ch(512), k=3, s=2, name='p4_down')
     p5_out = c2f_block(concat([p4_dn, c5]), ch(512), n(2), name='p5_out')
 
-    # ===== Deploy head（給部署、會量化）=====
-    dep_p3 = make_head(p3_out, C, ch(128), name='deploy_head_p3')
-    dep_p4 = make_head(p4_out, C, ch(256), name='deploy_head_p4')
-    dep_p5 = make_head(p5_out, C, ch(512), name='deploy_head_p5')
+    # feats = (p3, p4, p5)  # 一定要這個順序！
+    head_kd = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="kd_head", apply_sigmoid=False)
+    kd_preds = head_kd((p3_out, p4_out, p5_out))               # 形狀 (B, C, N) —— 蒸餾用浮點輸出
 
-    dep_f3 = L.Reshape(target_shape=(-1, C), name='deploy_flat_p3')(dep_p3)
-    dep_f4 = L.Reshape(target_shape=(-1, C), name='deploy_flat_p4')(dep_p4)
-    dep_f5 = L.Reshape(target_shape=(-1, C), name='deploy_flat_p5')(dep_p5)
-    deploy_preds = L.Concatenate(axis=1, name='deploy_preds')([dep_f3, dep_f4, dep_f5])
-
-    # ===== KD head（給蒸餾、保持浮點輸出）=====
-    kd_p3 = make_head(p3_out, C, ch(128), name='kd_head_p3')
-    kd_p4 = make_head(p4_out, C, ch(256), name='kd_head_p4')
-    kd_p5 = make_head(p5_out, C, ch(512), name='kd_head_p5')
-
-    kd_f3 = L.Reshape(target_shape=(-1, C), name='kd_flat_p3')(kd_p3)
-    kd_f4 = L.Reshape(target_shape=(-1, C), name='kd_flat_p4')(kd_p4)
-    kd_f5 = L.Reshape(target_shape=(-1, C), name='kd_flat_p5')(kd_p5)
-    kd_preds = L.Concatenate(axis=1, name='kd_preds')([kd_f3, kd_f4, kd_f5])             # (B,N,C)
+    # 若還需要 deploy（QAT）輸出，讓它走相同幾何路徑，僅在 head 前加量化 wrapper：
+    # （保留你現有的量化 backbone/neck；這裡只保證 deploy 也輸出 (B,C,N) 且順序一致）
+    head_dep = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="deploy_head", apply_sigmoid=False)
+    deploy_preds = head_dep((p3_out, p4_out, p5_out))   
 
     return K.Model(inp, [deploy_preds, kd_preds], name='u8s_pose_keras_dual')
 

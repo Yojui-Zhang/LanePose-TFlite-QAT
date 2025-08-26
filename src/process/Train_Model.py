@@ -28,6 +28,8 @@ import Depance file
 import csv
 import numpy as np 
 import tensorflow_model_optimization as tfmot
+from tensorflow.keras.models import clone_model
+from src.Model_cfg.u_8_s_pose_keras_qat import TeacherCompatHead  # 確保可 import 到
 
 from tqdm import tqdm
 from importlib import reload
@@ -129,44 +131,75 @@ def probe_kd_output_distribution(student_model, dataset, expected_C, imgsz=640):
 Core Logic
 ==================================================================================
 '''
-
 def build_student_qat():
     """
     建立雙輸出學生 + 選擇性量化：
-      - deploy_* 分支 & backbone/neck：量化（QAT）
-      - kd_* 分支：保留浮點（未量化輸出，供 KD）
+      - backbone/neck：量化（QAT）
+      - 兩個 head（deploy_head, kd_head）：不量化
     """
+
     reload(cfg)
-    base = cfg.build_u8s_pose_dual(  # <<== 用雙頭版本
+
+    # 1) 先建雙頭的 base model（head 輸出都是 (B,C,N)）
+    base = cfg.build_u8s_pose_dual(
         input_shape=(config.IMGSZ, config.IMGSZ, 3),
         num_classes=config.NUM_CLS,
         num_kpt=config.NUM_KPT,
         kpt_vals=config.KPT_VALS
     )
 
-    from tensorflow.keras.models import clone_model
+    # 2) 只註解要量化的層；凡是 head 相關一律跳過
+    QUANTIZABLE = (
+        tf.keras.layers.Conv2D,
+        tf.keras.layers.DepthwiseConv2D,
+        tf.keras.layers.Dense,
+        tf.keras.layers.Activation,   # 視需要
+        tf.keras.layers.ReLU,         # 視需要
+        tf.keras.layers.LeakyReLU,    # 視需要
+        tf.keras.layers.PReLU,        # 視需要
+        tf.keras.layers.SeparableConv2D,  # 若你有用
+    )
+
+    def in_heads(layer_name: str) -> bool:
+        # 覆蓋 head 本體與其子層（例：deploy_head/p3_out）
+        return ("kd_head" in layer_name) or ("deploy_head" in layer_name)
 
     def annotate_fn(layer):
         name = layer.name or ""
-        # 跳過 kd_* 層（KD 頭保持浮點）
-        if name.startswith("kd_") or "/kd_" in name:
-            return layer  # 不標註 -> 不量化
-        # 其餘標註量化
-        try:
-            return tfmot.quantization.keras.quantize_annotate_layer(layer)
-        except Exception:
+        # a) 自訂 head 本體：不量化
+        if isinstance(layer, TeacherCompatHead):
             return layer
+        # b) 任一 head 節點（含其中的 Conv）：不量化
+        if in_heads(name):
+            return layer
+        # c) 非 head 的量化白名單才標註
+        if isinstance(layer, QUANTIZABLE):
+            return tfmot.quantization.keras.quantize_annotate_layer(layer)
+        # 其他層照原樣返回
+        return layer
 
     annotated = clone_model(base, clone_function=annotate_fn)
-    student = tfmot.quantization.keras.quantize_apply(annotated)
 
-    # 檢查：兩個輸出仍存在（[deploy_preds, kd_preds]）
-    if not isinstance(student.output, (list, tuple)) or len(student.output) != 2:
+    # 3) 在 quantize_scope 內套用（讓 TFMOT 認得自訂層）
+    with tfmot.quantization.keras.quantize_scope({
+        "TeacherCompatHead": TeacherCompatHead
+    }):
+        student = tfmot.quantization.keras.quantize_apply(annotated)
+
+    # 4) 驗證：兩個輸出仍在，且 head 節點沒有被包 Quantize
+    outs = student.outputs
+    if not isinstance(outs, (list, tuple)) or len(outs) != 2:
         raise RuntimeError("Expect dual outputs [deploy_preds, kd_preds] after quantize_apply().")
 
+    # 可選：列出被量化的層數 & 檢查 head 是否未量化
     qlayers = [l for l in student.submodules if "Quantize" in l.__class__.__name__]
     print(f"[CHECK] quantization layers count: {len(qlayers)}")
+    for l in student.submodules:
+        if "kd_head" in l.name or "deploy_head" in l.name:
+            assert "Quantize" not in l.__class__.__name__, f"Head was quantized unexpectedly: {l.name}"
+
     return student
+
 
 def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
     """
@@ -176,7 +209,7 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
     """
     
     print("\n--- Starting QAT Fine-tuning ---")
-    # 1) 視 config.BNSTOP__ 來凍/解凍 BN
+
     for l in student.submodules:
         if isinstance(l, tf.keras.layers.BatchNormalization):
             l.trainable = config.BNSTOP__
@@ -209,39 +242,30 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
     if config.PLOT_Switch == True:
         plot_and_save_lr_schedule(schedule, total_steps, output_paths['lr_plot'])
 
-    # 3) 『訓練前』先用一張樣本決定學生輸出 N 維的重排方式（與 teacher 對齊）
-    expected_C = 4 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
-    H3, W3 = config.IMGSZ // 8,  config.IMGSZ // 8
-    H4, W4 = config.IMGSZ // 16, config.IMGSZ // 16
-    H5, W5 = config.IMGSZ // 32, config.IMGSZ // 32
-    N3, N4, N5 = H3 * W3, H4 * W4, H5 * W5
+    # expected_C = 4 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
+    # H3, W3 = config.IMGSZ // 8,  config.IMGSZ // 8
+    # H4, W4 = config.IMGSZ // 16, config.IMGSZ // 16
+    # H5, W5 = config.IMGSZ // 32, config.IMGSZ // 32
+    # N3, N4, N5 = H3 * W3, H4 * W4, H5 * W5
 
     try:
         sample_batch = next(iter(ds))
         sample_imgs = sample_batch[0] if isinstance(sample_batch, (list, tuple)) else sample_batch
-        sample_one = _ensure_bhwc4(sample_imgs, imgsz=config.IMGSZ)  # 取 1 張做對齊（ds 通常有 repeat，不會影響訓練）
+        sample_one = _ensure_bhwc4(sample_imgs, imgsz=config.IMGSZ)
     except Exception:
         sample_one = tf.zeros([1, config.IMGSZ, config.IMGSZ, 3], tf.float32)
 
-    # 直接用你現有的自動對齊函式
-    lens_perm, reorder_idx = choose_student_split_order(student, teacher, sample_one, N3, N4, N5, expected_C, 
-                                                        config.NUM_CLS, config.NUM_KPT, config.KPT_VALS, )
-    # 轉成 Python 基本型別，方便 tf.function 內部使用
-    lens_perm  = tuple(int(x) for x in lens_perm)    # e.g. (N3, N4, N5) 的某種排列
-    reorder_idx = [int(x) for x in reorder_idx]      # e.g. [0,1,2] 或 [2,1,0] 等
+    # lens_perm, reorder_idx = choose_student_split_order(student, teacher, sample_one, N3, N4, N5, expected_C, 
+    #                                                     config.NUM_CLS, config.NUM_KPT, config.KPT_VALS, )
+    # lens_perm  = tuple(int(x) for x in lens_perm)
+    # reorder_idx = [int(x) for x in reorder_idx]
 
-    print(f" [TRAIN ALIGN] lens_perm={lens_perm}, reorder_idx={reorder_idx}")
+    # print(f" [TRAIN ALIGN] lens_perm={lens_perm}, reorder_idx={reorder_idx}")
 
-
-    # --- (1) 靜態版保證 (B,N,C) ---
-    def _ensure_BNC(y, expected_C):
-        return ensure_BNC_static(y, expected_C)
-
-    # --- (2) 依 (lens_perm, reorder_idx) 重排 N 區塊 ---
-    def _reorder_N_blocks(y_BNC):
-        s0, s1, s2 = lens_perm   # e.g. (N3, N5, N4)
-        parts = tf.split(y_BNC, [s0, s1, s2], axis=1)
-        return tf.concat([parts[reorder_idx[0]], parts[reorder_idx[1]], parts[reorder_idx[2]]], axis=1)
+    # def _reorder_N_blocks(y_BNC):
+    #     s0, s1, s2 = lens_perm   # e.g. (N3, N5, N4)
+    #     parts = tf.split(y_BNC, [s0, s1, s2], axis=1)
+    #     return tf.concat([parts[reorder_idx[0]], parts[reorder_idx[1]], parts[reorder_idx[2]]], axis=1)
 
 
     @tf.function
@@ -256,59 +280,67 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
             y_t_raw = teacher(batch_imgs, training=False)
             y_s_out = student(batch_imgs, training=True)
             kd_raw  = y_s_out[1] if isinstance(y_s_out, (list,tuple)) else y_s_out
+            deploy_raw  = y_s_out[0] if isinstance(y_s_out, (list,tuple)) else y_s_out
+# ===================
+            y_t_BNC = ensure_BNC_static(y_t_raw, C)
+            y_t_BNC = tf.stop_gradient(y_t_BNC)
+            
+            # y_t_BNC, t_is_pixel = normalize_teacher_pred(
+            #     y_t_raw, expected_C=C,
+            #     num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS,
+            #     batch_imgs=batch_imgs, target_domain='pixel', return_detected=True
+            # )
+# =================== 
+            # t_box, t_cls, t_kxy, t_ksc = split_BNC(y_t_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
 
-            # --- Teacher 統一到 0–1（或 pixel） ---
-            y_t_unit, t_is_pixel = normalize_teacher_pred(
-                y_t_raw, expected_C=C,
-                num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS,
-                batch_imgs=batch_imgs, target_domain='unit', return_detected=True
-            )
-            t_box, t_cls, t_kxy, t_ksc = split_BNC(y_t_unit, NUM_CLS, NUM_KPT, KPT_VALS)
-
-            # ========== ★★ 關鍵：Student KD 先保證 (B,N,C) 再「重排 N」 ★★ ==========
-            kd_BNC = _ensure_BNC(kd_raw, C)          # (B,N,C)
-            kd_BNC = _reorder_N_blocks(kd_BNC)       # (B,N,C) 與 Teacher 同順序
-            s_box, s_cls_logit, s_kxy, s_ksc_logit = align_student_to_domain(
-                kd_BNC, NUM_CLS, NUM_KPT, KPT_VALS, batch_imgs=batch_imgs, target_domain_is_pixel=False
-            )
-
+            kd_BNC = ensure_BNC_static(kd_raw, C)          # (B,N,C)
+            deploy_BNC = ensure_BNC_static(deploy_raw, C)          # (B,N,C)
+            # kd_BNC = _reorder_N_blocks(kd_BNC)       # (B,N,C) 與 Teacher 同順序
+# ===================
+            # s_box, s_cls, s_kxy, s_ksc = split_BNC(kd_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
+            # s_box, s_cls, s_kxy, s_ksc = align_student_to_domain(
+            #     kd_BNC, NUM_CLS, NUM_KPT, KPT_VALS, batch_imgs=batch_imgs, target_domain_is_pixel=False
+            # )
+# ===================
             # --- KD Loss ---
-            kd_cls = tf.reduce_mean(
-                tf.nn.sigmoid_cross_entropy_with_logits(labels=t_cls, logits=s_cls_logit)
-            )
-            kd_ksc = (tf.reduce_mean(
-                tf.nn.sigmoid_cross_entropy_with_logits(labels=t_ksc, logits=s_ksc_logit)
-            ) if t_ksc is not None else 0.0)
-            kd_box = tf.reduce_mean(tf.losses.huber(t_box, s_box))
-            kd_kpt = tf.reduce_mean(tf.losses.huber(t_kxy, s_kxy))
+            # kd_cls = tf.reduce_mean(tf.losses.huber(t_cls, s_cls))
+            # kd_ksc = (tf.reduce_mean(tf.losses.huber(t_ksc, s_ksc)) if t_ksc is not None else 0.0)
+            # kd_box = tf.reduce_mean(tf.losses.huber(t_box, s_box))
+            # kd_kpt = tf.reduce_mean(tf.losses.huber(t_kxy, s_kxy))
 
-            # 注意你用的是 W_KPT_V，請確認名稱是否正確；若你配置檔叫 W_KPT_SC，請改回去
-            loss_kd = (config.W_BOX * kd_box
-                    + config.W_CLS * kd_cls
-                    + config.W_KPT_XY * kd_kpt
-                    + (config.W_KPT_V * kd_ksc if t_ksc is not None else 0.0))
+            # loss_kd = (config.W_BOX * kd_box
+            #         + config.W_CLS * kd_cls
+            #         + config.W_KPT_XY * kd_kpt
+            #         + (config.W_KPT_V * kd_ksc if t_ksc is not None else 0.0))
 
-            # --- 一致性（deploy 也要「保證 BNC → 重排 N → 數域對齊」） ---
-            alpha = 0.05
-            if isinstance(y_s_out, (list,tuple)):
-                deploy_raw = y_s_out[0]
-                d_BNC = _ensure_BNC(deploy_raw, C)
-                d_BNC = _reorder_N_blocks(d_BNC)
-                d_box, d_cls_logit, d_kxy, d_ksc_logit = align_student_to_domain(
-                    d_BNC, NUM_CLS, NUM_KPT, KPT_VALS,
-                    batch_imgs=batch_imgs, target_domain_is_pixel=False
-                )
-                loss_cons = alpha * (
-                    tf.reduce_mean(tf.abs(d_box - tf.stop_gradient(s_box))) +
-                    tf.reduce_mean(tf.abs(d_kxy - tf.stop_gradient(s_kxy))) +
-                    tf.reduce_mean(tf.abs(tf.nn.sigmoid(d_cls_logit) - tf.stop_gradient(tf.nn.sigmoid(s_cls_logit))))
-                    + (tf.reduce_mean(tf.abs(tf.nn.sigmoid(d_ksc_logit) - tf.stop_gradient(tf.nn.sigmoid(s_ksc_logit))))
-                    if t_ksc is not None else 0.0)
-                )
-            else:
-                loss_cons = 0.0
+            # # --- Deploy Loss ---
+            # alpha = 0.0
+            # if isinstance(y_s_out, (list,tuple)):
+            #     deploy_raw = y_s_out[0]
+            #     d_BNC = ensure_BNC_static(deploy_raw, C)
+            #     # d_BNC = _reorder_N_blocks(d_BNC)
+            #     d_box, d_cls, d_kxy, d_ksc = split_BNC(d_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
+            #     # d_box, d_cls, d_kxy, d_ksc = align_student_to_domain(
+            #     #     d_BNC, NUM_CLS, NUM_KPT, KPT_VALS,
+            #     #     batch_imgs=batch_imgs, target_domain_is_pixel=False
+            #     # )
+            #     loss_cons = alpha * (
+            #         tf.reduce_mean(tf.abs(d_box - tf.stop_gradient(s_box))) +
+            #         tf.reduce_mean(tf.abs(d_kxy - tf.stop_gradient(s_kxy))) +
+            #         tf.reduce_mean(tf.abs(d_cls - tf.stop_gradient(s_cls))) +
+            #         (tf.reduce_mean(tf.abs(d_ksc - tf.stop_gradient(s_ksc)))
+            #         if t_ksc is not None else 0.0)
+            #     )
+            # else:
+            #     loss_cons = 0.0
 
-            loss = loss_kd + loss_cons
+            # loss = loss_kd + loss_cons
+
+            huber = tf.keras.losses.Huber(delta=1.0, reduction="sum_over_batch_size")
+            loss_kd  = huber(kd_BNC, y_t_BNC)
+            loss_deploy  = huber(deploy_BNC, y_t_BNC)
+
+            loss = loss_kd + loss_deploy
 
             # ========== ★★ AMP 正確用法（自訂 loop 必須手動 scale/unscale） ★★ ==========
             scaled_loss = opt.get_scaled_loss(loss) if config.USE_AMP else loss
@@ -325,39 +357,42 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
         KPT_VALS = config.KPT_VALS
         expected_C = 4 + NUM_CLS + NUM_KPT * KPT_VALS
 
-        # Teacher → 0–1
-        y_t_unit = normalize_teacher_pred(
-            teacher(x_eval, training=False),
-            expected_C=expected_C,
-            num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS,
-            batch_imgs=x_eval, target_domain='unit', return_detected=False
-        )
-        t_box, t_cls, t_kxy, t_ksc = split_BNC(y_t_unit, NUM_CLS, NUM_KPT, KPT_VALS)
+        # Teacher 輸出
+        out_teacher = teacher(x_eval, training=False)
+        y_t_BNC = ensure_BNC_static(out_teacher, expected_C)
+        # y_t_BNC = normalize_teacher_pred(
+        #     teacher(x_eval, training=False),
+        #     expected_C=expected_C,
+        #     num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS,
+        #     batch_imgs=x_eval, target_domain='pixel', return_detected=False
+        # )
+        
+        t_box, t_cls, t_kxy, t_ksc = split_BNC(y_t_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
 
         # Student KD 分支
         out = student(x_eval, training=False)
         kd_raw = out[1] if isinstance(out, (list, tuple)) and len(out) == 2 else out
 
         # ★ 保證 BNC + 重排
-        kd_BNC = _ensure_BNC(kd_raw, expected_C)
-        kd_BNC = _reorder_N_blocks(kd_BNC)
-        s_box, s_cls_logit, s_kxy, s_ksc_logit = align_student_to_domain(
-            kd_BNC, NUM_CLS, NUM_KPT, KPT_VALS, batch_imgs=x_eval, target_domain_is_pixel=False
-        )
-
-        p_t_cls = tf.where((t_cls < 0.) | (t_cls > 1.), tf.sigmoid(t_cls), t_cls)
-        p_s_cls = tf.sigmoid(s_cls_logit)
+        kd_BNC = ensure_BNC_static(kd_raw, expected_C)
+        # kd_BNC = _reorder_N_blocks(kd_BNC)
+        s_box, s_cls, s_kxy, s_ksc = split_BNC(kd_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
+        # s_box, s_cls, s_kxy, s_ksc = align_student_to_domain(
+        #     kd_BNC, NUM_CLS, NUM_KPT, KPT_VALS, batch_imgs=x_eval, target_domain_is_pixel=False
+        # )
 
         mae_box = tf.reduce_mean(tf.abs(t_box - s_box))
+        mae_cls = tf.reduce_mean(tf.abs(t_cls - s_cls))
         mae_kpt = tf.reduce_mean(tf.abs(t_kxy - s_kxy))
-        mae_cls = tf.reduce_mean(tf.abs(p_t_cls - p_s_cls))
-        return mae_box, mae_cls, mae_kpt
+        mae_ksc = tf.reduce_mean(tf.abs(t_ksc - s_ksc))
+
+        return mae_box, mae_cls, mae_kpt, mae_ksc
 
     # 7) 訓練迴圈 + 每 epoch 末評估並寫 CSV
     loss_history = []
     with open(output_paths['log_csv'], 'w', newline='') as csvfile:
         csv_writer = csv.writer(csvfile)
-        csv_writer.writerow(['epoch', 'loss', 'learning_rate', 'mae_box', 'mae_cls', 'mae_kpt'])
+        csv_writer.writerow(['epoch', 'loss', 'learning_rate', 'mae_box', 'mae_cls', 'mae_kpt', 'mae_ksc'])
 
         for e in range(config.EPOCHS):
             epoch_loss_agg = tf.keras.metrics.Mean()
@@ -376,25 +411,24 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
                 progress_bar.set_postfix(loss=f"{loss:.4f}")
 
             # 如果剛剛收到中斷，直接跳出 epoch 迴圈
-            if config.STOP_REQUESTED:                         # <<< 新增
-                avg_loss = epoch_loss_agg.result().numpy().item() if epoch_loss_agg.count.numpy() > 0 else float('nan')  # <<< 新增
-                print(f"[⚠️ Interrupt] Early stop at epoch {e+1}. Avg Loss so far: {avg_loss}")                          # <<< 新增
-                break                                   # <<< 新增
-
+            if config.STOP_REQUESTED:
+                avg_loss = epoch_loss_agg.result().numpy().item() if epoch_loss_agg.count.numpy() > 0 else float('nan')
+                print(f"[⚠️ Interrupt] Early stop at epoch {e+1}. Avg Loss so far: {avg_loss}")
+                break
 
             avg_loss = epoch_loss_agg.result().numpy().item()
             current_lr = schedule((e + 1) * steps_per_epoch).numpy().item()
             loss_history.append(avg_loss)
 
             # --- epoch-end diagnostics (MAE + variance) ---
-            mae_box_t, mae_cls_t, mae_kpt_t = eval_epoch_metrics(sample_one)
-            mae_box_t = float(mae_box_t.numpy()); mae_cls_t = float(mae_cls_t.numpy()); mae_kpt_t = float(mae_kpt_t.numpy())
+            mae_box_t, mae_cls_t, mae_kpt_t, mae_ksc_t = eval_epoch_metrics(sample_one)
+            mae_box_t = float(mae_box_t.numpy()); mae_cls_t = float(mae_cls_t.numpy()); mae_kpt_t = float(mae_kpt_t.numpy()); mae_ksc_t = float(mae_ksc_t.numpy())
             
             csv_writer.writerow([e + 1, f"{avg_loss:.6f}", f"{current_lr:.8f}",
-                                 f"{mae_box_t:.6f}", f"{mae_cls_t:.6f}", f"{mae_kpt_t:.6f}"])
+                                 f"{mae_box_t:.6f}", f"{mae_cls_t:.6f}", f"{mae_kpt_t:.6f}", f"{mae_ksc_t:.6f}"])
 
             print(f"Epoch {e+1}/{config.EPOCHS} - Avg Loss: {avg_loss:.4f}, LR: {current_lr:.6f} | "
-                  f"MAE(box/cls/kpt): {mae_box_t:.4f}/{mae_cls_t:.4f}/{mae_kpt_t:.4f}")
+                  f"MAE(box/cls/kpt/ksc): {mae_box_t:.4f}/{mae_cls_t:.4f}/{mae_kpt_t:.4f}/{mae_ksc_t:.4f}")
 
 
     print(f"✅ Training finished. Log saved to {output_paths['log_csv']}")

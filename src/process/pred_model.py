@@ -1,7 +1,9 @@
 
-
+import config
 import tensorflow as tf
+
 from itertools import permutations
+
 
 '''
 預測 Teacher 模型結果進行比較
@@ -108,23 +110,6 @@ def detect_is_pixel_domain(box, kxy, thr=0.01, eps=1e-6):
     frac_out = tf.maximum(box_out, kxy_out)  # 單一 scalar
     return frac_out > thr  # tf.bool
 
-# ---- 只解決 (B, N, C) 排列；不動數域 ----
-def ensure_BNC(y, expected_C):
-    y = tf.convert_to_tensor(y)
-    tf.debugging.assert_rank(y, 3, message="ensure_BNC: input rank must be 3 (B,?,?)")
-    sh = tf.shape(y)
-    last = sh[2]
-    expected = tf.cast(expected_C, last.dtype)
-    def _as_is(): return y
-    def _transpose_and_check():
-        y_t = tf.transpose(y, perm=[0,2,1])
-        tf.debugging.assert_equal(tf.shape(y_t)[2], expected,
-                                  message="ensure_BNC: after transpose, last dim != expected_C")
-        return y_t
-    return tf.cond(tf.equal(last, expected), _as_is, _transpose_and_check)
-
-
-
 def normalize_teacher_pred(y, expected_C, num_cls, num_kpt, kpt_vals,
                            batch_imgs,  # (B,H,W,C) 用來取得 W,H
                            target_domain='unit',  # 'unit' or 'pixel' or 'auto'
@@ -134,7 +119,7 @@ def normalize_teacher_pred(y, expected_C, num_cls, num_kpt, kpt_vals,
       y_out: (B,N,C) 已轉成 target_domain 的數域
       is_pixel_detected: tf.bool（可選）
     """
-    y = ensure_BNC(y, expected_C)
+    y = ensure_BNC_static(y, expected_C)
     box, cls, kxy, ksc = split_BNC(y, num_cls, num_kpt, kpt_vals)
 
     # 取得當前 batch 的 W, H
@@ -185,45 +170,24 @@ def choose_student_split_order(student_infer, teacher, sample_one,
     """
     print("\n--- Aligning Student/Teacher Output Order ---")
 
-    # --- Teacher → 指定數域 ---
-    y_te = normalize_teacher_pred(
-        teacher(sample_one, training=False),
-        expected_C=expected_C,
-        num_cls=num_cls, num_kpt=num_kpt, kpt_vals=kpt_vals,
-        batch_imgs=sample_one,
-        target_domain=target_domain,      # 'unit' 或 'pixel'
-        return_detected=False
-    )
-
-    # --- Student single-output（或取第一個輸出）---
+    # --- Teacher / Student
+    y_te = teacher(sample_one, training=False)
     y_st = student_infer(sample_one, training=False)
+
     if isinstance(y_st, (list, tuple)):
-        y_st = y_st[0]
+        y_st = y_st[1]
     if y_st.shape.rank != 3:
         raise ValueError(f"[EXPORT] Student single output must be rank-3, got {y_st.shape}")
 
     # 先確保 (B,N,C) 排列
-    y_st = ensure_BNC(y_st, expected_C)
+    y_te = ensure_BNC_static(y_te, expected_C)
+    y_st = ensure_BNC_static(y_st, expected_C)
 
-    # 將 Student 也映到與 Teacher 相同數域
-    is_pixel = (target_domain == 'pixel')
-    s_box, s_cls_logit, s_kxy, s_ksc_logit = align_student_to_domain(
-        y_st, num_cls, num_kpt, kpt_vals,
-        batch_imgs=sample_one,
-        target_domain_is_pixel=is_pixel
-    )
+    t_box, t_cls, t_kxy, t_ksc = split_BNC(y_te, config.NUM_CLS, config.NUM_KPT, config.KPT_VALS)
+    s_box, s_cls, s_kxy, s_ksc = split_BNC(y_st, config.NUM_CLS, config.NUM_KPT, config.KPT_VALS)
 
-    # 把分類/可見度轉成機率，以免 logits 量級影響 MAE
-    s_full = pack_BNC(s_box, tf.sigmoid(s_cls_logit), s_kxy,
-                      tf.sigmoid(s_ksc_logit) if s_ksc_logit is not None else None)
-
-    # Teacher 也把分類/可見度保證成機率
-    t_box, t_cls, t_kxy, t_ksc = split_BNC(y_te, num_cls, num_kpt, kpt_vals)
-    def maybe_to_prob(_cls):
-        frac_out = tf.reduce_mean(tf.cast(tf.logical_or(_cls < 0., _cls > 1.), tf.float32))
-        return tf.cond(frac_out > 0.01, lambda: tf.sigmoid(_cls), lambda: _cls)
-    y_te_prob = pack_BNC(t_box, maybe_to_prob(t_cls), t_kxy,
-                         t_ksc if (t_ksc is None) else tf.clip_by_value(t_ksc, 0., 1.))
+    s_full = pack_BNC(s_box, s_cls, s_kxy, s_ksc if s_ksc is not None else None)
+    y_te_prob = pack_BNC(t_box, t_cls, t_kxy, t_ksc if t_ksc is not None else None)
 
     # 依 lens 做順序搜尋
     lens = [N3, N4, N5]

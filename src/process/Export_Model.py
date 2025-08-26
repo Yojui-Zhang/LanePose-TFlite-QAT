@@ -45,21 +45,36 @@ Export Setting
 ==================================================================================
 '''
 def create_and_configure_tflite_converter(saved_model_path):
-    """建立並回傳一個已設定好的 TFLite INT8 converter"""
-    print(f"  > Creating TFLite converter from: {saved_model_path}")
     conv = tf.lite.TFLiteConverter.from_saved_model(saved_model_path)
-    conv.optimizations             = [tf.lite.Optimize.DEFAULT]
-    conv.representative_dataset    = rep_data_gen
-    conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-    conv.inference_input_type      = tf.float32
-    conv.inference_output_type     = tf.float32
-    conv.experimental_new_converter = True
-    try:
-        conv.experimental_new_quantizer = True
-    except AttributeError:
-        pass # 如果 TensorFlow 版本不支援此屬性，則忽略
-    return conv
+    mode = getattr(config, "TFLITE_QUANT_MODE", "int8")
 
+    if mode == "int8":
+        conv.optimizations = [tf.lite.Optimize.DEFAULT]
+        conv.representative_dataset = rep_data_gen
+        # conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8, tf.lite.OpsSet.TFLITE_BUILTINS]
+        conv.inference_input_type  = tf.float32
+        conv.inference_output_type = tf.float32
+
+    elif mode == "fp16":
+        conv.optimizations = [tf.lite.Optimize.DEFAULT]
+        conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+        conv.target_spec.supported_types = [tf.float16]   # 權重壓到 FP16，I/O 照舊 float32
+        conv.inference_input_type  = tf.float32
+        conv.inference_output_type = tf.float32
+        conv.representative_dataset = None
+
+    else:  # "fp32"
+        conv.optimizations = []
+        conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+        conv.inference_input_type  = tf.float32
+        conv.inference_output_type = tf.float32
+        conv.representative_dataset = None
+
+    conv.experimental_new_converter = True
+    try: conv.experimental_new_quantizer = True
+    except AttributeError: pass
+    return conv
 
 '''
 ==================================================================================
@@ -77,69 +92,68 @@ class ExportModule(tf.Module):
        - final (1,C,N) with name 'output0'
     ==============================================================================
     """
-    def __init__(self, model, C, lens_perm, reorder_idx,
-                 grid_modes=config.GRID_MODES, porder=config.PORDER, ch_map=config.CHANNEL_MAPPING,
-                 xywh_to_ltrb=config.XYWH_TO_LTRB, xywh_is_norm01=config.XYWH_IS_NORMALIZED_01):
+    def __init__(self, model, C,
+                 apply_chmap=False, ch_map=None,
+                 apply_sigmoid_cls=True, apply_sigmoid_kptv=True):
         super().__init__()
         self.model = model
         self.C = int(C)
-        self.lens_perm = tuple(int(x) for x in lens_perm)
-        self.reorder_idx = tuple(int(x) for x in reorder_idx)
-        self.grid_modes = tuple(grid_modes)
-        self.porder = tuple(porder)
-        self.ch_map = tf.constant(list(map(int, ch_map)), tf.int32)
-        self.xywh_to_ltrb = bool(xywh_to_ltrb)
-        self.xywh_is_norm01 = bool(xywh_is_norm01)
+        self.apply_chmap = bool(apply_chmap)
+        if ch_map is not None:
+            self.ch_map = tf.constant(list(map(int, ch_map)), tf.int32)  # 長度= C
+        else:
+            self.ch_map = None
+        self.apply_sigmoid_cls = bool(apply_sigmoid_cls)
+        self.apply_sigmoid_kptv = bool(apply_sigmoid_kptv)
 
     @tf.function(input_signature=[tf.TensorSpec([1, config.IMGSZ, config.IMGSZ, 3], tf.float32, name="images")])
     def serving_fn(self, x):
         y = self.model(x, training=False)
-        if y.shape.rank != 3: raise ValueError(f"export expects rank=3, got {y.shape}")
-        out_nc = tf.transpose(y, [0, 2, 1]) if (y.shape[1] == self.C) else y
 
-        segs = tf.split(out_nc, num_or_size_splits=list(self.lens_perm), axis=1)
-        segs = [segs[i] for i in self.reorder_idx]
-        out_nc = tf.concat(segs, axis=1)
+        # 只取 deploy 輸出
+        if isinstance(y, (list, tuple)):
+            y = y[0]  # 假設 outputs=[deploy, kd]
 
-        H3, W3 = config.IMGSZ // 8, config.IMGSZ // 8
-        H4, W4 = config.IMGSZ // 16, config.IMGSZ // 16
-        H5, W5 = config.IMGSZ // 32, config.IMGSZ // 32
-        N3, N4, N5 = H3*W3, H4*W4, H5*W5
-        
-        def reorder_block_tf(block_BNC, H, W, scan='row', flip_y=False, flip_x=False):
-            B, C = tf.shape(block_BNC)[0], tf.shape(block_BNC)[2]
-            x_ = tf.reshape(block_BNC, [B, H, W, C])
-            if scan == 'col': x_ = tf.transpose(x_, [0, 2, 1, 3])
-            if flip_y: x_ = tf.reverse(x_, axis=[1])
-            if flip_x: x_ = tf.reverse(x_, axis=[2])
-            return tf.reshape(x_, [B, -1, C])
+        # 期望 rank=3，且要統一成 (B, C, N)
+        tf.debugging.assert_rank(y, 3, message="export expects rank=3")
+        if y.shape[1] == self.C:
+            y_bcn = y                         # (B,C,N)
+        elif y.shape[2] == self.C:
+            y_bcn = tf.transpose(y, [0, 2, 1])  # (B,N,C) -> (B,C,N)
+        else:
+            raise ValueError(f"export expects (B,C,N) or (B,N,C) with C={self.C}, got {y.shape}")
 
-        p3, p4, p5 = tf.split(out_nc, [N3, N4, N5], axis=1)
-        m3, m4, m5 = self.grid_modes
-        p3r = reorder_block_tf(p3, H3, W3, scan=m3[0], flip_y=bool(m3[1]), flip_x=bool(m3[2]))
-        p4r = reorder_block_tf(p4, H4, W4, scan=m4[0], flip_y=bool(m4[1]), flip_x=bool(m4[2]))
-        p5r = reorder_block_tf(p5, H5, W5, scan=m5[0], flip_y=bool(m5[1]), flip_x=bool(m5[2]))
+        # （可選）通道重排：如 student 與 teacher 通道語義已一致，關掉這步
+        if self.apply_chmap and self.ch_map is not None:
+            y_bcn = tf.gather(y_bcn, self.ch_map, axis=1)
 
-        preds_list = [p3r, p4r, p5r]
-        out_nc = tf.concat([preds_list[i] for i in self.porder], axis=1)
-        out_nc = tf.gather(out_nc, self.ch_map, axis=-1)
+        # （可選）只對 cls 與 kpt v 做 sigmoid
+        if self.apply_sigmoid_cls or self.apply_sigmoid_kptv:
+            NUM_CLS = int(config.NUM_CLS)
+            NUM_KPT = int(config.NUM_KPT)
+            KVAL    = int(config.KPT_VALS)  # 通常 3 -> (x,y,v)
 
-        # 輸出是 logits，但 TFLite 需要的是機率，因此在這裡加上 sigmoid
-        raw_box, raw_cls, raw_kpt = tf.split(out_nc, [4, config.NUM_CLS, -1], axis=-1)
+            box = y_bcn[:, 0:4, :]                    # 線性
+            cls = y_bcn[:, 4:4+NUM_CLS, :]            # 可能要 sigmoid
+            kpt = y_bcn[:, 4+NUM_CLS:, :]             # [K*V, N]
 
-        box = tf.sigmoid(raw_box)
-        cls = tf.sigmoid(raw_cls)
-        
-        kpt_reshaped = tf.reshape(raw_kpt, [-1, N3+N4+N5, config.NUM_KPT, config.KPT_VALS])
-        # kpt_xy = kpt_reshaped[..., :2] # xy 是 logits，但在 C++ 端處理
-        kpt_xy = tf.sigmoid(kpt_reshaped[..., :2]) # 新的程式碼，輸出歸一化座標
-        kpt_v = tf.sigmoid(kpt_reshaped[..., 2:3]) # v 是機率
-        kpt = tf.reshape(tf.concat([kpt_xy, kpt_v], axis=-1), [-1, N3+N4+N5, config.NUM_KPT * config.KPT_VALS])
-        
-        # 產生和 C++ code 預期一致的輸出：[box_prob, cls_prob, kpt_logits_v_prob]
-        pred_ultra = tf.concat([box, cls, kpt], axis=-1)
-        out_cn = tf.transpose(pred_ultra, [0, 2, 1])
-        return {"output0": tf.reshape(out_cn, [1, self.C, -1])}
+            if self.apply_sigmoid_cls and NUM_CLS > 0:
+                cls = tf.sigmoid(cls)
+
+            if self.apply_sigmoid_kptv and NUM_KPT > 0 and KVAL >= 3:
+                # reshape 成 (B, K, V, N)，對 v 通道做 sigmoid，再攤回去
+                B = tf.shape(y_bcn)[0]
+                N = tf.shape(y_bcn)[2]
+                kpt = tf.reshape(kpt, [B, NUM_KPT, KVAL, N])  # (B,K,V,N)
+                kxy = kpt[:, :, 0:2, :]                       # 線性
+                kv  = tf.sigmoid(kpt[:, :, 2:3, :])           # 機率
+                kpt = tf.concat([kxy, kv], axis=2)            # (B,K,3,N)
+                kpt = tf.reshape(kpt, [B, NUM_KPT*KVAL, N])   # (B,K*V,N)
+
+            y_bcn = tf.concat([box, cls, kpt], axis=1)        # (B,C,N)
+
+        # 輸出固定成 [1, C, N]
+        return {"output0": tf.reshape(y_bcn, [1, self.C, -1])}
 
 def _detect_resume_kind(p: str):
     """
@@ -359,7 +373,15 @@ def export_only(student, teacher, ds, output_paths, tag="export_only_diagnostics
             tfl_bytes = conv.convert()
             
             # 決定 TFLite 輸出路徑
-            tflite_filename = Path(rw).name + "_converted.tflite"
+            if config.TFLITE_QUANT_MODE == 'fp32':
+                tflite_filename = Path(rw).name + "_FP32_converted.tflite"
+            elif config.TFLITE_QUANT_MODE == 'fp16':
+                tflite_filename = Path(rw).name + "_FP16_converted.tflite"
+            elif config.TFLITE_QUANT_MODE == 'int8':
+                tflite_filename = Path(rw).name + "_int8_converted.tflite"
+            else:
+                tflite_filename = Path(rw).name + "_unknow_converted.tflite"
+
             tflite_path = output_paths['models'] / tflite_filename
             tflite_path.write_bytes(tfl_bytes)
             print(f"✅ TFLite model converted and saved to → {tflite_path}")
@@ -430,33 +452,18 @@ def run_diagnostics_once(
       3) Variance across N for several channels        -> detect plateau
     ==============================================================================
     """
-    # ---- 1) Keras student (serving_fn -> [1,C,N]) ----
-    out_keras = export_mod.serving_fn(sample_one)["output0"].numpy()  # (1, C, N)
-
-    # ---- 2) TFLite student (-> [1,C,N]) ----
-    out_tfl = _run_tflite_infer(tflite_path, sample_one)              # (1, C, N)
-
-    # ---- 3) Teacher normalized (B,N,C) -> transpose to (1,C,N) ----
-    expected_C = C
-    te_nc = normalize_teacher_pred(
-                        teacher(sample_one, training=False),
-                        expected_C=C,
-                        num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS,
-                        batch_imgs=sample_one,
-                        target_domain='unit',          # ★ 改 'pixel' 可走像素域
-                        return_detected=False
-                        )
-
-    te_cn = np.transpose(te_nc, (0, 2, 1))  # (1, C, N)
+    out_keras = export_mod.serving_fn(sample_one)["output0"].numpy()
+    out_tfl = _run_tflite_infer(tflite_path, sample_one)
+    te_nc = teacher(sample_one, training=False)
 
     # sanity shape
-    assert out_keras.shape[1] == C and out_tfl.shape[1] == C and te_cn.shape[1] == C, \
-        f"Channel mismatch: keras={out_keras.shape}, tflite={out_tfl.shape}, teacher={te_cn.shape}"
+    assert out_keras.shape[1] == C and out_tfl.shape[1] == C and te_nc.shape[1] == C, \
+        f"Channel mismatch: keras={out_keras.shape}, tflite={out_tfl.shape}, teacher={te_nc.shape}"
 
     # slices
     c0_box = 0
     c1_box = 4
-    c0_cls = 4
+    c0_cls = c1_box
     c1_cls = 4 + NUM_CLS
     c0_kpt = c1_cls
     c1_kpt = C
@@ -470,9 +477,9 @@ def run_diagnostics_once(
     mae_kpt_tk = mae_slice(out_tfl, out_keras, c0_kpt, c1_kpt)
 
     # ---- MAE: Student(Keras) vs Teacher (對齊/訓練程度) ----
-    mae_box_st = mae_slice(out_keras, te_cn, c0_box, c1_box)
-    mae_cls_st = mae_slice(out_keras, te_cn, c0_cls, c1_cls)
-    mae_kpt_st = mae_slice(out_keras, te_cn, c0_kpt, c1_kpt)
+    mae_box_st = mae_slice(out_keras, te_nc, c0_box, c1_box)
+    mae_cls_st = mae_slice(out_keras, te_nc, c0_cls, c1_cls)
+    mae_kpt_st = mae_slice(out_keras, te_nc, c0_kpt, c1_kpt)
 
     # ---- Variance across N（檢查是否又變成常數） ----
     def var_across_N(y_cn, ch, limit=500):
@@ -490,7 +497,7 @@ def run_diagnostics_once(
     }
 
     print("\n========== One-shot Diagnostics ==========")
-    print(f"[Shapes] keras={out_keras.shape}, tflite={out_tfl.shape}, teacher={te_cn.shape}")
+    print(f"[Shapes] keras={out_keras.shape}, tflite={out_tfl.shape}, teacher={te_nc.shape}")
     print("\n---- MAE: Student TFLite  vs Student Keras (serving_fn) ----")
     print(f"  box: {mae_box_tk:.6f} | cls: {mae_cls_tk:.6f} | kpt: {mae_kpt_tk:.6f}")
     print("\n---- MAE: Student Keras  vs Teacher (normalized) ----")

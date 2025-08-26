@@ -28,6 +28,7 @@ import Depance file
 import time
 from datetime import datetime
 from pathlib import Path
+import numpy as np 
 
 import tensorflow_model_optimization as tfmot
 
@@ -48,6 +49,8 @@ from src.process.Train_Model import (build_student_qat, run_qat, choose_student_
 
 from src.process.Export_Model import (ExportModule, run_diagnostics_once,export_only, 
                                       create_and_configure_tflite_converter)
+
+from src.process.pred_model import (ensure_BNC_static)
 
 if config.PLOT_Switch == True:
     from src.process.Plot_Data import plot_and_save_loss_curve
@@ -94,47 +97,7 @@ def main():
     ds, n_files = build_dataset(img_glob=config.REP_DIR_train, batch=config.BATCH)
     steps_per_epoch = max(1, n_files // config.BATCH)
 
-
-    # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝
-    import numpy as np 
-    sample_batch = next(iter(ds))
-    sample_imgs = sample_batch[0] if isinstance(sample_batch, (list, tuple)) else sample_batch
-    sample_one = _ensure_bhwc4(sample_imgs, imgsz=config.IMGSZ)
-
-    y_t_raw = teacher(sample_one, training=False)           # Teacher raw
-    y_s_out = student(sample_one, training=True)            # [deploy_raw, kd_raw]
-    kd_raw   = y_s_out[1] if isinstance(y_s_out, (list,tuple)) else y_s_out
-
-
-    y_s_numpy_list = [tensor.numpy() for tensor in y_s_out]
-    y_t_numpy = y_t_raw.numpy()
-
-    # 處理 Student 的第一個輸出
-    student_preds_0 = y_s_numpy_list[0] # shape: (2, 8400, 56)
-    # 將 (2, 8400, 56) reshape 成 (2 * 8400, 56) -> (16800, 56)
-    student_preds_0_reshaped = student_preds_0.reshape(-1, student_preds_0.shape[-1])
-    np.savetxt('./output/student_output_0_init.txt', student_preds_0_reshaped, fmt='%.8f', delimiter=',')
-
-    # 處理 Student 的第二個輸出
-    student_preds_1 = y_s_numpy_list[1]
-    student_preds_1_reshaped = student_preds_1.reshape(-1, student_preds_1.shape[-1])
-    np.savetxt('./output/student_output_1_init.txt', student_preds_1_reshaped, fmt='%.8f', delimiter=',')
-
-
-    # 處理 Teacher 的輸出
-    # 注意：Teacher 的維度是 (2, 56, 8400)，和 Student (2, 8400, 56) 不同
-    # 我們可以先將其轉置(transpose)成與 Student 一致的維度
-    y_t_numpy_transposed = y_t_numpy.transpose((0, 2, 1)) # (2, 56, 8400) -> (2, 8400, 56)
-    # 再進行 Reshape
-    teacher_preds_reshaped = y_t_numpy_transposed.reshape(-1, y_t_numpy_transposed.shape[-1])
-    np.savetxt('./output/teacher_output_init.txt', teacher_preds_reshaped, fmt='%.8f', delimiter=',')
-    # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝
-
-
-
-
     try:
-        # 4) QAT 微調 or 直接 Export
         if getattr(config, "EXPORT_ONLY", False):
             print("\n=== EXPORT_ONLY: skip training, use current/loaded weights ===")
             export_only(student, teacher, ds, output_paths, tag="export_only")
@@ -148,51 +111,62 @@ def main():
                 plot_and_save_loss_curve(loss_history, output_paths['loss_plot'])
 
     except KeyboardInterrupt:
-        # 極端情況：某些環境仍會拋出 KeyboardInterrupt；這裡兜底處理
         print("\n[⚠️ Interrupt] KeyboardInterrupt caught. Will export current weights...\n")
     finally:
-
-
+        
     # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝
-        import numpy as np 
+
+        # # 1) 準備樣本
         sample_batch = next(iter(ds))
         sample_imgs = sample_batch[0] if isinstance(sample_batch, (list, tuple)) else sample_batch
         sample_one = _ensure_bhwc4(sample_imgs, imgsz=config.IMGSZ)
 
-        y_t_raw = teacher(sample_one, training=False)           # Teacher raw
-        y_s_out = student(sample_one, training=False)            # [deploy_raw, kd_raw]
-        kd_raw   = y_s_out[1] if isinstance(y_s_out, (list,tuple)) else y_s_out
+        # # 2) 重新計算 teacher / student 的對齊資訊（和訓練邏輯一致）
+        C = 4 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
+        # H3 = W3 = config.IMGSZ // 8
+        # H4 = W4 = config.IMGSZ // 16
+        # H5 = W5 = config.IMGSZ // 32
+        # N3, N4, N5 = H3*W3, H4*W4, H5*W5
 
+        # lens_perm, reorder_idx = choose_student_split_order(
+        #     student, teacher, sample_one, N3, N4, N5, C, NUM_CLS, NUM_KPT, KPT_VALS
+        # )
+        # lens_perm  = tuple(int(x) for x in lens_perm)
+        # reorder_idx = [int(x) for x in reorder_idx]
 
-        y_s_numpy_list = [tensor.numpy() for tensor in y_s_out]
-        y_t_numpy = y_t_raw.numpy()
+        # def _reorder_N_blocks(y_BNC):
+        #     s0, s1, s2 = lens_perm
+        #     parts = tf.split(y_BNC, [s0, s1, s2], axis=1)
+        #     return tf.concat([parts[reorder_idx[0]], parts[reorder_idx[1]], parts[reorder_idx[2]]], axis=1)
 
-        # 處理 Student 的第一個輸出
-        student_preds_0 = y_s_numpy_list[0] # shape: (2, 8400, 56)
-        # 將 (2, 8400, 56) reshape 成 (2 * 8400, 56) -> (16800, 56)
-        student_preds_0_reshaped = student_preds_0.reshape(-1, student_preds_0.shape[-1])
-        np.savetxt('./output/student_output_0.txt', student_preds_0_reshaped, fmt='%.8f', delimiter=',')
+        # 3) 正確取分支 -> 統一到 (B,N,C) -> 學生做重排
+        y_t_raw = teacher(sample_one, training=False)
+        y_s_out = student(sample_one, training=False)
 
-        # 處理 Student 的第二個輸出
-        student_preds_1 = y_s_numpy_list[1]
-        student_preds_1_reshaped = student_preds_1.reshape(-1, student_preds_1.shape[-1])
-        np.savetxt('./output/student_output_1.txt', student_preds_1_reshaped, fmt='%.8f', delimiter=',')
+        # teacher to (B,N,C)
+        y_t_BNC = ensure_BNC_static(y_t_raw, C)  # 不要自己 transpose
+        # student kd 分支到 (B,N,C) + 重排
+        kd_raw = y_s_out[1] if isinstance(y_s_out, (list,tuple)) else y_s_out
+        kd_BNC = ensure_BNC_static(kd_raw, C)
+        # kd_BNC = _reorder_N_blocks(kd_BNC)
 
+        # （如有需要，也可把 deploy 分支同樣轉為 BNC + 重排後另存，僅供參考）
+        dep_raw = y_s_out[0] if isinstance(y_s_out, (list,tuple)) else None
+        if dep_raw is not None:
+            dep_BNC = ensure_BNC_static(dep_raw, C)
+            # dep_BNC = _reorder_N_blocks(dep_BNC)
 
-        # 處理 Teacher 的輸出
-        # 注意：Teacher 的維度是 (2, 56, 8400)，和 Student (2, 8400, 56) 不同
-        # 我們可以先將其轉置(transpose)成與 Student 一致的維度
-        y_t_numpy_transposed = y_t_numpy.transpose((0, 2, 1)) # (2, 56, 8400) -> (2, 8400, 56)
-        # 再進行 Reshape
-        teacher_preds_reshaped = y_t_numpy_transposed.reshape(-1, y_t_numpy_transposed.shape[-1])
-        np.savetxt('./output/teacher_output.txt', teacher_preds_reshaped, fmt='%.8f', delimiter=',')
+        # 4) 攤平成 (B*N, C) 存檔
+        teacher_flat = tf.reshape(y_t_BNC, [-1, C]).numpy()
+        student_kd_flat = tf.reshape(kd_BNC, [-1, C]).numpy()
+        np.savetxt(output_paths['logs'] / 'teacher_output.txt', teacher_flat, fmt='%.4f', delimiter=',')
+        np.savetxt(output_paths['logs'] / 'student_kd_output.txt', student_kd_flat, fmt='%.4f', delimiter=',')
+
+        if dep_raw is not None:
+            student_dep_flat = tf.reshape(dep_BNC, [-1, C]).numpy()
+            np.savetxt( output_paths['logs'] / 'student_deploy_output.txt', student_dep_flat, fmt='%.4f', delimiter=',')
+        
     # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝
-
-
-
-        '''
-        expected_C = 4 + config.NUM_CLS + config.NUM_KPT*config.KPT_VALS
-        probe_kd_output_distribution(student, ds, expected_C, imgsz=config.IMGSZ)
         
         if not getattr(config, "EXPORT_ONLY", False):
             # 5) 導出前準備（你原本的第 5～9 步）
@@ -203,6 +177,16 @@ def main():
             C  = 4 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
             print(f"\nExpected N={N3+N4+N5}, C={C}")
 
+# =================================================================================================================
+            # if hasattr(tfmot.quantization.keras, "strip_quantization"):
+            #     print("\n[INFO] Stripping quantization wrappers from the KD-only submodel.")
+            #     student_kd = tf.keras.Model(student.input, student.outputs[1], name="student_kd_only")  # 取 KD
+            #     student_infer = tfmot.quantization.keras.strip_quantization(student_kd)
+            # else:
+            #     print("\n[WARN] `strip_quantization` not found; exporting wrapped KD-only submodel.")
+            #     student_infer = tf.keras.Model(student.input, student.outputs[1], name="student_kd_only")
+# =================================================================================================================
+
             if hasattr(tfmot.quantization.keras, "strip_quantization"):
                 print("\n[INFO] Stripping quantization wrappers from the model.")
                 # 只取 deploy 分支輸出（index 0）
@@ -212,24 +196,23 @@ def main():
                 print("\n[WARN] `strip_quantization` not found; exporting wrapped model.")
                 student_infer = tf.keras.Model(student.input, student.outputs[0], name="student_deploy_only")
 
+# =================================================================================================================
 
             # 6) 自動對齊輸出順序
-            try:
-                sample_batch = next(iter(ds))
-                sample_imgs = sample_batch[0] if isinstance(sample_batch, (list, tuple)) else sample_batch
-                sample_one = _ensure_bhwc4(sample_imgs, imgsz=config.IMGSZ)
-            except Exception:
-                sample_one = tf.zeros([1, config.IMGSZ, config.IMGSZ, 3], tf.float32)
+#             try:
+#                 sample_batch = next(iter(ds))
+#                 sample_imgs = sample_batch[0] if isinstance(sample_batch, (list, tuple)) else sample_batch
+#                 sample_one = _ensure_bhwc4(sample_imgs, imgsz=config.IMGSZ)
+#             except Exception:
+#                 sample_one = tf.zeros([1, config.IMGSZ, config.IMGSZ, 3], tf.float32)
 
-            lens_perm, reorder_idx = choose_student_split_order(student_infer, teacher, sample_one, N3, N4, N5, C)
-
+#             lens_perm, reorder_idx = choose_student_split_order(student_infer, teacher, sample_one, N3, N4, N5, C, 
+#                                                                 config.NUM_CLS, config.NUM_KPT, config.KPT_VALS,)
+            
             # 7) 導出 SavedModel
             print("\n--- Exporting SavedModel ---")
-            export_mod = ExportModule(
-                student_infer, C=C, lens_perm=lens_perm, reorder_idx=reorder_idx,
-                grid_modes=config.GRID_MODES, porder=config.PORDER, ch_map=config.CHANNEL_MAPPING,
-                xywh_to_ltrb=config.XYWH_TO_LTRB, xywh_is_norm01=config.XYWH_IS_NORMALIZED_01 if hasattr(config,'XYWH_IS_NORMALIZED_01') else config.XYWH_IS_NORMALIZED_01
-            )
+            export_mod = ExportModule( student_infer, C=C, apply_chmap=False, ch_map=None, apply_sigmoid_cls=False, apply_sigmoid_kptv=False )
+            
             saved_model_path = str(output_paths['models'] / ("qat_saved_model_interrupted" if config.STOP_REQUESTED else "qat_saved_model"))
             concrete_fn = export_mod.serving_fn.get_concrete_function()
             tf.saved_model.save(export_mod, saved_model_path, signatures=concrete_fn)
@@ -239,7 +222,16 @@ def main():
             conv = create_and_configure_tflite_converter(saved_model_path)
 
             tfl_bytes   = conv.convert()
-            tflite_path = str(output_paths['models'] / ("best_qat_int8_interrupted.tflite" if config.STOP_REQUESTED else "best_qat_int8.tflite"))
+
+            if config.TFLITE_QUANT_MODE == 'fp32':
+                tflite_path = str(output_paths['models'] / ("best_qat_FP32_interrupted.tflite" if config.STOP_REQUESTED else "best_qat_FP32.tflite"))
+            elif config.TFLITE_QUANT_MODE == 'fp16':
+                tflite_path = str(output_paths['models'] / ("best_qat_FP16_interrupted.tflite" if config.STOP_REQUESTED else "best_qat_FP16.tflite"))
+            elif config.TFLITE_QUANT_MODE == 'int8':
+                tflite_path = str(output_paths['models'] / ("best_qat_int8_interrupted.tflite" if config.STOP_REQUESTED else "best_qat_int8.tflite"))
+            else:
+                tflite_path = str(output_paths['models'] / ("best_qat_unknow_interrupted.tflite" if config.STOP_REQUESTED else "best_qat_unknow.tflite"))
+
             Path(tflite_path).write_bytes(tfl_bytes)
             print(f"\n✅ TFLite model written to → {tflite_path}")
 
@@ -261,7 +253,7 @@ def main():
                 NUM_KPT=config.NUM_KPT,
                 KPT_VALS=config.KPT_VALS,
             )
-        '''
+            
     # 10) 完成
     end_time = time.time()
     print(f"\n--- 🎉 All tasks completed in {((end_time - start_time) / 60):.2f} minutes. ---")
