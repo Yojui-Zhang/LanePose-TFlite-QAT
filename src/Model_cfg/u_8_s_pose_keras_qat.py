@@ -37,63 +37,78 @@ NK = config.NUM_KPT
 KPT_DIM = config.KPT_VALS
 RAW_C = 4 * REG_MAX + NC + NK * KPT_DIM  # 每個格點的 raw 通道數
 
-
-class TeacherCompatHead(L.Layer):
-    """
-    直接輸出 (B, C, N) 的 head，語義與通道排序與 Ultralytics YOLOv8-pose 對齊：
-    [ x, y, w, h, cls..., kpt(x,y,v)_1, kpt(x,y,v)_2, ... ]
-    其中只有 cls 與 v 走 sigmoid，其餘維持線性。
-    """
-    def __init__(self, num_cls: int, num_kpt: int, kpt_vals: int, name="head", apply_sigmoid=True):
-        super().__init__(name=name)
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+@tf.keras.utils.register_keras_serializable(package="QAT")
+class TeacherCompatHead(tf.keras.layers.Layer):
+    def __init__(self, num_cls, num_kpt, kpt_vals, name="head", apply_sigmoid=True, **kw):
+        super().__init__(name=name, **kw)
         self.num_cls  = int(num_cls)
         self.num_kpt  = int(num_kpt)
         self.kpt_vals = int(kpt_vals)
         self.C = 4 + self.num_cls + self.num_kpt * self.kpt_vals
-        # 三層各自的 1×1 conv 直接出 C 個通道（不加激活，讓後面做選擇性激活）
-        self.p3_conv = L.Conv2D(self.C, 1, padding="same", use_bias=True, name=f"{name}/p3_out")
-        self.p4_conv = L.Conv2D(self.C, 1, padding="same", use_bias=True, name=f"{name}/p4_out")
-        self.p5_conv = L.Conv2D(self.C, 1, padding="same", use_bias=True, name=f"{name}/p5_out")
         self.apply_sigmoid = bool(apply_sigmoid)
-        
-    def _apply_prob_activations(self, y):
-        box = y[..., :4]
-        cls = y[..., 4:4+self.num_cls]
-        kpt = y[..., 4+self.num_cls:]
-        if self.apply_sigmoid:
-            cls = tf.sigmoid(cls)
-        if self.kpt_vals >= 3:
-            B,H,W = tf.shape(y)[0], tf.shape(y)[1], tf.shape(y)[2]
-            kpt = tf.reshape(kpt, [B,H,W,self.num_kpt,self.kpt_vals])
-            kxy = kpt[..., :2]
-            kv  = tf.sigmoid(kpt[..., 2:3]) if self.apply_sigmoid else kpt[..., 2:3]
-            kpt = tf.concat([kxy, kv], axis=-1)
-            kpt = tf.reshape(kpt, [B,H,W,self.num_kpt*self.kpt_vals])
-        return tf.concat([box, cls, kpt], axis=-1)
+        self.p3_conv = tf.keras.layers.Conv2D(self.C, 1, padding="same", use_bias=True, name=f"{name}/p3_out")
+        self.p4_conv = tf.keras.layers.Conv2D(self.C, 1, padding="same", use_bias=True, name=f"{name}/p4_out")
+        self.p5_conv = tf.keras.layers.Conv2D(self.C, 1, padding="same", use_bias=True, name=f"{name}/p5_out")
 
-    @staticmethod
-    def _to_BCN(t):
-        # t: (B, H, W, C) -> (B, C, H*W)
-        return L.Lambda(
-            lambda x: tf.transpose(
-                tf.reshape(x, [tf.shape(x)[0], -1, tf.shape(x)[3]]),  # (B, H*W, C)
-                [0, 2, 1]                                            # (B, C, H*W)
-            )
-        )(t)
+    def get_config(self):
+        # Get the default config from the parent class (tf.keras.layers.Layer)
+        cfg = super().get_config()
+        # Add your custom parameters to the dictionary
+        cfg.update({
+            "num_cls": self.num_cls,
+            "num_kpt": self.num_kpt,
+            "kpt_vals": self.kpt_vals,
+            "apply_sigmoid": self.apply_sigmoid
+        })
+        return cfg
+
+    def _apply_prob_activations(self, y):
+        # 使用 L.Lambda 提取張量切片，確保圖的連續性
+        box = L.Lambda(lambda t: t[..., :4], name=f"{self.name}/slice_box")(y)
+        cls = L.Lambda(lambda t: t[..., 4:4+self.num_cls], name=f"{self.name}/slice_cls")(y)
+        kpt = L.Lambda(lambda t: t[..., 4+self.num_cls:], name=f"{self.name}/slice_kpt")(y)
+
+        if self.apply_sigmoid:
+            cls = L.Activation('sigmoid', name=f"{self.name}/cls_sigmoid")(cls)
+
+        if self.kpt_vals >= 3:
+            B, H, W, _ = y.shape
+            # 使用 Keras Layer 進行 reshape
+            kpt = L.Reshape((H, W, self.num_kpt, self.kpt_vals), name=f"{self.name}/kpt_reshape1")(kpt)
+            
+            kxy = L.Lambda(lambda t: t[..., :2], name=f"{self.name}/slice_kxy")(kpt)
+            kv = L.Lambda(lambda t: t[..., 2:3], name=f"{self.name}/slice_kv")(kpt)
+            
+            if self.apply_sigmoid:
+                kv = L.Activation('sigmoid', name=f"{self.name}/kv_sigmoid")(kv)
+            
+            # 使用 Keras Layer 進行 concat
+            kpt = L.Concatenate(axis=-1, name=f"{self.name}/kpt_concat")([kxy, kv])
+            kpt = L.Reshape((H, W, self.num_kpt * self.kpt_vals), name=f"{self.name}/kpt_reshape2")(kpt)
+        
+        return L.Concatenate(axis=-1, name=f"{self.name}/output_concat")([box, cls, kpt])
+
+    def _to_BCN(self, t):
+        # (B,H,W,C) -> (B,C,H*W)
+        # 使用 Keras Layer 進行 transpose 和 reshape
+        y = L.Permute((3, 1, 2), name=f"{self.name}/transpose_bchw")(t)  # (B,C,H,W)
+        y = L.Reshape((t.shape[-1], -1), name=f"{self.name}/flatten_hw")(y)  # (B,C,N)
+        return y
 
     def call(self, feats, training=False):
-        p3, p4, p5 = feats  # 請保證來自 P3(最高解析)→P4→P5 的順序
-        y3 = self._apply_prob_activations(self.p3_conv(p3))  # (B,H3,W3,C)
-        y4 = self._apply_prob_activations(self.p4_conv(p4))  # (B,H4,W4,C)
-        y5 = self._apply_prob_activations(self.p5_conv(p5))  # (B,H5,W5,C)
+        p3, p4, p5 = feats  # 1/8, 1/16, 1/32
+        y3 = self._apply_prob_activations(self.p3_conv(p3))
+        y4 = self._apply_prob_activations(self.p4_conv(p4))
+        y5 = self._apply_prob_activations(self.p5_conv(p5))
+        bcn3 = self._to_BCN(y3)
+        bcn4 = self._to_BCN(y4)
+        bcn5 = self._to_BCN(y5)
+        return tf.keras.layers.Concatenate(axis=2, name=f"{self.name}/preds")([bcn3, bcn4, bcn5])
 
-        bcn3 = self._to_BCN(y3)  # (B, C, N3)
-        bcn4 = self._to_BCN(y4)  # (B, C, N4)
-        bcn5 = self._to_BCN(y5)  # (B, C, N5)
 
-        preds = L.Concatenate(axis=2, name=f"{self.name}/preds")([bcn3, bcn4, bcn5])  # (B, C, N)
-        return preds
 
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
 
 def dfl_pose_head(p3, p4, p5, ch=128):
     # 三個子塔：回歸(DFL)、分類/obj、關鍵點
@@ -129,7 +144,7 @@ def dfl_pose_head(p3, p4, p5, ch=128):
     # preds  = L.Concatenate(axis=1, name='head.concat.bnc')([o3_bnc, o4_bnc, o5_bnc])  # [B,8400,RAW_C]
     return o3_bnc, o4_bnc, o5_bnc
 
-
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
 def conv_bn_act(x, out_ch: int, k: int = 3, s: int = 1, name: str = None, act: str = "relu6"):
     x = L.Conv2D(out_ch, k, strides=s, padding='same', use_bias=False,
                  name=None if not name else f"{name}/conv")(x)
@@ -145,17 +160,17 @@ def conv_bn_act(x, out_ch: int, k: int = 3, s: int = 1, name: str = None, act: s
     return x
 
 def c2f_block(x, out_ch: int, n: int = 2, name: str = None):
-    y = conv_bn_act(x, out_ch, k=1, s=1, name=None if not name else f"{name}/cv1")
+    y = conv_bn_act(x, out_ch, k=1, s=1, name=None if not name else f"{name}/cv1", act='relu6')
     parts = [y]
     for i in range(n):
-        y = conv_bn_act(y, out_ch, k=3, s=1, name=None if not name else f"{name}/m{i}")
+        y = conv_bn_act(y, out_ch, k=3, s=1, name=None if not name else f"{name}/m{i}", act='relu6')
         parts.append(y)
     z = L.Concatenate(axis=-1, name=None if not name else f"{name}/concat")(parts)
-    z = conv_bn_act(z, out_ch, k=1, s=1, name=None if not name else f"{name}/cv2")
+    z = conv_bn_act(z, out_ch, k=1, s=1, name=None if not name else f"{name}/cv2", act='relu6')
     return z
 
 def sppf_block(x, out_ch: int, k: int = 5, name: str = None):
-    x1 = conv_bn_act(x, out_ch, k=1, s=1, name=None if not name else f"{name}/cv1")
+    x1 = conv_bn_act(x, out_ch, k=1, s=1, name=None if not name else f"{name}/cv1", act='relu6')
     p1 = L.MaxPool2D(pool_size=k, strides=1, padding='same',
                      name=None if not name else f"{name}/p1")(x1)
     p2 = L.MaxPool2D(pool_size=k, strides=1, padding='same',
@@ -163,17 +178,129 @@ def sppf_block(x, out_ch: int, k: int = 5, name: str = None):
     p3 = L.MaxPool2D(pool_size=k, strides=1, padding='same',
                      name=None if not name else f"{name}/p3")(p2)
     cat = L.Concatenate(axis=-1, name=None if not name else f"{name}/cat")([x1, p1, p2, p3])
-    y = conv_bn_act(cat, out_ch, k=1, s=1, name=None if not name else f"{name}/cv2")
+    y = conv_bn_act(cat, out_ch, k=1, s=1, name=None if not name else f"{name}/cv2", act='relu6')
     return y
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+def dw_conv_bn_act(x, out_ch, k=3, s=1, name=None, act='relu6'):
+    x = L.DepthwiseConv2D(k, strides=s, padding='same', use_bias=False,
+                          name=None if not name else f'{name}/dw')(x)
+    x = L.BatchNormalization(epsilon=1e-3, momentum=0.99,
+                             name=None if not name else f'{name}/dw_bn')(x)
+    if act == 'relu6':
+        x = L.ReLU(max_value=6.0, name=None if not name else f'{name}/dw_relu6')(x)
+    elif act == 'relu':
+        x = L.ReLU(name=None if not name else f'{name}/dw_relu')(x)
+    else:
+        x = L.LeakyReLU(0.1, name=None if not name else f'{name}/dw_lrelu')(x)
 
-def make_head(x, out_ch: int, mid_ch: int, name: str):
-    x = conv_bn_act(x, mid_ch, k=3, s=1, name=f"{name}/h1")
-    x = conv_bn_act(x, mid_ch, k=3, s=1, name=f"{name}/h2")
-    x = L.Conv2D(out_ch, 1, padding='same', activation=None, name=f"{name}/out")(x)
+    x = L.Conv2D(out_ch, 1, strides=1, padding='same', use_bias=False,
+                 name=None if not name else f'{name}/pw')(x)
+    x = L.BatchNormalization(epsilon=1e-3, momentum=0.99,
+                             name=None if not name else f'{name}/pw_bn')(x)
+    if act == 'relu6':
+        x = L.ReLU(max_value=6.0, name=None if not name else f'{name}/pw_relu6')(x)
+    elif act == 'relu':
+        x = L.ReLU(name=None if not name else f'{name}/pw_relu')(x)
+    else:
+        x = L.LeakyReLU(0.1, name=None if not name else f'{name}/pw_lrelu')(x)
     return x
 
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
 
-def build_u8s_pose(
+def se_block(x, ratio=16, name=None):
+    ch = x.shape[-1]
+    s  = L.GlobalAveragePooling2D(keepdims=True, name=None if not name else f'{name}/gap')(x)
+    s  = L.Conv2D(ch // ratio, 1, activation='relu',
+                  name=None if not name else f'{name}/down')(s)
+    s  = L.Conv2D(ch, 1, activation='sigmoid',
+                  name=None if not name else f'{name}/up')(s)
+    return L.Multiply(name=None if not name else f'{name}/scale')([x, s])
+
+def repvgg_block(x, out_ch, k=3, s=1, use_se=False, name='rep', act='relu6'):
+    # 三條支路：3x3+BN、1x1+BN、Identity BN（條件成立才有）
+
+    y3  = conv_bn_act(x, out_ch, k=k, s=s, name=f'{name}/rbr_dense', act='relu6')
+    y1  = conv_bn_act(x, out_ch, k=1, s=s, name=f'{name}/rbr_1x1', act='relu6')
+    yid = None
+    if x.shape[-1] == out_ch and s == 1:
+        yid = L.BatchNormalization(epsilon=1e-3, momentum=0.99, name=f'{name}/rbr_identity')(x)
+
+    # 相加 -> （可選）SE -> 激活
+    parts = [t for t in (y3, y1, yid) if t is not None]
+    y = L.Add(name=f'{name}/sum')(parts)
+    if use_se:
+        y = se_block(y, ratio=16, name=f'{name}/se')
+
+    if act == 'relu6':
+        y = L.ReLU(max_value=6.0, name=f'{name}/relu6')(y)
+    elif act == 'relu':
+        y = L.ReLU(name=f'{name}/relu')(y)
+    else:
+        y = L.Activation('swish', name=f'{name}/silu')(y)
+    return y
+
+
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+
+@tf.keras.utils.register_keras_serializable(package="QAT")
+class ChannelAttention(L.Layer):
+    def __init__(self, ratio=16, **kw):
+        super().__init__(**kw)
+        self.ratio = int(ratio)
+        self.mlp1 = L.Conv2D(None, 1)  # 佔位，build 時根據輸入通道設置
+        self.mlp2 = L.Conv2D(None, 1)
+
+    def build(self, input_shape):
+        C = int(input_shape[-1])
+        self.mlp1 = L.Conv2D(C // self.ratio, 1, activation="relu", use_bias=True, name=f"{self.name}/mlp1")
+        self.mlp2 = L.Conv2D(C,              1, activation=None,   use_bias=True, name=f"{self.name}/mlp2")
+
+    def call(self, x):
+        avg = L.GlobalAveragePooling2D(keepdims=True, name=f"{self.name}/gap")(x)
+        mx  = L.GlobalMaxPooling2D(keepdims=True,     name=f"{self.name}/gmp")(x)
+        avg = self.mlp2(self.mlp1(avg))
+        mx  = self.mlp2(self.mlp1(mx))
+        
+        # 修正：使用 Keras Layer
+        sum_feat = L.Add(name=f"{self.name}/add")([avg, mx])
+        scale = L.Activation('sigmoid', name=f"{self.name}/sigmoid")(sum_feat)
+        return L.Multiply(name=f"{self.name}/scale")([x, scale])
+
+    def get_config(self):
+        cfg = super().get_config(); cfg.update({"ratio": self.ratio}); return cfg
+
+@tf.keras.utils.register_keras_serializable(package="QAT")
+class SpatialAttention(L.Layer):
+    def __init__(self, kernel_size=7, **kw):
+        super().__init__(**kw)
+        self.kernel_size = int(kernel_size)
+        self.conv = L.Conv2D(1, self.kernel_size, padding="same", use_bias=False, activation="sigmoid",
+                             name=f"{self.name}/conv")
+
+    def call(self, x):
+        # 修正：使用 Lambda Layer 包裝 reduce 操作
+        avg = L.Lambda(lambda t: tf.reduce_mean(t, axis=-1, keepdims=True), name=f"{self.name}/avg_pool")(x)
+        mx  = L.Lambda(lambda t: tf.reduce_max(t, axis=-1, keepdims=True), name=f"{self.name}/max_pool")(x)
+        
+        # 修正：使用 Keras Layer
+        cat = L.Concatenate(axis=-1, name=f"{self.name}/concat")([avg, mx])
+        scale = self.conv(cat)
+        return L.Multiply(name=f"{self.name}/scale")([x, scale])
+
+    def get_config(self):
+        cfg = super().get_config(); cfg.update({"kernel_size": self.kernel_size}); return cfg
+
+@tf.keras.utils.register_keras_serializable(package="QAT")
+class CBAM(L.Layer):
+    def __init__(self, ratio=16, kernel_size=7, **kw):
+        super().__init__(**kw)
+        self.ca = ChannelAttention(ratio=ratio, name=f"{self.name}/ca")
+        self.sa = SpatialAttention(kernel_size=kernel_size, name=f"{self.name}/sa")
+
+    def call(self, x):
+        return self.sa(self.ca(x))
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+def build_u8s_pose_dual(
     input_shape: Tuple[int, int, int] = (640, 640, 3),
     num_classes: int = 7,
     num_kpt: int = 15,
@@ -182,59 +309,55 @@ def build_u8s_pose(
     depth_mult: float = 1.0,
 ):
     C = 4 + num_classes + num_kpt * kpt_vals
-
     def ch(c): return max(8, int(c * width_mult))
     def n(d):  return max(1, int(d * depth_mult))
 
     inp = L.Input(shape=input_shape, name='images')
 
     # Backbone
-    x  = conv_bn_act(inp, ch(64),  k=3, s=2, name='stem')
-    x  = c2f_block(x, ch(64),  n(2), name='c2f_1')
+    x0  = conv_bn_act(inp, ch(8),  k=3, s=2, name='Conv_0', act='relu6')                    # 1/2
 
-    x  = conv_bn_act(x, ch(128), k=3, s=2, name='down_2')
-    x  = c2f_block(x, ch(128), n(3), name='c2f_2')
+    x1 = dw_conv_bn_act(x0, ch(16), k=3, s=2, name='DWConv_1')                              # 1/4
+    x2 = repvgg_block(x1, ch(16), k=3, s=1, use_se=True, name='RepVGG_2', act='relu6')
 
-    x  = conv_bn_act(x, ch(256), k=3, s=2, name='down_3')
-    c3 = c2f_block(x, ch(256), n(3), name='c2f_3')
+    x3 = dw_conv_bn_act(x2, ch(32), k=3, s=2, name='DWConv_3')                              # 1/8
+    x4 = repvgg_block(x3, ch(32), k=3, s=1, use_se=True, name='RepVGG_4', act='relu6')
 
-    x  = conv_bn_act(c3, ch(512), k=3, s=2, name='down_4')
-    c4 = c2f_block(x, ch(512), n(3), name='c2f_4')
+    x5 = dw_conv_bn_act(x4, ch(64), k=3, s=2, name='DWConv_5')                              # 1/16
+    x6 = repvgg_block(x5, ch(64), k=3, s=1, use_se=True, name='RepVGG_6', act='relu6')
+    # x7 = CBAM(ratio=16, kernel_size=7, name="CBAM_7")(x6)
 
-    x  = conv_bn_act(c4, ch(512), k=3, s=2, name='down_5')
-    x  = c2f_block(x, ch(512), n(3), name='c2f_5')
-    c5 = sppf_block(x, ch(512), name='sppf')
+    x8 = dw_conv_bn_act(x6, ch(128), k=3, s=2, name='DWConv_8')                             # 1/32
+    x9 = repvgg_block(x8, ch(128), k=3, s=1, use_se=True, name='RepVGG_9', act='relu6')
+    # x10 = CBAM(ratio=16, kernel_size=7, name="CBAM_10")(x9)
+
+    x11 = sppf_block(x9, ch(128), name='SPPF_11')
 
     # Neck
-    concat = L.Concatenate(axis=-1)
-    p5_up  = L.UpSampling2D(name='p5_up')(c5)
-    p4_td  = c2f_block(concat([p5_up, c4]), ch(256), n(2), name='p4_td')
+    x12   = L.UpSampling2D(size=(2,2), name='UP_12')(x11)                                   # 1/16
+    x13   = L.Concatenate(axis=-1, name='cat_13')([x12, x6])
+    x14   = repvgg_block(x13, ch(64), k=3, s=1, name='RepVGG_14', act='LeakyRelu')
+    # x15   = CBAM(ratio=16, kernel_size=7, name="CBAM_15")(x14)
 
-    p4_up  = L.UpSampling2D(name='p4_up')(p4_td)
-    p3_out = c2f_block(concat([p4_up, c3]), ch(128), n(2), name='p3_out')
+    x16   = L.UpSampling2D(size=(2,2), name='UP_16')(x14)                                   # 1/8
+    x17   = L.Concatenate(axis=-1, name='cat_17')([x16, x4])
+    x18   = repvgg_block(x17, ch(32), k=3, s=1, name='RepVGG_18', act='LeakyRelu')
 
-    p3_dn  = conv_bn_act(p3_out, ch(256), k=3, s=2, name='p3_down')
-    p4_out = c2f_block(concat([p3_dn, p4_td]), ch(256), n(2), name='p4_out')
+    # x19   = L.UpSampling2D(size=(2,2), name='UP_19')(x18)                                   # 1/4
+    # x20   = L.Concatenate(axis=-1, name='cat_20')([x19, x2])
+    # x21   = repvgg_block(x20, ch(16), k=3, s=1, name='RepVGG_21', act='LeakyRelu')
 
-    p4_dn  = conv_bn_act(p4_out, ch(512), k=3, s=2, name='p4_down')
-    p5_out = c2f_block(concat([p4_dn, c5]), ch(512), n(2), name='p5_out')
 
-    # Head
-    out_p3 = make_head(p3_out, C, ch(128), name='head_p3')
-    out_p4 = make_head(p4_out, C, ch(256), name='head_p4')
-    out_p5 = make_head(p5_out, C, ch(512), name='head_p5')
-    # out_p3, out_p4, out_p5 = dfl_pose_head(p3_out, p4_out, p5_out)
+    # feats = (p3, p4, p5)  # 一定要這個順序！
+    head_kd = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="kd_head", apply_sigmoid=False)
+    kd_preds = head_kd((x18, x14, x9))
 
-    # Flatten HW -> N，避免 Lambda：用 Reshape
-    f3 = L.Reshape(target_shape=(-1, C), name='flat_p3')(out_p3)
-    f4 = L.Reshape(target_shape=(-1, C), name='flat_p4')(out_p4)
-    f5 = L.Reshape(target_shape=(-1, C), name='flat_p5')(out_p5)
-    out = L.Concatenate(axis=1, name='preds')([f3, f4, f5])
-    # out = L.Concatenate(axis=1, name='preds')([out_p3, out_p4, out_p5])
+    head_dep = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="deploy_head", apply_sigmoid=False)
+    deploy_preds = head_dep((x18, x14, x9))   
 
-    return K.Model(inp, out, name='u8s_pose_keras')
+    return K.Model(inp, [deploy_preds, kd_preds], name='u8s_pose_keras_dual')
 
-def build_u8s_pose_dual(
+def build_u8s_pose_dual_original(
     input_shape: Tuple[int, int, int] = (640, 640, 3),
     num_classes: int = 7,
     num_kpt: int = 15,
@@ -280,12 +403,12 @@ def build_u8s_pose_dual(
     p5_out = c2f_block(concat([p4_dn, c5]), ch(512), n(2), name='p5_out')
 
     # feats = (p3, p4, p5)  # 一定要這個順序！
-    head_kd = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="kd_head", apply_sigmoid=False)
+    head_kd = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="kd_head", apply_sigmoid=True)
     kd_preds = head_kd((p3_out, p4_out, p5_out))               # 形狀 (B, C, N) —— 蒸餾用浮點輸出
 
     # 若還需要 deploy（QAT）輸出，讓它走相同幾何路徑，僅在 head 前加量化 wrapper：
     # （保留你現有的量化 backbone/neck；這裡只保證 deploy 也輸出 (B,C,N) 且順序一致）
-    head_dep = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="deploy_head", apply_sigmoid=False)
+    head_dep = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="deploy_head", apply_sigmoid=True)
     deploy_preds = head_dep((p3_out, p4_out, p5_out))   
 
     return K.Model(inp, [deploy_preds, kd_preds], name='u8s_pose_keras_dual')
@@ -293,8 +416,8 @@ def build_u8s_pose_dual(
 
 
 if __name__ == '__main__':
-    m = build_u8s_pose((config.IMGSZ,config.IMGSZ,3), num_classes=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS)
+    m = build_u8s_pose_dual((config.IMGSZ,config.IMGSZ,3), num_classes=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS)
     m.summary(line_length=120)
-    x = tf.random.uniform([2,640,640,3], 0, 1, dtype=tf.float32)
+    x = tf.random.uniform([2, 640, 640, 3], 0, 1, dtype=tf.float32)
     y = m(x)
     print('Output shape:', y.shape)

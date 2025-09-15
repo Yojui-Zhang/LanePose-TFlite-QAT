@@ -48,13 +48,16 @@ def create_and_configure_tflite_converter(saved_model_path):
     conv = tf.lite.TFLiteConverter.from_saved_model(saved_model_path)
     mode = getattr(config, "TFLITE_QUANT_MODE", "int8")
 
+    print("\n開始 Export TFlite...")
+
     if mode == "int8":
         conv.optimizations = [tf.lite.Optimize.DEFAULT]
         conv.representative_dataset = rep_data_gen
-        # conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-        conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8, tf.lite.OpsSet.TFLITE_BUILTINS]
+        conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        # conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8, tf.lite.OpsSet.TFLITE_BUILTINS]
         conv.inference_input_type  = tf.float32
         conv.inference_output_type = tf.float32
+        print("\n選擇 Int8 Export TFlite...")
 
     elif mode == "fp16":
         conv.optimizations = [tf.lite.Optimize.DEFAULT]
@@ -63,6 +66,7 @@ def create_and_configure_tflite_converter(saved_model_path):
         conv.inference_input_type  = tf.float32
         conv.inference_output_type = tf.float32
         conv.representative_dataset = None
+        print("\n選擇 FP16 Export TFlite...")
 
     else:  # "fp32"
         conv.optimizations = []
@@ -70,6 +74,7 @@ def create_and_configure_tflite_converter(saved_model_path):
         conv.inference_input_type  = tf.float32
         conv.inference_output_type = tf.float32
         conv.representative_dataset = None
+        print("\n選擇 FP32 Export TFlite...")
 
     conv.experimental_new_converter = True
     try: conv.experimental_new_quantizer = True

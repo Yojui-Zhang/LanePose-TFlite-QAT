@@ -6,11 +6,11 @@ Training Settings
 ===================================================
 '''
 IMGSZ = 640
-BATCH = 6
-EPOCHS = 50              # 可先跑 5~10 看收斂
+BATCH = 2
+EPOCHS = 5              # 可先跑 5~10 看收斂
 
 base_lr = 0.01
-end_lr = 0.001
+end_lr = 0.01
 momentum = 0.9
 
 BNSTOP__ = True         # 凍結 BN , Ture不凍結/ False凍結
@@ -28,20 +28,20 @@ Location (Input/Output)
 '''
 """Train Dataset"""
 REP_DIR_train = [
-    "../_Dataset/KeyPoint/15point_6class_box0/20220830/images/*.jpg",
-    "../_Dataset/KeyPoint/15point_6class_box0/20240321_night/images/*.jpg",
-    "../_Dataset/KeyPoint/15point_6class_box0/acc_datasets/images/*.jpg",
-    "../_Dataset/KeyPoint/15point_6class_box0/s3_20230803/images/*.jpg",
-    "../_Dataset/KeyPoint/15point_6class_box0/Traffic_dataset_20240720_345_k/images/*.jpg",
-    "../_Dataset/KeyPoint/15point_6class_box0/yolov8data2_20250804/images/*.jpg"
-    # "../_Dataset/KeyPoint/temp/test1/images/*.jpg"
+    # "../_Dataset/KeyPoint/15point_6class_box0/20220830/images/*.jpg",
+    # "../_Dataset/KeyPoint/15point_6class_box0/20240321_night/images/*.jpg",
+    # "../_Dataset/KeyPoint/15point_6class_box0/acc_datasets/images/*.jpg",
+    # "../_Dataset/KeyPoint/15point_6class_box0/s3_20230803/images/*.jpg",
+    # "../_Dataset/KeyPoint/15point_6class_box0/Traffic_dataset_20240720_345_k/images/*.jpg",
+    # "../_Dataset/KeyPoint/15point_6class_box0/yolov8data2_20250804/images/*.jpg"
+    # "../_Dataset/KeyPoint/temp/mix_QAT/images/*.jpg"
 
-    # "../dataset/lanepose/mix_QAT/images/*.jpg"    
+    "../dataset/lanepose/mix_QAT/images/*.jpg"    
 ]
 
 """TFlite Validation Dataset"""
-REP_DIR_export = "../_Dataset/KeyPoint/temp/mix_QAT/images/*.jpg"
-# REP_DIR_export = "../dataset/lanepose/test1/images/*.jpg"
+# REP_DIR_export = "../_Dataset/KeyPoint/temp/mix_QAT/images/*.jpg"
+REP_DIR_export = "../dataset/lanepose/test1/images/*.jpg"
 
 """Teacher Model"""
 EXPORTED_DIR = "./lanepose20250807_s_model_640_640_6c_v1_saved_model/"
@@ -50,7 +50,7 @@ EXPORTED_DIR = "./lanepose20250807_s_model_640_640_6c_v1_saved_model/"
 TFLITE_OUT = "./output"
 
 """Export_Only Load Model""" 
-RESUME_WEIGHTS = "./output/20250821_074514/models/qat_saved_model_interrupted"
+RESUME_WEIGHTS = "./output/20250827_143201/models/qat_saved_model"
 
 '''
 ===================================================

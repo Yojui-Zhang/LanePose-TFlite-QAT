@@ -26,6 +26,7 @@ import Depance file
 ===================================================
 '''
 import time
+import cv2
 from datetime import datetime
 from pathlib import Path
 import numpy as np 
@@ -54,7 +55,89 @@ from src.process.pred_model import (ensure_BNC_static)
 
 if config.PLOT_Switch == True:
     from src.process.Plot_Data import plot_and_save_loss_curve
+    
+NUM_CLS  = config.NUM_CLS
+NUM_KPT  = config.NUM_KPT
+KPT_VALS = config.KPT_VALS
 
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+def _to_uint8_img(bhwc):
+    # 取 batch 第 1 張，前 3 通道（RGB）
+    img = bhwc[0, ..., :3].numpy() if hasattr(bhwc, 'numpy') else bhwc[0, ..., :3]
+    img = np.asarray(img)
+    # 轉 uint8
+    if img.dtype != np.uint8:
+        if img.max() <= 1.5:  # 0~1 規模
+            img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+        else:
+            img = np.clip(img, 0, 255).astype(np.uint8)
+    return img
+
+def _apply_sigmoid_for_pose(y_row):
+    """對一行 (C,) 套用 sigmoid：box(0:4), cls(4:4+NUM_CLS), kpt(xy,v)"""
+    z = y_row.copy()
+    z[0:4] = 1 / (1 + np.exp(-z[0:4]))  # box xywh
+    if NUM_CLS > 0:
+        z[4:4+NUM_CLS] = 1 / (1 + np.exp(-z[4:4+NUM_CLS]))
+    kpt = z[4+NUM_CLS:].reshape(NUM_KPT, KPT_VALS)
+    kpt[:, :2] = 1 / (1 + np.exp(-kpt[:, :2]))  # x,y
+    if KPT_VALS >= 3:
+        kpt[:, 2:3] = 1 / (1 + np.exp(-kpt[:, 2:3]))  # v
+    z[4+NUM_CLS:] = kpt.reshape(-1)
+    return z
+
+def _pick_best_and_draw(img_bgr, y_BNC, is_logits=False, out_path=None, title_text=None):
+    """
+    img_bgr: (H,W,3) uint8
+    y_BNC:   (N,C) numpy
+    is_logits: 若為 True 先做 sigmoid 映到 0~1
+    """
+    H, W = img_bgr.shape[:2]
+    arr = y_BNC.numpy() if hasattr(y_BNC, 'numpy') else y_BNC
+    arr = np.asarray(arr)
+
+    # 先把所有候選轉換到 unit 域便於打分
+    if is_logits:
+        arr_unit = np.stack([_apply_sigmoid_for_pose(r) for r in arr], axis=0)
+    else:
+        arr_unit = arr.copy()
+    # 計分：用 keypoint v 的平均值（若無 v 就用框面積當作備援）
+    kpt = arr_unit[:, 4+NUM_CLS:].reshape(-1, NUM_KPT, KPT_VALS)
+    if KPT_VALS >= 3:
+        v = kpt[:, :, 2]
+        scores = v.mean(axis=1)
+    else:
+        xywh = arr_unit[:, 0:4]
+        scores = (xywh[:, 2] * xywh[:, 3])  # 寬×高
+
+    best = int(scores.argmax())
+    det  = arr_unit[best]  # 已在 unit 域
+
+    # 取 box
+    x, y, w, h = det[0:4]
+    x1 = int((x - w/2) * W); y1 = int((y - h/2) * H)
+    x2 = int((x + w/2) * W); y2 = int((y + h/2) * H)
+
+    # 畫圖
+    canvas = img_bgr.copy()
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), (60, 220, 20), 2)
+    # 取 kpts
+    kpt_flat = det[4+NUM_CLS:].reshape(NUM_KPT, KPT_VALS)
+    for i in range(NUM_KPT):
+        kx = int(kpt_flat[i, 0] * W)
+        ky = int(kpt_flat[i, 1] * H)
+        kv = float(kpt_flat[i, 2] if KPT_VALS >= 3 else 1.0)
+        color = (40, 220, 40) if kv >= 0.5 else (40, 40, 220)
+        cv2.circle(canvas, (kx, ky), 3, color, -1)
+
+    if title_text:
+        cv2.putText(canvas, title_text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
+
+    if out_path is not None:
+        cv2.imwrite(str(out_path), canvas)
+    return canvas
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+    
 def main():
     # 0) 初始化設定
     start_time = time.time()
@@ -123,22 +206,7 @@ def main():
 
         # # 2) 重新計算 teacher / student 的對齊資訊（和訓練邏輯一致）
         C = 4 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
-        # H3 = W3 = config.IMGSZ // 8
-        # H4 = W4 = config.IMGSZ // 16
-        # H5 = W5 = config.IMGSZ // 32
-        # N3, N4, N5 = H3*W3, H4*W4, H5*W5
-
-        # lens_perm, reorder_idx = choose_student_split_order(
-        #     student, teacher, sample_one, N3, N4, N5, C, NUM_CLS, NUM_KPT, KPT_VALS
-        # )
-        # lens_perm  = tuple(int(x) for x in lens_perm)
-        # reorder_idx = [int(x) for x in reorder_idx]
-
-        # def _reorder_N_blocks(y_BNC):
-        #     s0, s1, s2 = lens_perm
-        #     parts = tf.split(y_BNC, [s0, s1, s2], axis=1)
-        #     return tf.concat([parts[reorder_idx[0]], parts[reorder_idx[1]], parts[reorder_idx[2]]], axis=1)
-
+        
         # 3) 正確取分支 -> 統一到 (B,N,C) -> 學生做重排
         y_t_raw = teacher(sample_one, training=False)
         y_s_out = student(sample_one, training=False)
@@ -166,7 +234,32 @@ def main():
             student_dep_flat = tf.reshape(dep_BNC, [-1, C]).numpy()
             np.savetxt( output_paths['logs'] / 'student_deploy_output.txt', student_dep_flat, fmt='%.4f', delimiter=',')
         
-    # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+
+        plots_dir = output_paths['plots']
+        os.makedirs(plots_dir, exist_ok=True)
+
+        # 取影像（batch 第 1 張）
+        img0 = _to_uint8_img(sample_one)
+        # 教師 / 學生 (N,C)
+        t_NC  = y_t_BNC[0].numpy() if hasattr(y_t_BNC, 'numpy') else y_t_BNC[0]
+        kd_NC = kd_BNC[0].numpy()  if hasattr(kd_BNC, 'numpy') else kd_BNC[0]
+        dep_NC = None
+        if dep_raw is not None:
+            dep_NC = dep_BNC[0].numpy() if hasattr(dep_BNC, 'numpy') else dep_BNC[0]
+
+        # 繪圖並儲存
+        path1 = plots_dir / "result1.png"
+        path2 = plots_dir / "result2.png"
+        path3 = plots_dir / "result3.png"
+
+        _ = _pick_best_and_draw(img0, t_NC,  is_logits=False, out_path=path1, title_text="Teacher")
+        _ = _pick_best_and_draw(img0, kd_NC, is_logits=True,  out_path=path2, title_text="Student KD")  # KD 多半是 logits
+        if dep_NC is not None:
+            _ = _pick_best_and_draw(img0, dep_NC, is_logits=False, out_path=path3, title_text="Student Deploy")
+        print(f"[viz] Saved: {path1}, {path2}" + (f", {path3}" if dep_NC is not None else ""))
+
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
         
         if not getattr(config, "EXPORT_ONLY", False):
             # 5) 導出前準備（你原本的第 5～9 步）
@@ -187,14 +280,16 @@ def main():
             #     student_infer = tf.keras.Model(student.input, student.outputs[1], name="student_kd_only")
 # =================================================================================================================
 
-            if hasattr(tfmot.quantization.keras, "strip_quantization"):
-                print("\n[INFO] Stripping quantization wrappers from the model.")
-                # 只取 deploy 分支輸出（index 0）
-                student_deploy = tf.keras.Model(student.input, student.outputs[0], name="student_deploy_only")
-                student_infer = tfmot.quantization.keras.strip_quantization(student_deploy)
-            else:
-                print("\n[WARN] `strip_quantization` not found; exporting wrapped model.")
-                student_infer = tf.keras.Model(student.input, student.outputs[0], name="student_deploy_only")
+            # if hasattr(tfmot.quantization.keras, "strip_quantization"):
+            #     print("\n[INFO] Stripping quantization wrappers from the model.")
+            #     # 只取 deploy 分支輸出（index 0）
+            #     student_deploy = tf.keras.Model(student.input, student.outputs[0], name="student_deploy_only")
+            #     student_infer = tfmot.quantization.keras.strip_quantization(student_deploy)
+            # else:
+            #     print("\n[WARN] `strip_quantization` not found; exporting wrapped model.")
+            #     student_infer = tf.keras.Model(student.input, student.outputs[0], name="student_deploy_only")
+            
+            student_infer = tf.keras.Model(student.input, student.outputs[0], name="student_deploy_only")
 
 # =================================================================================================================
 

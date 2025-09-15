@@ -29,7 +29,7 @@ import csv
 import numpy as np 
 import tensorflow_model_optimization as tfmot
 from tensorflow.keras.models import clone_model
-from src.Model_cfg.u_8_s_pose_keras_qat import TeacherCompatHead  # 確保可 import 到
+from src.Model_cfg.u_8_s_pose_keras_qat import TeacherCompatHead, ChannelAttention, SpatialAttention, CBAM  # 確保可 import 到
 
 from tqdm import tqdm
 from importlib import reload
@@ -182,7 +182,10 @@ def build_student_qat():
 
     # 3) 在 quantize_scope 內套用（讓 TFMOT 認得自訂層）
     with tfmot.quantization.keras.quantize_scope({
-        "TeacherCompatHead": TeacherCompatHead
+        "TeacherCompatHead": TeacherCompatHead,
+        "ChannelAttention": ChannelAttention,
+        "SpatialAttention": SpatialAttention,
+        "CBAM": CBAM
     }):
         student = tfmot.quantization.keras.quantize_apply(annotated)
 
@@ -266,89 +269,92 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
     #     s0, s1, s2 = lens_perm   # e.g. (N3, N5, N4)
     #     parts = tf.split(y_BNC, [s0, s1, s2], axis=1)
     #     return tf.concat([parts[reorder_idx[0]], parts[reorder_idx[1]], parts[reorder_idx[2]]], axis=1)
-
+    
+    
+    
+#     TEACHER_RAW_CLS_IS_PROB  = True   # 若 Teacher raw 的 cls 是 [0,1] 機率
+#     TEACHER_RAW_KPTV_IS_PROB = True   # 若 Teacher raw 的 kpt v 是 [0,1] 機率
+#     TEACHER_RAW_BOX_IS_UNIT  = False   # 若 Teacher raw 的 xywh 是 0~1
+#     TEACHER_RAW_KXY_IS_UNIT  = False   # 若 Teacher raw 的 kpt(xy) 是 0~1
 
     @tf.function
     def train_step(batch_imgs):
-        NUM_CLS  = config.NUM_CLS
-        NUM_KPT  = config.NUM_KPT
-        KPT_VALS = config.KPT_VALS
-        C = 4 + NUM_CLS + NUM_KPT * KPT_VALS  # 56
+        NUM_CLS, NUM_KPT, KPT_VALS = config.NUM_CLS, config.NUM_KPT, config.KPT_VALS
+        C = 4 + NUM_CLS + NUM_KPT * KPT_VALS  # e.g., 56
+
+        # 建議 QAT/KD 用較小 LR；Huber 對極值比較穩
+        huber = tf.keras.losses.Huber(delta=1.0, reduction="sum_over_batch_size")
+
+        # 分項權重（可微調）
+        L_BOX, L_KXY, L_V, L_CLS = 5.0, 9.0, 1.0, (1.0 if NUM_CLS > 0 else 0.0)
+        L_DEPLOY = 2.0  # ★ 先關掉 deploy 的監督
 
         with tf.GradientTape() as tape:
-            # fwd
-            y_t_raw = teacher(batch_imgs, training=False)
-            y_s_out = student(batch_imgs, training=True)
-            kd_raw  = y_s_out[1] if isinstance(y_s_out, (list,tuple)) else y_s_out
-            deploy_raw  = y_s_out[0] if isinstance(y_s_out, (list,tuple)) else y_s_out
-# ===================
-            y_t_BNC = ensure_BNC_static(y_t_raw, C)
-            y_t_BNC = tf.stop_gradient(y_t_BNC)
+            # 前傳
+            y_t_raw = teacher(batch_imgs, training=False)   # Teacher 原始輸出（你的 ground truth）
+            y_s_out = student(batch_imgs, training=True)    # (deploy_raw, kd_raw) or single
+
+            kd_raw     = y_s_out[1] if isinstance(y_s_out, (list,tuple)) else y_s_out
+            deploy_raw = y_s_out[0] if isinstance(y_s_out, (list,tuple)) else y_s_out
+
+            # (B,N,C)
+            t_BNC = ensure_BNC_static(y_t_raw, C)
+            s_BNC = ensure_BNC_static(kd_raw, C)
+            d_BNC = ensure_BNC_static(deploy_raw, C)
+
+            # 分段切片（不做語義變換，先把通道分出來）
+            t_box, t_cls, t_kxy, t_v = split_BNC(t_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
+            s_box, s_cls, s_kxy, s_v = split_BNC(s_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
+            d_box, d_cls, d_kxy, d_v = split_BNC(d_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
+
+            # ★ 把 Student 的那些“對 Teacher 來說是機率域”的通道過 sigmoid，對齊到 Teacher 的 raw 空間
+#             if TEACHER_RAW_CLS_IS_PROB and (NUM_CLS > 0):
+#                 s_cls = tf.nn.sigmoid(s_cls)
+#             if TEACHER_RAW_KPTV_IS_PROB and (KPT_VALS >= 3) and (s_v is not None):
+#                 s_v = tf.nn.sigmoid(s_v)
+#             if TEACHER_RAW_BOX_IS_UNIT:
+#                 s_box = tf.nn.sigmoid(s_box)
+#             if TEACHER_RAW_KXY_IS_UNIT and (s_kxy is not None):
+#                 s_kxy = tf.nn.sigmoid(s_kxy)
+
+            # 直接 Raw→Raw 蒸餾（Teacher 保持不動）
+            loss_box = L_BOX * huber(s_box, t_box)
+            loss_kxy = L_KXY * huber(s_kxy, t_kxy) if (s_kxy is not None) else 0.0
+            loss_v   = L_V   * huber(s_v,   t_v)   if (s_v   is not None) else 0.0
+            loss_cls = L_CLS * huber(s_cls, t_cls) if (NUM_CLS > 0) else 0.0
             
-            # y_t_BNC, t_is_pixel = normalize_teacher_pred(
-            #     y_t_raw, expected_C=C,
-            #     num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS,
-            #     batch_imgs=batch_imgs, target_domain='pixel', return_detected=True
-            # )
-# =================== 
-            # t_box, t_cls, t_kxy, t_ksc = split_BNC(y_t_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
+            loss_box_d = L_BOX * huber(d_box, t_box)
+            loss_kxy_d = L_KXY * huber(d_kxy, t_kxy) if (s_kxy is not None) else 0.0
+            loss_v_d   = L_V   * huber(d_v,   t_v)   if (s_v   is not None) else 0.0
+            loss_cls_d = L_CLS * huber(d_cls, t_cls) if (NUM_CLS > 0) else 0.0
 
-            kd_BNC = ensure_BNC_static(kd_raw, C)          # (B,N,C)
-            deploy_BNC = ensure_BNC_static(deploy_raw, C)          # (B,N,C)
-            # kd_BNC = _reorder_N_blocks(kd_BNC)       # (B,N,C) 與 Teacher 同順序
-# ===================
-            # s_box, s_cls, s_kxy, s_ksc = split_BNC(kd_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
-            # s_box, s_cls, s_kxy, s_ksc = align_student_to_domain(
-            #     kd_BNC, NUM_CLS, NUM_KPT, KPT_VALS, batch_imgs=batch_imgs, target_domain_is_pixel=False
-            # )
-# ===================
-            # --- KD Loss ---
-            # kd_cls = tf.reduce_mean(tf.losses.huber(t_cls, s_cls))
-            # kd_ksc = (tf.reduce_mean(tf.losses.huber(t_ksc, s_ksc)) if t_ksc is not None else 0.0)
-            # kd_box = tf.reduce_mean(tf.losses.huber(t_box, s_box))
-            # kd_kpt = tf.reduce_mean(tf.losses.huber(t_kxy, s_kxy))
+            loss_kd = loss_box + loss_kxy + loss_v + loss_cls
 
-            # loss_kd = (config.W_BOX * kd_box
-            #         + config.W_CLS * kd_cls
-            #         + config.W_KPT_XY * kd_kpt
-            #         + (config.W_KPT_V * kd_ksc if t_ksc is not None else 0.0))
+            # Deploy 監督（先關掉，避免干擾你追 raw）
+#             loss_dep = tf.constant(0.0, tf.float32)
+            loss_dep = loss_box_d + loss_kxy_d + loss_v_d + loss_cls_d
 
-            # # --- Deploy Loss ---
-            # alpha = 0.0
-            # if isinstance(y_s_out, (list,tuple)):
-            #     deploy_raw = y_s_out[0]
-            #     d_BNC = ensure_BNC_static(deploy_raw, C)
-            #     # d_BNC = _reorder_N_blocks(d_BNC)
-            #     d_box, d_cls, d_kxy, d_ksc = split_BNC(d_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
-            #     # d_box, d_cls, d_kxy, d_ksc = align_student_to_domain(
-            #     #     d_BNC, NUM_CLS, NUM_KPT, KPT_VALS,
-            #     #     batch_imgs=batch_imgs, target_domain_is_pixel=False
-            #     # )
-            #     loss_cons = alpha * (
-            #         tf.reduce_mean(tf.abs(d_box - tf.stop_gradient(s_box))) +
-            #         tf.reduce_mean(tf.abs(d_kxy - tf.stop_gradient(s_kxy))) +
-            #         tf.reduce_mean(tf.abs(d_cls - tf.stop_gradient(s_cls))) +
-            #         (tf.reduce_mean(tf.abs(d_ksc - tf.stop_gradient(s_ksc)))
-            #         if t_ksc is not None else 0.0)
-            #     )
-            # else:
-            #     loss_cons = 0.0
-
-            # loss = loss_kd + loss_cons
-
-            huber = tf.keras.losses.Huber(delta=1.0, reduction="sum_over_batch_size")
-            loss_kd  = huber(kd_BNC, y_t_BNC)
-            loss_deploy  = huber(deploy_BNC, y_t_BNC)
-
-            loss = loss_kd + loss_deploy
-
-            # ========== ★★ AMP 正確用法（自訂 loop 必須手動 scale/unscale） ★★ ==========
+            loss = loss_kd + L_DEPLOY * loss_dep
             scaled_loss = opt.get_scaled_loss(loss) if config.USE_AMP else loss
 
         scaled_grads = tape.gradient(scaled_loss, student.trainable_variables)
         grads = opt.get_unscaled_gradients(scaled_grads) if config.USE_AMP else scaled_grads
         opt.apply_gradients(zip(grads, student.trainable_variables))
-        return loss
+
+        # 你要看的 raw-MAE（跟上面的空間一致）
+        mae_box_s = tf.reduce_mean(tf.abs(s_box - t_box))
+        mae_kxy_s = tf.reduce_mean(tf.abs(s_kxy - t_kxy)) if (s_kxy is not None) else 0.0
+        mae_v_s   = tf.reduce_mean(tf.abs(s_v   - t_v  )) if (s_v   is not None) else 0.0
+        mae_cls_s = tf.reduce_mean(tf.abs(s_cls - t_cls)) if (NUM_CLS > 0) else 0.0
+        mae_all_s = (mae_box_s + mae_kxy_s + mae_v_s+ mae_cls_s)
+        
+        mae_box_d = tf.reduce_mean(tf.abs(d_box - t_box))
+        mae_kxy_d = tf.reduce_mean(tf.abs(d_kxy - t_kxy)) if (s_kxy is not None) else 0.0
+        mae_v_d   = tf.reduce_mean(tf.abs(d_v   - t_v  )) if (s_v   is not None) else 0.0
+        mae_cls_d = tf.reduce_mean(tf.abs(d_cls - t_cls)) if (NUM_CLS > 0) else 0.0
+        mae_all_d = (mae_box_d + mae_kxy_d + mae_v_d + mae_cls_d)
+
+        return loss, mae_all_s, mae_box_s, mae_cls_s, mae_kxy_s, mae_v_s, mae_all_d
 
     # 6) 評估：epoch 末計算 MAE（Student vs Teacher）與 across-N 變異數
     def eval_epoch_metrics(x_eval):
@@ -406,9 +412,9 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
                     break                               # <<< 新增
 
                 imgs = next(it)
-                loss = train_step(imgs)
+                loss, mae_all, mae_box, mae_cls, mae_kxy, mae_v, mae_dep_all = train_step(imgs)
                 epoch_loss_agg.update_state(loss)
-                progress_bar.set_postfix(loss=f"{loss:.4f}")
+                progress_bar.set_postfix(loss=f"{loss:.4f}", MAE_ALL_s=f"{mae_all:.4f}", MAE_CLS=f"{mae_cls:.4f}", MAE_kxy=f"{mae_kxy:.4f}", MAE_v=f"{mae_v:.4f}", MAE_depoly=f"{mae_dep_all:.4f}")
 
             # 如果剛剛收到中斷，直接跳出 epoch 迴圈
             if config.STOP_REQUESTED:
