@@ -5,9 +5,10 @@ import tensorflow as tf
 Training Settings
 ===================================================
 '''
+
 IMGSZ = 640
-BATCH = 2
-EPOCHS = 5              # 可先跑 5~10 看收斂
+BATCH = 16
+EPOCHS = 150              # 可先跑 5~10 看收斂
 
 base_lr = 0.01
 end_lr = 0.01
@@ -21,6 +22,10 @@ EXPORT_ONLY = False      # True 是否只進行輸出測試（.ckpt）, False �
 
 TFLITE_QUANT_MODE = "int8"  # 可選: "int8" | "fp16" | "fp32"
 
+# 監督來源：'distill' 或 'label#
+TRAIN_SUPERVISION = 'label'  # 原本只有蒸餾的話改成 'label' 就會走標註訓練
+
+USE_DFL  = False       # ← 關掉 DFL
 '''
 ===================================================
 Location (Input/Output)
@@ -36,7 +41,9 @@ REP_DIR_train = [
     # "../_Dataset/KeyPoint/15point_6class_box0/yolov8data2_20250804/images/*.jpg"
     # "../_Dataset/KeyPoint/temp/mix_QAT/images/*.jpg"
 
-    "../dataset/lanepose/mix_QAT/images/*.jpg"    
+    # "../dataset/lanepose/mix_QAT/images/*.jpg"    
+    "../dataset/lanepose/20220830/images/*.jpg"
+    # "../dataset/lanepose/20220830/labels/*.txt"
 ]
 
 """TFlite Validation Dataset"""
@@ -50,7 +57,7 @@ EXPORTED_DIR = "./lanepose20250807_s_model_640_640_6c_v1_saved_model/"
 TFLITE_OUT = "./output"
 
 """Export_Only Load Model""" 
-RESUME_WEIGHTS = "./output/20250827_143201/models/qat_saved_model"
+RESUME_WEIGHTS = "./output/20250910_135119/models/qat_saved_model"
 
 '''
 ===================================================
@@ -86,3 +93,4 @@ XYWH_TO_LTRB = False            # 模型輸出為ltrb:True, 輸出為xy:False
 XYWH_IS_NORMALIZED_01 = False   # 模型輸出是否經過歸一化
 
 STOP_REQUESTED = False          # 全域旗標：一旦收到中斷訊號就設 True
+

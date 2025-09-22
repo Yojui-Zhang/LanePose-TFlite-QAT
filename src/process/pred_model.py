@@ -1,6 +1,27 @@
+# === TOP-OF-FILE SHIM: put this at the very top of main.py BEFORE any import of tfmot/keras/etc ===
+import os, sys
+
+# Prefer tf.keras (legacy) and try to avoid independent keras
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+os.environ["KERAS_BACKEND"] = "tensorflow"
+
+# Import tensorflow early
+import tensorflow as tf
+from tensorflow import keras as K
+
+# Force any "import keras" in other libs to resolve to tf.keras
+sys.modules["keras"] = K
+sys.modules["keras.models"] = K.models
+sys.modules["keras.layers"] = K.layers
+sys.modules["keras.activations"] = K.activations
+sys.modules["keras.initializers"] = K.initializers
+sys.modules["keras.utils"] = K.utils
+sys.modules["keras.losses"] = K.losses
+sys.modules["keras.backend"] = K.backend
+# ===========================================================
+
 
 import config
-import tensorflow as tf
 
 from itertools import permutations
 
@@ -8,6 +29,67 @@ from itertools import permutations
 '''
 預測 Teacher 模型結果進行比較
 '''
+# ====================================================================================
+
+def _bchw_to_bnc(t):
+    # (B,C,H,W) -> (B, H*W, C)
+    shp = tf.shape(t)
+    B, C, H, W = shp[0], shp[1], shp[2], shp[3]
+    t = tf.transpose(t, [0, 2, 3, 1])       # (B,H,W,C)
+    return tf.reshape(t, [B, H * W, C])     # (B,N,C)
+
+def _pyr_to_bnc(x_list):
+    # list of (B,C,H,W) -> concat along N -> (B, sum(H*W), C)
+    bncs = [_bchw_to_bnc(x) for x in x_list]
+    return tf.concat(bncs, axis=1)
+
+def _pack_feats_kpts_to_BCN(feats_list, kpts_list):
+    # feats_list: no = nc + 4*reg_max ; kpts_list: nk*kv
+    feats_bnc = _pyr_to_bnc(feats_list)  # (B, N_total, no)
+    kpts_bnc  = _pyr_to_bnc(kpts_list)   # (B, N_total, nk*kv)
+    return tf.concat([feats_bnc, kpts_bnc], axis=-1)  # (B, N_total, C_total)
+
+def make_ultra_infer_model(student, branch='kd', name='student_ultra_infer'):
+    """
+    student: 你訓練好的模型（保持 4 個輸出結構）
+    branch : 'kd' 或 'deploy' ，用哪個分支來導出（通常選 'kd'，因為它才在訓練中被監督）
+    return : Keras Model，輸入同 student.input，輸出為 (B, N_total, C_total) 的 BCN
+    """
+    # 這個 helper 與你在 Train_Model.py 裡的一樣；若沒有，這裡再寫一次
+    def _unpack_student_outputs(y):
+        # 想像 y = [(dep_feats, dep_kpts), (kd_feats, kd_kpts)] 或被扁平成 4 個張量
+        if isinstance(y, (list, tuple)) and len(y) == 2 and \
+           all(isinstance(t, (list, tuple)) and len(t) == 2 for t in y):
+            return y[0], y[1]
+        if isinstance(y, (list, tuple)) and len(y) == 4:
+            return (y[0], y[1]), (y[2], y[3])
+        # 退而求其次：兩個輸出，沒拆 feats/kpts
+        if isinstance(y, (list, tuple)) and len(y) == 2:
+            return y[0], y[1]
+        return y, y
+
+    x = student.input
+    y = student(x, training=False)
+    dep_raw, kd_raw = _unpack_student_outputs(y)
+
+    raw = kd_raw if branch == 'kd' else dep_raw
+    # raw 期望為 (feats_list, kpts_list)
+    if isinstance(raw, (list, tuple)) and len(raw) == 2 and \
+       all(isinstance(t, (list, tuple)) for t in raw):
+        feats_list, kpts_list = raw
+        bcn = _pack_feats_kpts_to_BCN(feats_list, kpts_list)
+    else:
+        # 若你的 student 某些情況下已經把分支扁平化成 rank-4 清單，就先轉回
+        lst = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+        # 粗略分半：前半視為 feats、後半視為 kpts（你也可帶 no/nk*kv 更精準分割）
+        half = len(lst) // 2
+        feats_bcn = _pyr_to_bnc(lst[:half])
+        kpts_bcn  = _pyr_to_bnc(lst[half:])
+        bcn = tf.concat([feats_bcn, kpts_bcn], axis=-1)
+
+    return K.Model(x, bcn, name=name)
+
+# ====================================================================================
 
 def ensure_BNC_static(y, expected_C: int):
     y = tf.convert_to_tensor(y)

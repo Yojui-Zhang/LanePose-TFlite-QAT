@@ -35,9 +35,13 @@ REG_MAX = 16
 NC = config.NUM_CLS
 NK = config.NUM_KPT
 KPT_DIM = config.KPT_VALS
-RAW_C = 4 * REG_MAX + NC + NK * KPT_DIM  # 每個格點的 raw 通道數
+if not config.USE_DFL:
+    RAW_C = 4 + NC + NK * KPT_DIM  # 每個格點的 raw 通道數
+else:
+    RAW_C = 4 * REG_MAX + NC + NK * KPT_DIM  # 每個格點的 raw 通道數
 
-# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+
 @tf.keras.utils.register_keras_serializable(package="QAT")
 class TeacherCompatHead(tf.keras.layers.Layer):
     def __init__(self, num_cls, num_kpt, kpt_vals, name="head", apply_sigmoid=True, **kw):
@@ -300,7 +304,138 @@ class CBAM(L.Layer):
     def call(self, x):
         return self.sa(self.ca(x))
 # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+# 新增：Ultralytics 相容的 YOLOv8-Pose Head（兩分支輸出）
+class U8PoseCompatHead(tf.keras.layers.Layer):
+    def __init__(self, num_cls, num_kpt, kpt_vals, reg_max=16, ch=128, name="u8pose_head", **kw):
+        super().__init__(name=name, **kw)
+        self.nc = int(num_cls)
+        self.nk = int(num_kpt)
+        self.kv = int(kpt_vals)
+        self.reg_max = int(reg_max)
+        self.no = self.nc + (4 if not config.USE_DFL else 4 * self.reg_max)  # <-- Ultralytics: cls + DFL(4*reg_max)
+
+        # 你原本的三塔結構（可直接重用）
+        def tower(prefix):
+            return [
+                L.Conv2D(ch, 3, padding='same', use_bias=False, name=f'{prefix}.0/conv'),
+                L.BatchNormalization(name=f'{prefix}.0/bn'),
+                L.ReLU(max_value=6.0, name=f'{prefix}.0/relu6'),
+                L.Conv2D(ch, 3, padding='same', use_bias=False, name=f'{prefix}.1/conv'),
+                L.BatchNormalization(name=f'{prefix}.1/bn'),
+                L.ReLU(max_value=6.0, name=f'{prefix}.1/relu6'),
+            ]
+
+        self.twr_reg = [tower('head.reg.p3'), tower('head.reg.p4'), tower('head.reg.p5')]
+        self.twr_cls = [tower('head.cls.p3'), tower('head.cls.p4'), tower('head.cls.p5')]
+        self.twr_kpt = [tower('head.kpt.p3'), tower('head.kpt.p4'), tower('head.kpt.p5')]
+
+        box_ch = (4 if not config.USE_DFL else 4 * self.reg_max)
+        # 最終 1x1 輸出層
+        self.out_reg = [
+            L.Conv2D(box_ch, 1, name='head.regout.p3'),
+            L.Conv2D(box_ch, 1, name='head.regout.p4'),
+            L.Conv2D(box_ch, 1, name='head.regout.p5'),
+        ]
+        self.out_cls = [
+            L.Conv2D(self.nc, 1, name='head.coout.p3'),
+            L.Conv2D(self.nc, 1, name='head.coout.p4'),
+            L.Conv2D(self.nc, 1, name='head.coout.p5'),
+        ]
+        self.out_kpt = [
+            L.Conv2D(self.nk * self.kv, 1, name='head.kptout.p3'),
+            L.Conv2D(self.nk * self.kv, 1, name='head.kptout.p4'),
+            L.Conv2D(self.nk * self.kv, 1, name='head.kptout.p5'),
+        ]
+
+    def _run_tower(self, x, blocks):
+        y = x
+        # 依序套兩個 conv-bn-relu6
+        for i in range(0, len(blocks), 3):
+            y = blocks[i](y); y = blocks[i+1](y); y = blocks[i+2](y)
+        return y
+
+    def _to_bchw(self, t):
+        # Keras 是 channels_last，Ultralytics loss 期望 (B, C, H, W)
+        return L.Permute((3, 1, 2))(t)
+
+    def call(self, feats, training=False):
+        p3, p4, p5 = feats  # P3=1/8, P4=1/16, P5=1/32 —— 必須是這個順序
+
+        feats_out = []
+        kpts_out  = []
+        for i, p in enumerate((p3, p4, p5)):
+            r = self._run_tower(p, self.twr_reg[i])
+            c = self._run_tower(p, self.twr_cls[i])
+            k = self._run_tower(p, self.twr_kpt[i])
+
+            r = self.out_reg[i](r)  # (B,H,W, 4*reg_max)
+            c = self.out_cls[i](c)  # (B,H,W, nc)
+            k = self.out_kpt[i](k)  # (B,H,W, nk*3)
+
+            rc = L.Concatenate(axis=-1)([r, c])  # (B,H,W, nc+4*reg_max)
+            feats_out.append(self._to_bchw(rc))  # -> (B, no, H, W)
+            kpts_out.append(self._to_bchw(k))    # -> (B, nk*3, H, W)
+
+        # 回傳格式與 Ultralytics 一致： (feats_list, kpts_list)
+        return feats_out, kpts_out
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+
+
 def build_u8s_pose_dual(
+    input_shape: Tuple[int, int, int] = (640, 640, 3),
+    num_classes: int = 7,
+    num_kpt: int = 15,
+    kpt_vals: int = 3,
+    width_mult: float = 1.0,
+    depth_mult: float = 1.0,
+):
+    C = 4 + num_classes + num_kpt * kpt_vals
+    def ch(c): return max(8, int(c * width_mult))
+    def n(d):  return max(1, int(d * depth_mult))
+
+    inp = L.Input(shape=input_shape, name='images')
+
+    # Backbone
+    x0  = conv_bn_act(inp, ch(8),  k=3, s=2, name='Conv_0', act='relu6')                    # 1/2
+
+    x1 = dw_conv_bn_act(x0, ch(16), k=3, s=2, name='DWConv_1')                              # 1/4
+    x2 = repvgg_block(x1, ch(16), k=3, s=1, use_se=True, name='RepVGG_2', act='relu6')
+
+    x3 = dw_conv_bn_act(x2, ch(32), k=3, s=2, name='DWConv_3')                              # 1/8
+    x4 = repvgg_block(x3, ch(32), k=3, s=1, use_se=True, name='RepVGG_4', act='relu6')
+
+    x5 = dw_conv_bn_act(x4, ch(64), k=3, s=2, name='DWConv_5')                              # 1/16
+    x6 = repvgg_block(x5, ch(64), k=3, s=1, use_se=True, name='RepVGG_6', act='relu6')
+    # x7 = CBAM(ratio=16, kernel_size=7, name="CBAM_7")(x6)
+
+    x8 = dw_conv_bn_act(x6, ch(128), k=3, s=2, name='DWConv_8')                             # 1/32
+    x9 = repvgg_block(x8, ch(128), k=3, s=1, use_se=True, name='RepVGG_9', act='relu6')
+    # x10 = CBAM(ratio=16, kernel_size=7, name="CBAM_10")(x9)
+
+    x11 = sppf_block(x9, ch(128), name='SPPF_11')
+
+    # Neck
+    x12   = L.UpSampling2D(size=(2,2), name='UP_12')(x11)                                   # 1/16
+    x13   = L.Concatenate(axis=-1, name='cat_13')([x12, x6])
+    x14   = repvgg_block(x13, ch(64), k=3, s=1, name='RepVGG_14', act='LeakyRelu')
+    # x15   = CBAM(ratio=16, kernel_size=7, name="CBAM_15")(x14)
+
+    x16   = L.UpSampling2D(size=(2,2), name='UP_16')(x14)                                   # 1/8
+    x17   = L.Concatenate(axis=-1, name='cat_17')([x16, x4])
+    x18   = repvgg_block(x17, ch(32), k=3, s=1, name='RepVGG_18', act='LeakyRelu')
+
+
+    head_kd  = U8PoseCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, reg_max=REG_MAX, name="kd_head")
+    kd_feats, kd_kpts = head_kd((x18, x14, x9))  # ← Ultralytics 訓練態格式
+
+    head_dep = U8PoseCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, reg_max=REG_MAX, name="deploy_head")
+    deploy_feats, deploy_kpts = head_dep((x18, x14, x9))        # ← 維持你原先 (B,N,C) 便於部署
+
+    model = K.Model(inp, [(deploy_feats, deploy_kpts), (kd_feats, kd_kpts)], name="u8s_pose_keras_dual")
+    return model
+
+
+def build_u8s_pose_dual_distill(
     input_shape: Tuple[int, int, int] = (640, 640, 3),
     num_classes: int = 7,
     num_kpt: int = 15,
@@ -347,69 +482,12 @@ def build_u8s_pose_dual(
     # x20   = L.Concatenate(axis=-1, name='cat_20')([x19, x2])
     # x21   = repvgg_block(x20, ch(16), k=3, s=1, name='RepVGG_21', act='LeakyRelu')
 
-
     # feats = (p3, p4, p5)  # 一定要這個順序！
     head_kd = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="kd_head", apply_sigmoid=False)
     kd_preds = head_kd((x18, x14, x9))
 
     head_dep = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="deploy_head", apply_sigmoid=False)
     deploy_preds = head_dep((x18, x14, x9))   
-
-    return K.Model(inp, [deploy_preds, kd_preds], name='u8s_pose_keras_dual')
-
-def build_u8s_pose_dual_original(
-    input_shape: Tuple[int, int, int] = (640, 640, 3),
-    num_classes: int = 7,
-    num_kpt: int = 15,
-    kpt_vals: int = 3,
-    width_mult: float = 1.0,
-    depth_mult: float = 1.0,
-):
-    C = 4 + num_classes + num_kpt * kpt_vals
-    def ch(c): return max(8, int(c * width_mult))
-    def n(d):  return max(1, int(d * depth_mult))
-
-    inp = L.Input(shape=input_shape, name='images')
-
-    # Backbone
-    x  = conv_bn_act(inp, ch(64),  k=3, s=2, name='stem')
-    x  = c2f_block(x, ch(64),  n(2), name='c2f_1')
-
-    x  = conv_bn_act(x, ch(128), k=3, s=2, name='down_2')
-    x  = c2f_block(x, ch(128), n(3), name='c2f_2')
-
-    x  = conv_bn_act(x, ch(256), k=3, s=2, name='down_3')
-    c3 = c2f_block(x, ch(256), n(3), name='c2f_3')
-
-    x  = conv_bn_act(c3, ch(512), k=3, s=2, name='down_4')
-    c4 = c2f_block(x, ch(512), n(3), name='c2f_4')
-
-    x  = conv_bn_act(c4, ch(512), k=3, s=2, name='down_5')
-    x  = c2f_block(x, ch(512), n(3), name='c2f_5')
-    c5 = sppf_block(x, ch(512), name='sppf')
-
-    # Neck
-    concat = L.Concatenate(axis=-1)
-    p5_up  = L.UpSampling2D(name='p5_up')(c5)
-    p4_td  = c2f_block(concat([p5_up, c4]), ch(256), n(2), name='p4_td')
-
-    p4_up  = L.UpSampling2D(name='p4_up')(p4_td)
-    p3_out = c2f_block(concat([p4_up, c3]), ch(128), n(2), name='p3_out')
-
-    p3_dn  = conv_bn_act(p3_out, ch(256), k=3, s=2, name='p3_down')
-    p4_out = c2f_block(concat([p3_dn, p4_td]), ch(256), n(2), name='p4_out')
-
-    p4_dn  = conv_bn_act(p4_out, ch(512), k=3, s=2, name='p4_down')
-    p5_out = c2f_block(concat([p4_dn, c5]), ch(512), n(2), name='p5_out')
-
-    # feats = (p3, p4, p5)  # 一定要這個順序！
-    head_kd = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="kd_head", apply_sigmoid=True)
-    kd_preds = head_kd((p3_out, p4_out, p5_out))               # 形狀 (B, C, N) —— 蒸餾用浮點輸出
-
-    # 若還需要 deploy（QAT）輸出，讓它走相同幾何路徑，僅在 head 前加量化 wrapper：
-    # （保留你現有的量化 backbone/neck；這裡只保證 deploy 也輸出 (B,C,N) 且順序一致）
-    head_dep = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="deploy_head", apply_sigmoid=True)
-    deploy_preds = head_dep((p3_out, p4_out, p5_out))   
 
     return K.Model(inp, [deploy_preds, kd_preds], name='u8s_pose_keras_dual')
 

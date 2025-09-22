@@ -25,11 +25,12 @@ sys.modules["keras.backend"] = K.backend
 import Depance file
 ===================================================
 '''
+import os
 import csv
 import numpy as np 
 import tensorflow_model_optimization as tfmot
 from tensorflow.keras.models import clone_model
-from src.Model_cfg.u_8_s_pose_keras_qat import TeacherCompatHead, ChannelAttention, SpatialAttention, CBAM  # 確保可 import 到
+from src.Model_cfg.u_8_s_pose_keras_qat import TeacherCompatHead, U8PoseCompatHead,ChannelAttention, SpatialAttention, CBAM  # 確保可 import 到
 
 from tqdm import tqdm
 from importlib import reload
@@ -47,8 +48,18 @@ from src.process.pred_model import (normalize_teacher_pred, split_BNC,
                                     align_student_to_domain, choose_student_split_order,
                                     ensure_BNC_static)
 
+from src.Loss_function.pose_label_loss_tf import (
+    PoseLabelLoss, build_targets_from_labels, build_grid_shapes
+)
+from src.process.pred_reshape import bcn_to_bnc
+
+from src.process.labels_yolo_pose_tf import parse_label_lines
+
+from src.Loss_function.loss_tf import v8PoseLossTF
+
 if config.PLOT_Switch == True:
     from src.process.Plot_Data import plot_and_save_lr_schedule
+
 
 
 '''
@@ -131,6 +142,82 @@ def probe_kd_output_distribution(student_model, dataset, expected_C, imgsz=640):
 Core Logic
 ==================================================================================
 '''
+
+
+def build_batch_dict_from_targets(targets_per_image, num_kpt, kpt_vals):
+    """
+    Args:
+      targets_per_image: 長度為 B 的 list；每個元素是 (Gi, 5 + num_kpt*kpt_vals) 的 tf.Tensor 或 numpy
+                         每列: [cls, cx, cy, w, h, kp1x, kp1y, kp1v, ...]
+      num_kpt: 關鍵點數
+      kpt_vals: 每個 keypoint 的欄位數（通常 3: x,y,v）
+    Returns:
+      batch_dict = {
+        'batch_idx': (G,1) int32,
+        'cls'      : (G,1) int32,
+        'bboxes'   : (G,4) float32 (xywh normalized),
+        'keypoints': (G, num_kpt, kpt_vals) float32
+      }
+    """
+    batch_idx_list, cls_list, bboxes_list, kpts_list = [], [], [], []
+    for b, arr in enumerate(targets_per_image):
+        if arr is None:
+            continue
+        t = tf.convert_to_tensor(arr)
+        if tf.shape(t)[0] == 0:
+            continue
+        t = tf.cast(t, tf.float32)
+        cls = tf.cast(t[:, 0:1], tf.int32)              # (Gi,1)
+        xywh = t[:, 1:5]                                 # (Gi,4)
+        kpts_flat = t[:, 5:5 + num_kpt * kpt_vals]       # (Gi, num_kpt*kpt_vals)
+        kpts = tf.reshape(kpts_flat, [-1, num_kpt, kpt_vals])
+
+        gi = tf.shape(t)[0]
+        batch_idx_list.append(tf.fill([gi,1], b))
+        cls_list.append(cls)
+        bboxes_list.append(xywh)
+        kpts_list.append(kpts)
+
+    if len(cls_list) == 0:
+        # 空 batch（沒有任何 GT）
+        z = tf.zeros([0,1], tf.int32)
+        return {'batch_idx': z,
+                'cls': z,
+                'bboxes': tf.zeros([0,4], tf.float32),
+                'keypoints': tf.zeros([0, num_kpt, kpt_vals], tf.float32)}
+
+    batch_idx = tf.concat(batch_idx_list, axis=0)
+    cls_all   = tf.concat(cls_list, axis=0)
+    boxes_all = tf.concat(bboxes_list, axis=0)
+    kpts_all  = tf.concat(kpts_list, axis=0)
+    return {'batch_idx': batch_idx,
+            'cls': cls_all,
+            'bboxes': boxes_all,
+            'keypoints': kpts_all}
+
+
+# 放在 Train_Model.py 顶部合適位置
+def ul_tuple_to_BNC(kd_raw, num_cls, num_kpt, kpt_vals):
+    """kd_raw 來自 U8PoseCompatHead 的 (feats_list, kpts_list)。
+       feats_list: [ (B, no, H, W) * 3 ]，no = nc + 4*reg_max
+       kpts_list : [ (B, nk*kv, H, W) * 3 ]，nk*kv = num_kpt * kpt_vals
+       輸出: (B, N_total, C_total) 其中 C_total = no + nk*kv
+    """
+    feats_list, kpts_list = kd_raw
+    # 逐層 (B, C, H, W) -> (B, H*W, C)
+    def bchw_to_bnc(t):
+        # t 是 tf.Tensor
+        b, c, h, w = t.shape
+        x = tf.transpose(t, perm=[0, 2, 3, 1])      # (B,H,W,C)
+        x = tf.reshape(x, [b, h*w, c])              # (B,N,C)
+        return x
+    feats_bnc = [bchw_to_bnc(t) for t in feats_list]
+    kpts_bnc  = [bchw_to_bnc(t) for t in kpts_list]
+    # 每層把 (no) 和 (nk*kv) 在 C 維度 concat，再沿 N 維拼三層
+    bnc_layers = [tf.concat([f, k], axis=-1) for f, k in zip(feats_bnc, kpts_bnc)]
+    return tf.concat(bnc_layers, axis=1)           # (B, N3+N4+N5, no+nk*kv)
+
+
 def build_student_qat():
     """
     建立雙輸出學生 + 選擇性量化：
@@ -140,13 +227,23 @@ def build_student_qat():
 
     reload(cfg)
 
-    # 1) 先建雙頭的 base model（head 輸出都是 (B,C,N)）
-    base = cfg.build_u8s_pose_dual(
-        input_shape=(config.IMGSZ, config.IMGSZ, 3),
-        num_classes=config.NUM_CLS,
-        num_kpt=config.NUM_KPT,
-        kpt_vals=config.KPT_VALS
-    )
+    if config.TRAIN_SUPERVISION == 'label':
+        # 1) 先建雙頭的 base model（head 輸出都是 (B,C,N)）
+        base = cfg.build_u8s_pose_dual(
+            input_shape=(config.IMGSZ, config.IMGSZ, 3),
+            num_classes=config.NUM_CLS,
+            num_kpt=config.NUM_KPT,
+            kpt_vals=config.KPT_VALS
+        )
+        print(f"\nBuild the u8s_pose_dual model...")
+    else:
+        base = cfg.build_u8s_pose_dual_distill(
+            input_shape=(config.IMGSZ, config.IMGSZ, 3),
+            num_classes=config.NUM_CLS,
+            num_kpt=config.NUM_KPT,
+            kpt_vals=config.KPT_VALS
+        )
+        print(f"\nBuild the u8s_pose_dual_distill model...")
 
     # 2) 只註解要量化的層；凡是 head 相關一律跳過
     QUANTIZABLE = (
@@ -169,6 +266,8 @@ def build_student_qat():
         # a) 自訂 head 本體：不量化
         if isinstance(layer, TeacherCompatHead):
             return layer
+        if isinstance(layer, U8PoseCompatHead):
+            return layer
         # b) 任一 head 節點（含其中的 Conv）：不量化
         if in_heads(name):
             return layer
@@ -183,6 +282,7 @@ def build_student_qat():
     # 3) 在 quantize_scope 內套用（讓 TFMOT 認得自訂層）
     with tfmot.quantization.keras.quantize_scope({
         "TeacherCompatHead": TeacherCompatHead,
+        "U8PoseCompatHead" : U8PoseCompatHead,
         "ChannelAttention": ChannelAttention,
         "SpatialAttention": SpatialAttention,
         "CBAM": CBAM
@@ -190,9 +290,9 @@ def build_student_qat():
         student = tfmot.quantization.keras.quantize_apply(annotated)
 
     # 4) 驗證：兩個輸出仍在，且 head 節點沒有被包 Quantize
-    outs = student.outputs
-    if not isinstance(outs, (list, tuple)) or len(outs) != 2:
-        raise RuntimeError("Expect dual outputs [deploy_preds, kd_preds] after quantize_apply().")
+    # outs = student.outputs
+    # if not isinstance(outs, (list, tuple)) or len(outs) != 2:
+    #     raise RuntimeError("Expect dual outputs [deploy_preds, kd_preds] after quantize_apply().")
 
     # 可選：列出被量化的層數 & 檢查 head 是否未量化
     qlayers = [l for l in student.submodules if "Quantize" in l.__class__.__name__]
@@ -210,6 +310,14 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
     執行 QAT 訓練，並把『學生輸出 N 維（P3/P4/P5）』在 train_step 中重排到與 Teacher 一致。
     ==============================================================================
     """
+    pose_loss = v8PoseLossTF(
+        strides=(8,16,32),
+        nc=config.NUM_CLS,
+        reg_max=16,
+        kpt_shape=(config.NUM_KPT, config.KPT_VALS),
+        img_size=config.IMGSZ,      # e.g., 640
+        topk=10
+    )
     
     print("\n--- Starting QAT Fine-tuning ---")
 
@@ -245,18 +353,54 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
     if config.PLOT_Switch == True:
         plot_and_save_lr_schedule(schedule, total_steps, output_paths['lr_plot'])
 
-    # expected_C = 4 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
-    # H3, W3 = config.IMGSZ // 8,  config.IMGSZ // 8
-    # H4, W4 = config.IMGSZ // 16, config.IMGSZ // 16
-    # H5, W5 = config.IMGSZ // 32, config.IMGSZ // 32
-    # N3, N4, N5 = H3 * W3, H4 * W4, H5 * W5
-
     try:
         sample_batch = next(iter(ds))
-        sample_imgs = sample_batch[0] if isinstance(sample_batch, (list, tuple)) else sample_batch
+        if isinstance(sample_batch, (list, tuple)) and len(sample_batch) >= 2:
+            sample_imgs, label_paths = sample_batch[0], sample_batch[1]
+        else:
+            sample_imgs, label_paths = sample_batch, None
+
+        labels_list = None
+        if label_paths is not None:
+
+            # 轉成 1D 並拿到 numpy
+            lp_np = tf.reshape(label_paths, [-1]).numpy()
+
+            # 安全轉字串：bytes -> str；str 原樣返回
+            def _to_str(x):
+                # x 可能是 bytes 或 str
+                if isinstance(x, (bytes, bytearray)):
+                    return x.decode("utf-8")
+                return str(x)
+
+            paths = [_to_str(p) for p in lp_np]
+
+            labels_list = []
+            for p in paths:
+                # 用 tf.io.gfile.exists 更健壯
+                if tf.io.gfile.exists(p):
+                    with tf.io.gfile.GFile(p, "r") as f:
+                        lines = [ln.strip() for ln in f if ln.strip()]
+                else:
+                    lines = []
+                arr = parse_label_lines(lines, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS)
+                labels_list.append(arr)
+
+            print(f"\nLoaded label files: {len(labels_list)}")
+            for i, arr in enumerate(labels_list):
+                print(f"  img[{i}] -> {arr.shape[0]} objects (shape={arr.shape})")
+
         sample_one = _ensure_bhwc4(sample_imgs, imgsz=config.IMGSZ)
-    except Exception:
+        
+
+    except Exception as e:
+        print(f"\n[warn] sample inspect failed: {e}")
         sample_one = tf.zeros([1, config.IMGSZ, config.IMGSZ, 3], tf.float32)
+    
+# =====================================================
+
+
+# =====================================================
 
     # lens_perm, reorder_idx = choose_student_split_order(student, teacher, sample_one, N3, N4, N5, expected_C, 
     #                                                     config.NUM_CLS, config.NUM_KPT, config.KPT_VALS, )
@@ -269,69 +413,49 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
     #     s0, s1, s2 = lens_perm   # e.g. (N3, N5, N4)
     #     parts = tf.split(y_BNC, [s0, s1, s2], axis=1)
     #     return tf.concat([parts[reorder_idx[0]], parts[reorder_idx[1]], parts[reorder_idx[2]]], axis=1)
-    
-    
-    
-#     TEACHER_RAW_CLS_IS_PROB  = True   # 若 Teacher raw 的 cls 是 [0,1] 機率
-#     TEACHER_RAW_KPTV_IS_PROB = True   # 若 Teacher raw 的 kpt v 是 [0,1] 機率
-#     TEACHER_RAW_BOX_IS_UNIT  = False   # 若 Teacher raw 的 xywh 是 0~1
-#     TEACHER_RAW_KXY_IS_UNIT  = False   # 若 Teacher raw 的 kpt(xy) 是 0~1
+
+    def concat_scales_to_bcn(scales_list):
+        outs = []
+        for t in scales_list:  # t: (B, C, H, W)
+            B, C, H, W = t.shape
+            outs.append(tf.reshape(t, [B, C, H*W]))
+        return tf.concat(outs, axis=2)  # (B, C, N_total)
 
     @tf.function
-    def train_step(batch_imgs):
+    def train_step_distill(batch_imgs):
+        # 這個函式維持你原本蒸餾的 tf.function 版本（從原 train_step 的 else branch 重用）
         NUM_CLS, NUM_KPT, KPT_VALS = config.NUM_CLS, config.NUM_KPT, config.KPT_VALS
-        C = 4 + NUM_CLS + NUM_KPT * KPT_VALS  # e.g., 56
-
-        # 建議 QAT/KD 用較小 LR；Huber 對極值比較穩
+        C = 4 + NUM_CLS + NUM_KPT * KPT_VALS
         huber = tf.keras.losses.Huber(delta=1.0, reduction="sum_over_batch_size")
-
-        # 分項權重（可微調）
         L_BOX, L_KXY, L_V, L_CLS = 5.0, 9.0, 1.0, (1.0 if NUM_CLS > 0 else 0.0)
-        L_DEPLOY = 2.0  # ★ 先關掉 deploy 的監督
+        L_DEPLOY = 2.0
 
         with tf.GradientTape() as tape:
-            # 前傳
-            y_t_raw = teacher(batch_imgs, training=False)   # Teacher 原始輸出（你的 ground truth）
-            y_s_out = student(batch_imgs, training=True)    # (deploy_raw, kd_raw) or single
+            y_t_raw = teacher(batch_imgs, training=False)
+            y_s_out = student(batch_imgs, training=True)
 
             kd_raw     = y_s_out[1] if isinstance(y_s_out, (list,tuple)) else y_s_out
             deploy_raw = y_s_out[0] if isinstance(y_s_out, (list,tuple)) else y_s_out
 
-            # (B,N,C)
             t_BNC = ensure_BNC_static(y_t_raw, C)
             s_BNC = ensure_BNC_static(kd_raw, C)
             d_BNC = ensure_BNC_static(deploy_raw, C)
 
-            # 分段切片（不做語義變換，先把通道分出來）
             t_box, t_cls, t_kxy, t_v = split_BNC(t_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
             s_box, s_cls, s_kxy, s_v = split_BNC(s_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
             d_box, d_cls, d_kxy, d_v = split_BNC(d_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
 
-            # ★ 把 Student 的那些“對 Teacher 來說是機率域”的通道過 sigmoid，對齊到 Teacher 的 raw 空間
-#             if TEACHER_RAW_CLS_IS_PROB and (NUM_CLS > 0):
-#                 s_cls = tf.nn.sigmoid(s_cls)
-#             if TEACHER_RAW_KPTV_IS_PROB and (KPT_VALS >= 3) and (s_v is not None):
-#                 s_v = tf.nn.sigmoid(s_v)
-#             if TEACHER_RAW_BOX_IS_UNIT:
-#                 s_box = tf.nn.sigmoid(s_box)
-#             if TEACHER_RAW_KXY_IS_UNIT and (s_kxy is not None):
-#                 s_kxy = tf.nn.sigmoid(s_kxy)
-
-            # 直接 Raw→Raw 蒸餾（Teacher 保持不動）
             loss_box = L_BOX * huber(s_box, t_box)
             loss_kxy = L_KXY * huber(s_kxy, t_kxy) if (s_kxy is not None) else 0.0
-            loss_v   = L_V   * huber(s_v,   t_v)   if (s_v   is not None) else 0.0
+            loss_v   = L_V   * huber(s_v,   t_v  ) if (s_v   is not None) else 0.0
             loss_cls = L_CLS * huber(s_cls, t_cls) if (NUM_CLS > 0) else 0.0
-            
+
             loss_box_d = L_BOX * huber(d_box, t_box)
             loss_kxy_d = L_KXY * huber(d_kxy, t_kxy) if (s_kxy is not None) else 0.0
-            loss_v_d   = L_V   * huber(d_v,   t_v)   if (s_v   is not None) else 0.0
+            loss_v_d   = L_V   * huber(d_v,   t_v  ) if (s_v   is not None) else 0.0
             loss_cls_d = L_CLS * huber(d_cls, t_cls) if (NUM_CLS > 0) else 0.0
 
             loss_kd = loss_box + loss_kxy + loss_v + loss_cls
-
-            # Deploy 監督（先關掉，避免干擾你追 raw）
-#             loss_dep = tf.constant(0.0, tf.float32)
             loss_dep = loss_box_d + loss_kxy_d + loss_v_d + loss_cls_d
 
             loss = loss_kd + L_DEPLOY * loss_dep
@@ -341,20 +465,54 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
         grads = opt.get_unscaled_gradients(scaled_grads) if config.USE_AMP else scaled_grads
         opt.apply_gradients(zip(grads, student.trainable_variables))
 
-        # 你要看的 raw-MAE（跟上面的空間一致）
+        # return metrics (你原本使用的那組)
         mae_box_s = tf.reduce_mean(tf.abs(s_box - t_box))
         mae_kxy_s = tf.reduce_mean(tf.abs(s_kxy - t_kxy)) if (s_kxy is not None) else 0.0
         mae_v_s   = tf.reduce_mean(tf.abs(s_v   - t_v  )) if (s_v   is not None) else 0.0
         mae_cls_s = tf.reduce_mean(tf.abs(s_cls - t_cls)) if (NUM_CLS > 0) else 0.0
-        mae_all_s = (mae_box_s + mae_kxy_s + mae_v_s+ mae_cls_s)
-        
+        mae_all_s = (mae_box_s + mae_kxy_s + mae_v_s + mae_cls_s)
+
         mae_box_d = tf.reduce_mean(tf.abs(d_box - t_box))
-        mae_kxy_d = tf.reduce_mean(tf.abs(d_kxy - t_kxy)) if (s_kxy is not None) else 0.0
-        mae_v_d   = tf.reduce_mean(tf.abs(d_v   - t_v  )) if (s_v   is not None) else 0.0
+        mae_kxy_d = tf.reduce_mean(tf.abs(d_kxy - t_kxy)) if (d_kxy is not None) else 0.0
+        mae_v_d   = tf.reduce_mean(tf.abs(d_v   - t_v  )) if (d_v   is not None) else 0.0
         mae_cls_d = tf.reduce_mean(tf.abs(d_cls - t_cls)) if (NUM_CLS > 0) else 0.0
         mae_all_d = (mae_box_d + mae_kxy_d + mae_v_d + mae_cls_d)
 
         return loss, mae_all_s, mae_box_s, mae_cls_s, mae_kxy_s, mae_v_s, mae_all_d
+
+    def train_step_label(batch_imgs, targets_per_image):
+        # 非 @tf.function：在這裡直接用 targets（Tensor），做 forward/backward
+        NUM_CLS, NUM_KPT, KPT_VALS = config.NUM_CLS, config.NUM_KPT, config.KPT_VALS
+        C = 4 + NUM_CLS + NUM_KPT * KPT_VALS
+
+        with tf.GradientTape() as tape:
+            
+            y_s_out = student(batch_imgs, training=True)
+            deploy_feats, deploy_kpts = y_s_out[0] if isinstance(y_s_out, (list, tuple)) else y_s_out
+            kd_feats, kd_kpts = y_s_out[1] if isinstance(y_s_out, (list, tuple)) else y_s_out
+
+            # t_BNC = ensure_BNC_static(teacher(batch_imgs, training=False), C)
+
+            batch_dict = build_batch_dict_from_targets(
+                targets_per_image, num_kpt=NUM_KPT, kpt_vals=KPT_VALS
+            )
+
+            total_loss_kd, logs = pose_loss((kd_feats, kd_kpts), batch_dict)
+            total_loss_depoly, logs_depoly = pose_loss((deploy_feats, deploy_kpts), batch_dict)
+            total_loss = total_loss_kd + total_loss_depoly 
+            
+
+        grads = tape.gradient(total_loss, student.trainable_variables)
+        opt.apply_gradients(zip(grads, student.trainable_variables))
+        '''
+        # parts_* 是 dict
+        mae_box = parts_dp['box']
+        mae_cls = parts_dp.get('cls', 0.0)
+        mae_kxy = parts_dp.get('kpt', 0.0)
+        mae_v   = parts_dp.get('kobj', 0.0)
+        mae_all = mae_box + mae_cls + mae_kxy + mae_v
+        '''
+        return total_loss, logs
 
     # 6) 評估：epoch 末計算 MAE（Student vs Teacher）與 across-N 變異數
     def eval_epoch_metrics(x_eval):
@@ -411,10 +569,69 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
                     print("[⚠️ Interrupt] Stop requested. Leaving training loop...")   # <<< 新增
                     break                               # <<< 新增
 
-                imgs = next(it)
-                loss, mae_all, mae_box, mae_cls, mae_kxy, mae_v, mae_dep_all = train_step(imgs)
-                epoch_loss_agg.update_state(loss)
-                progress_bar.set_postfix(loss=f"{loss:.4f}", MAE_ALL_s=f"{mae_all:.4f}", MAE_CLS=f"{mae_cls:.4f}", MAE_kxy=f"{mae_kxy:.4f}", MAE_v=f"{mae_v:.4f}", MAE_depoly=f"{mae_dep_all:.4f}")
+                batch = next(it)
+                if isinstance(batch, (list, tuple)):
+                    batch_imgs, batch_label_paths = batch[0], batch[1]
+                else:
+                    batch_imgs, batch_label_paths = batch, None
+
+# ==================================================================
+                if config.TRAIN_SUPERVISION == 'label' and batch_label_paths is not None:
+                    # safe convert tensor -> python list of str
+                    lp_np = tf.reshape(batch_label_paths, [-1]).numpy()
+                    def _to_str(x):
+                        if isinstance(x, (bytes, bytearray)):
+                            return x.decode('utf-8')
+                        return str(x)
+                    paths = [_to_str(p) for p in lp_np]
+
+                    labels_list = []
+                    for p in paths:
+                        if tf.io.gfile.exists(p):
+                            with tf.io.gfile.GFile(p, "r") as f:
+                                lines = [ln.strip() for ln in f if ln.strip()]
+                        else:
+                            lines = []
+                        arr = parse_label_lines(lines, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS)
+                        labels_list.append(arr)
+
+                    # build targets -> tensors
+                    # 用實際 batch 的 H 來推 grid（若未知就退回 config.IMGSZ）
+                    _h = batch_imgs.shape[1]
+                    try:
+                        imgsz_runtime = int(_h) if _h is not None else int(config.IMGSZ)
+                    except Exception:
+                        imgsz_runtime = int(config.IMGSZ)
+
+                    '''
+                    targets, pos_mask, _ = build_targets_from_labels(
+                        batch_labels=labels_list,
+                        num_classes=config.NUM_CLS,
+                        num_kpt=config.NUM_KPT,
+                        kpt_vals=config.KPT_VALS,
+                        imgsz=imgsz_runtime,
+                        strides=(8,16,32)
+                    )
+
+                    targets['pos_mask']  = pos_mask
+                    '''
+                    # call non-tf train step
+                    loss, loss_log = train_step_label(batch_imgs, labels_list)
+
+                    epoch_loss_agg.update_state(loss)
+                    progress_bar.set_postfix(loss=f"{loss:.4f}")
+
+
+                else:
+                    # distill path (fast, tf.function)
+                    # ensure we pass only images tensor, not tuple
+                    loss, mae_all, mae_box, mae_cls, mae_kxy, mae_v, mae_dep_all = train_step_distill(batch_imgs)
+
+                    epoch_loss_agg.update_state(loss)
+                    progress_bar.set_postfix(loss=f"{loss:.4f}", MAE_ALL_s=f"{mae_all:.4f}",MAE_BOX=f"{mae_box:.4f}", MAE_CLS=f"{mae_cls:.4f}", MAE_kxy=f"{mae_kxy:.4f}", MAE_v=f"{mae_v:.4f}", MAE_depoly=f"{mae_dep_all:.4f}")
+
+# ==================================================================
+
 
             # 如果剛剛收到中斷，直接跳出 epoch 迴圈
             if config.STOP_REQUESTED:
@@ -425,7 +642,7 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
             avg_loss = epoch_loss_agg.result().numpy().item()
             current_lr = schedule((e + 1) * steps_per_epoch).numpy().item()
             loss_history.append(avg_loss)
-
+            '''
             # --- epoch-end diagnostics (MAE + variance) ---
             mae_box_t, mae_cls_t, mae_kpt_t, mae_ksc_t = eval_epoch_metrics(sample_one)
             mae_box_t = float(mae_box_t.numpy()); mae_cls_t = float(mae_cls_t.numpy()); mae_kpt_t = float(mae_kpt_t.numpy()); mae_ksc_t = float(mae_ksc_t.numpy())
@@ -435,7 +652,8 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
 
             print(f"Epoch {e+1}/{config.EPOCHS} - Avg Loss: {avg_loss:.4f}, LR: {current_lr:.6f} | "
                   f"MAE(box/cls/kpt/ksc): {mae_box_t:.4f}/{mae_cls_t:.4f}/{mae_kpt_t:.4f}/{mae_ksc_t:.4f}")
-
+                '''
+            csv_writer.writerow([e + 1, f"{avg_loss:.6f}", f"{current_lr:.8f}"])
 
     print(f"✅ Training finished. Log saved to {output_paths['log_csv']}")
     return loss_history

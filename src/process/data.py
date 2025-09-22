@@ -12,6 +12,8 @@ import config
 ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
 '''
 
+AUTOTUNE = tf.data.AUTOTUNE
+
 def letterbox(img, new_size=config.IMGSZ):
     h, w = img.shape[:2]
     scale = new_size / max(h, w)
@@ -34,6 +36,8 @@ def parse_img(path):
 
     p = _decode_path(path)
     bgr = cv2.imread(p)
+    
+    #bgr to rgb
     rgb = bgr[:, :, ::-1]
     img = letterbox(rgb, config.IMGSZ).astype(np.float32) / 255.0
     return img
@@ -42,6 +46,24 @@ def tf_parse(path):
     img = tf.numpy_function(parse_img, [path], Tout=tf.float32)
     img.set_shape([config.IMGSZ, config.IMGSZ, 3])
     return img
+
+
+def tf_parse_load(img_path):
+    # 保險：確保是 scalar tf.string
+    img_path = tf.ensure_shape(img_path, [])
+    tf.debugging.assert_type(img_path, tf.string,
+                                message="img_path must be tf.string. Check build_dataset inputs.")
+    img_bytes = tf.io.read_file(img_path)
+    img = tf.io.decode_image(img_bytes, channels=3, expand_animations=False)
+    img = tf.image.convert_image_dtype(img, tf.float32)
+    img = tf.image.resize(img, (config.IMGSZ, config.IMGSZ))
+
+    # ../images/xxx.jpg -> ../labels/xxx.txt
+    lbl_path = tf.strings.regex_replace(img_path, r"/images/", "/labels/")
+    lbl_path = tf.strings.regex_replace(lbl_path, r"\.(jpg|jpeg|png|bmp)$", ".txt")
+
+    return img, lbl_path  # (H,W,C), scalar string
+
 
 def build_dataset(img_glob, batch=config.BATCH, shuffle=True, repeat=True):
     
@@ -74,13 +96,68 @@ def build_dataset(img_glob, batch=config.BATCH, shuffle=True, repeat=True):
     if shuffle:
         ds = ds.shuffle(len(files), reshuffle_each_iteration=True) # 加上 reshuffle_each_iteration
         
-    ds = ds.map(tf_parse, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.map(tf_parse_load, num_parallel_calls=tf.data.AUTOTUNE)
     ds = ds.batch(batch).prefetch(tf.data.AUTOTUNE)
     if repeat:
         ds = ds.repeat()
         
     return ds, len(files)
 
+
+# def build_dataset(img_glob, batch=8, shuffle=False):
+#     """
+#     img_glob: str 或 list[str]，例如 "../dataset/lanepose/20220830/images/*.jpg"
+#     回傳: ds, n_files
+#       ds 產出 (batch_imgs, batch_label_paths)
+#         - batch_imgs: float32 [B, H, W, C]
+#         - batch_label_paths: tf.string [B]（每張圖對應的 label .txt）
+#     """
+#     # 1) 用 list_files 確保 dtype=string
+#     if isinstance(img_glob, (list, tuple)):
+#         # 把多個 pattern 合併
+#         pat_ds = tf.data.Dataset.from_tensor_slices(
+#             tf.constant([str(p) for p in img_glob], dtype=tf.string)
+#         )
+#         files_ds = pat_ds.interleave(
+#             lambda p: tf.data.Dataset.list_files(p, shuffle=False),
+#             cycle_length=len(img_glob),
+#             num_parallel_calls=AUTOTUNE
+#         )
+#     else:
+#         files_ds = tf.data.Dataset.list_files(
+#             tf.constant(str(img_glob), dtype=tf.string), shuffle=False
+#         )
+
+#     # 2) 計數（非必要，但你原本要回傳 n_files）
+#     #    這裡用 cache 再 reduce 避免多次遍歷
+#     cached = files_ds.cache()
+#     n_files = int(tf.data.experimental.cardinality(cached).numpy()) if \
+#         tf.data.experimental.cardinality(cached) != tf.data.experimental.INFINITE_CARDINALITY else \
+#         sum(1 for _ in cached)
+
+#     # 3) 讀圖 + 產生 label 路徑
+#     def _load(img_path):
+#         # 保險：確保是 scalar tf.string
+#         img_path = tf.ensure_shape(img_path, [])
+#         tf.debugging.assert_type(img_path, tf.string,
+#                                  message="img_path must be tf.string. Check build_dataset inputs.")
+#         img_bytes = tf.io.read_file(img_path)
+#         img = tf.io.decode_image(img_bytes, channels=3, expand_animations=False)
+#         img = tf.image.convert_image_dtype(img, tf.float32)
+#         img = tf.image.resize(img, (config.IMGSZ, config.IMGSZ))
+
+#         # ../images/xxx.jpg -> ../labels/xxx.txt
+#         lbl_path = tf.strings.regex_replace(img_path, r"/images/", "/labels/")
+#         lbl_path = tf.strings.regex_replace(lbl_path, r"\.(jpg|jpeg|png|bmp)$", ".txt")
+
+#         return img, lbl_path  # (H,W,C), scalar string
+
+#     ds = cached.map(_load, num_parallel_calls=AUTOTUNE)
+#     if shuffle:
+#         ds = ds.shuffle(1024, reshuffle_each_iteration=True)
+
+#     ds = ds.batch(batch, drop_remainder=False).prefetch(AUTOTUNE)
+#     return ds, n_files
 '''
 ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
 代表集 generator（ 轉 TFLite）
