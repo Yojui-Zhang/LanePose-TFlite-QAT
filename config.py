@@ -7,8 +7,8 @@ Training Settings
 '''
 
 IMGSZ = 640
-BATCH = 16
-EPOCHS = 150              # 可先跑 5~10 看收斂
+BATCH = 32
+EPOCHS = 20              # 可先跑 5~10 看收斂
 
 base_lr = 0.01
 end_lr = 0.01
@@ -23,7 +23,7 @@ EXPORT_ONLY = False      # True 是否只進行輸出測試（.ckpt）, False �
 TFLITE_QUANT_MODE = "int8"  # 可選: "int8" | "fp16" | "fp32"
 
 # 監督來源：'distill' 或 'label#
-TRAIN_SUPERVISION = 'label'  # 原本只有蒸餾的話改成 'label' 就會走標註訓練
+TRAIN_SUPERVISION = 'distill'  # 原本只有蒸餾的話改成 'label' 就會走標註訓練
 
 USE_DFL  = False       # ← 關掉 DFL
 '''
@@ -33,22 +33,22 @@ Location (Input/Output)
 '''
 """Train Dataset"""
 REP_DIR_train = [
-    # "../_Dataset/KeyPoint/15point_6class_box0/20220830/images/*.jpg",
-    # "../_Dataset/KeyPoint/15point_6class_box0/20240321_night/images/*.jpg",
-    # "../_Dataset/KeyPoint/15point_6class_box0/acc_datasets/images/*.jpg",
-    # "../_Dataset/KeyPoint/15point_6class_box0/s3_20230803/images/*.jpg",
-    # "../_Dataset/KeyPoint/15point_6class_box0/Traffic_dataset_20240720_345_k/images/*.jpg",
-    # "../_Dataset/KeyPoint/15point_6class_box0/yolov8data2_20250804/images/*.jpg"
-    # "../_Dataset/KeyPoint/temp/mix_QAT/images/*.jpg"
+    "../dataset/lanepose/20220830/images/*.jpg",
+    "../dataset/lanepose/20240321_night/images/*.jpg",
+    "../dataset/lanepose/acc_datasets/images/*.jpg",
+    "../dataset/lanepose/s3_20230803/images/*.jpg",
+    "../dataset/lanepose/Traffic_dataset_20240720_345_k/images/*.jpg",
+    "../dataset/lanepose/yolov8data2_20250804/images/*.jpg"
+    # "../dataset/lanepose/temp/mix_QAT/images/*.jpg"
 
-    # "../dataset/lanepose/mix_QAT/images/*.jpg"    
-    "../dataset/lanepose/20220830/images/*.jpg"
+    # "../dataset/lanepose/test1/images/*.jpg"    
+    # "../dataset/lanepose/20220830/images/*.jpg"
     # "../dataset/lanepose/20220830/labels/*.txt"
 ]
 
 """TFlite Validation Dataset"""
-# REP_DIR_export = "../_Dataset/KeyPoint/temp/mix_QAT/images/*.jpg"
-REP_DIR_export = "../dataset/lanepose/test1/images/*.jpg"
+REP_DIR_export = "../_Dataset/KeyPoint/temp/mix_QAT/images/*.jpg"
+# REP_DIR_export = "../dataset/lanepose/test1/images/*.jpg"
 
 """Teacher Model"""
 EXPORTED_DIR = "./lanepose20250807_s_model_640_640_6c_v1_saved_model/"

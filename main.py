@@ -401,8 +401,22 @@ def save_visualization_results_to_png(sample_one, y_t_BNC, kd_BNC, dep_BNC, outp
             out_path=path_student_kd,
             title_text="Multi detections"
         )
+        
+        if dep_NC is not None:
+            _, _ = _pick_and_draw_multi(
+                img,
+                dep_NC,                 # (N,C)
+                is_logits=False,       # 若 y_BNC 是後處理前的 logits 設 True
+                det_score_thr=conf_thr,     # 分數門檻
+                top_k=10,              # 最多保留 10 個；不設即不限
+                do_nms=True,           # 開 NMS
+                iou_thr=0.5,           # NMS IoU 門檻
+                kpt_vis_thr=0.5,       # 關鍵點顏色門檻
+                out_path=path_student_deploy,
+                title_text="Multi detections"
+            )
 
-        saved_paths = f"{path_teacher.name}, {path_student_kd.name}"
+        saved_paths = f"{path_teacher.name}, {path_student_kd.name}, {path_student_deploy.name}"
         
         if dep_NC is not None:
             _ = _pick_best_and_draw(img, dep_NC, is_logits=False, out_path=path_student_deploy, title_text="Student Deploy")
@@ -472,26 +486,26 @@ def main():
     finally:
         
 # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
-        if config.TRAIN_SUPERVISION == 'label':
+        # if config.TRAIN_SUPERVISION == 'label':
         
-            student = make_ultra_infer_model(student, branch='kd')   # 或 'deploy' 視你需要
+        #     student = make_ultra_infer_model(student, branch='kd')   # 或 'deploy' 視你需要
 
-            # 計算 C 值
-            C = 4 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
-            conf_thr = 0.4
+        #     # 計算 C 值
+        #     C = 4 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
+        #     conf_thr = 0.4
 
-            for i in range(3):
-                # 執行推論並儲存 .txt 檔案
-                sample_one, y_t_BNC, kd_BNC, dep_BNC = save_model_outputs_to_txt(
-                    teacher, student, ds, C, output_paths
-                )
+        #     for i in range(3):
+        #         # 執行推論並儲存 .txt 檔案
+        #         sample_one, y_t_BNC, kd_BNC, dep_BNC = save_model_outputs_to_txt(
+        #             teacher, student, ds, C, output_paths
+        #         )
 
-                # 繪製視覺化結果並儲存 .png 檔案
-                save_visualization_results_to_png(
-                    sample_one, y_t_BNC, kd_BNC, dep_BNC, output_paths, i, conf_thr
-                )
+        #         # 繪製視覺化結果並儲存 .png 檔案
+        #         save_visualization_results_to_png(
+        #             sample_one, y_t_BNC, kd_BNC, dep_BNC, output_paths, i, conf_thr
+        #         )
         
-        '''
+        
 # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
         
         if not getattr(config, "EXPORT_ONLY", False):
@@ -581,7 +595,7 @@ def main():
                 NUM_KPT=config.NUM_KPT,
                 KPT_VALS=config.KPT_VALS,
             )
-            '''
+            
     # 10) 完成
     end_time = time.time()
     print(f"\n--- 🎉 All tasks completed in {((end_time - start_time) / 60):.2f} minutes. ---")

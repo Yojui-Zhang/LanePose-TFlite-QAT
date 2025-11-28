@@ -372,7 +372,9 @@ class U8PoseCompatHead(tf.keras.layers.Layer):
             c = self.out_cls[i](c)  # (B,H,W, nc)
             k = self.out_kpt[i](k)  # (B,H,W, nk*3)
 
-            rc = L.Concatenate(axis=-1)([r, c])  # (B,H,W, nc+4*reg_max)
+            # rc = L.Concatenate(axis=-1)([r, c])  # (B,H,W, nc+4*reg_max)
+            rc = L.Concatenate(axis=-1)([c, r])  # 先 cls, 再 reg —— 與 loss 假設一致
+            
             feats_out.append(self._to_bchw(rc))  # -> (B, no, H, W)
             kpts_out.append(self._to_bchw(k))    # -> (B, nk*3, H, W)
 

@@ -1,4 +1,5 @@
 
+pandas
 tensorflow-model-optimization==0.8.0
 opencv-python
 numpy

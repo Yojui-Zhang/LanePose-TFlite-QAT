@@ -28,6 +28,7 @@ import Depance file
 import os
 import csv
 import numpy as np 
+import pandas as pd
 import tensorflow_model_optimization as tfmot
 from tensorflow.keras.models import clone_model
 from src.Model_cfg.u_8_s_pose_keras_qat import TeacherCompatHead, U8PoseCompatHead,ChannelAttention, SpatialAttention, CBAM  # 確保可 import 到
@@ -55,7 +56,7 @@ from src.process.pred_reshape import bcn_to_bnc
 
 from src.process.labels_yolo_pose_tf import parse_label_lines
 
-from src.Loss_function.loss_tf import v8PoseLossTF
+from src.Loss_function.loss_tf import pose_loss_from_labels
 
 if config.PLOT_Switch == True:
     from src.process.Plot_Data import plot_and_save_lr_schedule
@@ -142,54 +143,49 @@ def probe_kd_output_distribution(student_model, dataset, expected_C, imgsz=640):
 Core Logic
 ==================================================================================
 '''
-
-
 def build_batch_dict_from_targets(targets_per_image, num_kpt, kpt_vals):
     """
-    Args:
-      targets_per_image: 長度為 B 的 list；每個元素是 (Gi, 5 + num_kpt*kpt_vals) 的 tf.Tensor 或 numpy
-                         每列: [cls, cx, cy, w, h, kp1x, kp1y, kp1v, ...]
-      num_kpt: 關鍵點數
-      kpt_vals: 每個 keypoint 的欄位數（通常 3: x,y,v）
-    Returns:
-      batch_dict = {
+    targets_per_image: 長度 B；每個元素 shape=(Gi, 5 + num_kpt*kpt_vals)
+    回傳:
+      {
         'batch_idx': (G,1) int32,
         'cls'      : (G,1) int32,
-        'bboxes'   : (G,4) float32 (xywh normalized),
+        'bboxes'   : (G,4) float32,
         'keypoints': (G, num_kpt, kpt_vals) float32
       }
     """
     batch_idx_list, cls_list, bboxes_list, kpts_list = [], [], [], []
-    for b, arr in enumerate(targets_per_image):
-        if arr is None:
-            continue
-        t = tf.convert_to_tensor(arr)
-        if tf.shape(t)[0] == 0:
-            continue
-        t = tf.cast(t, tf.float32)
-        cls = tf.cast(t[:, 0:1], tf.int32)              # (Gi,1)
-        xywh = t[:, 1:5]                                 # (Gi,4)
-        kpts_flat = t[:, 5:5 + num_kpt * kpt_vals]       # (Gi, num_kpt*kpt_vals)
-        kpts = tf.reshape(kpts_flat, [-1, num_kpt, kpt_vals])
 
+    for b, arr in enumerate(targets_per_image):
+        t = tf.zeros([0, 5 + num_kpt * kpt_vals], tf.float32) if (arr is None) \
+            else tf.cast(tf.convert_to_tensor(arr), tf.float32)
         gi = tf.shape(t)[0]
-        batch_idx_list.append(tf.fill([gi,1], b))
+
+        def when_non_empty():
+            cls = tf.cast(t[:, 0:1], tf.int32)
+            xywh = t[:, 1:5]
+            kpts = tf.reshape(t[:, 5:5 + num_kpt * kpt_vals], [-1, num_kpt, kpt_vals])
+            bi = tf.fill([gi, 1], tf.cast(b, tf.int32))
+            return bi, cls, xywh, kpts
+
+        def when_empty():
+            return (tf.zeros([0, 1], tf.int32),
+                    tf.zeros([0, 1], tf.int32),
+                    tf.zeros([0, 4], tf.float32),
+                    tf.zeros([0, num_kpt, kpt_vals], tf.float32))
+
+        bi, cls, xywh, kpts = tf.cond(gi > 0, when_non_empty, when_empty)
+
+        batch_idx_list.append(bi)
         cls_list.append(cls)
         bboxes_list.append(xywh)
         kpts_list.append(kpts)
-
-    if len(cls_list) == 0:
-        # 空 batch（沒有任何 GT）
-        z = tf.zeros([0,1], tf.int32)
-        return {'batch_idx': z,
-                'cls': z,
-                'bboxes': tf.zeros([0,4], tf.float32),
-                'keypoints': tf.zeros([0, num_kpt, kpt_vals], tf.float32)}
 
     batch_idx = tf.concat(batch_idx_list, axis=0)
     cls_all   = tf.concat(cls_list, axis=0)
     boxes_all = tf.concat(bboxes_list, axis=0)
     kpts_all  = tf.concat(kpts_list, axis=0)
+
     return {'batch_idx': batch_idx,
             'cls': cls_all,
             'bboxes': boxes_all,
@@ -227,23 +223,36 @@ def build_student_qat():
 
     reload(cfg)
 
-    if config.TRAIN_SUPERVISION == 'label':
-        # 1) 先建雙頭的 base model（head 輸出都是 (B,C,N)）
-        base = cfg.build_u8s_pose_dual(
-            input_shape=(config.IMGSZ, config.IMGSZ, 3),
-            num_classes=config.NUM_CLS,
-            num_kpt=config.NUM_KPT,
-            kpt_vals=config.KPT_VALS
-        )
-        print(f"\nBuild the u8s_pose_dual model...")
-    else:
-        base = cfg.build_u8s_pose_dual_distill(
-            input_shape=(config.IMGSZ, config.IMGSZ, 3),
-            num_classes=config.NUM_CLS,
-            num_kpt=config.NUM_KPT,
-            kpt_vals=config.KPT_VALS
-        )
-        print(f"\nBuild the u8s_pose_dual_distill model...")
+    # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+
+    # if config.TRAIN_SUPERVISION == 'label':
+    #     # 1) 先建雙頭的 base model（head 輸出都是 (B,C,N)）
+    #     base = cfg.build_u8s_pose_dual(
+    #         input_shape=(config.IMGSZ, config.IMGSZ, 3),
+    #         num_classes=config.NUM_CLS,
+    #         num_kpt=config.NUM_KPT,
+    #         kpt_vals=config.KPT_VALS
+    #     )
+    #     print(f"\nBuild the u8s_pose_dual model...")
+    # else:
+    #     base = cfg.build_u8s_pose_dual_distill(
+    #         input_shape=(config.IMGSZ, config.IMGSZ, 3),
+    #         num_classes=config.NUM_CLS,
+    #         num_kpt=config.NUM_KPT,
+    #         kpt_vals=config.KPT_VALS
+    #     )
+    #     print(f"\nBuild the u8s_pose_dual_distill model...")
+
+
+    base = cfg.build_u8s_pose_dual_distill(
+        input_shape=(config.IMGSZ, config.IMGSZ, 3),
+        num_classes=config.NUM_CLS,
+        num_kpt=config.NUM_KPT,
+        kpt_vals=config.KPT_VALS
+    )
+    print(f"\nBuild the u8s_pose_dual_distill model...")
+    
+    # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
 
     # 2) 只註解要量化的層；凡是 head 相關一律跳過
     QUANTIZABLE = (
@@ -304,20 +313,17 @@ def build_student_qat():
     return student
 
 
+
+
+
 def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
     """
     ==============================================================================
     執行 QAT 訓練，並把『學生輸出 N 維（P3/P4/P5）』在 train_step 中重排到與 Teacher 一致。
     ==============================================================================
     """
-    pose_loss = v8PoseLossTF(
-        strides=(8,16,32),
-        nc=config.NUM_CLS,
-        reg_max=16,
-        kpt_shape=(config.NUM_KPT, config.KPT_VALS),
-        img_size=config.IMGSZ,      # e.g., 640
-        topk=10
-    )
+    # pose_loss = v8PoseLossTF()
+    
     
     print("\n--- Starting QAT Fine-tuning ---")
 
@@ -479,7 +485,8 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
         mae_all_d = (mae_box_d + mae_kxy_d + mae_v_d + mae_cls_d)
 
         return loss, mae_all_s, mae_box_s, mae_cls_s, mae_kxy_s, mae_v_s, mae_all_d
-
+    
+    # @tf.function
     def train_step_label(batch_imgs, targets_per_image):
         # 非 @tf.function：在這裡直接用 targets（Tensor），做 forward/backward
         NUM_CLS, NUM_KPT, KPT_VALS = config.NUM_CLS, config.NUM_KPT, config.KPT_VALS
@@ -488,21 +495,79 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
         with tf.GradientTape() as tape:
             
             y_s_out = student(batch_imgs, training=True)
-            deploy_feats, deploy_kpts = y_s_out[0] if isinstance(y_s_out, (list, tuple)) else y_s_out
-            kd_feats, kd_kpts = y_s_out[1] if isinstance(y_s_out, (list, tuple)) else y_s_out
 
-            # t_BNC = ensure_BNC_static(teacher(batch_imgs, training=False), C)
+            kd_raw     = y_s_out[1] if isinstance(y_s_out, (list,tuple)) else y_s_out
+            deploy_raw = y_s_out[0] if isinstance(y_s_out, (list,tuple)) else y_s_out
+
+            s_BNC = ensure_BNC_static(kd_raw, C)
+            d_BNC = ensure_BNC_static(deploy_raw, C)
 
             batch_dict = build_batch_dict_from_targets(
                 targets_per_image, num_kpt=NUM_KPT, kpt_vals=KPT_VALS
             )
+            # ---------------------------------
+            '''
+            bd = batch_dict   # 簡寫
 
-            total_loss_kd, logs = pose_loss((kd_feats, kd_kpts), batch_dict)
-            total_loss_depoly, logs_depoly = pose_loss((deploy_feats, deploy_kpts), batch_dict)
-            total_loss = total_loss_kd + total_loss_depoly 
+            # 轉成 numpy
+            batch_idx = bd['batch_idx'].numpy().reshape(-1)   # (G,)
+            cls       = bd['cls'].numpy().reshape(-1)         # (G,)
+            bboxes    = bd['bboxes'].numpy()                  # (G,4)
+            kpts      = bd['keypoints'].numpy()               # (G, num_kpt, kpt_vals)
+
+            G = batch_idx.shape[0]
+
+            kpts_flat = kpts.reshape(G, NUM_KPT * KPT_VALS)   # (G, num_kpt*kpt_vals)
+
+            # 把所有欄位串在一起 → (G, 2 + 4 + num_kpt*kpt_vals)
+            data = np.concatenate([
+                batch_idx[:, None],    # (G,1)
+                cls[:, None],          # (G,1)
+                bboxes,                # (G,4)
+                kpts_flat              # (G, num_kpt*kpt_vals)
+            ], axis=1)
+
+            columns = ['batch_idx', 'cls', 'x', 'y', 'w', 'h']
+
+            # keypoints 欄名：kpt{i}_{j}
+            # 例如 kpt0_x, kpt0_y, kpt0_v, kpt1_x, kpt1_y, ...
+            name_per_val = ['x', 'y', 'v'][:KPT_VALS]   # 若是 (x,y) 就設 ['x','y']
+
+            for i in range(NUM_KPT):
+                for j in range(KPT_VALS):
+                    columns.append(f'kpt{i}_{name_per_val[j] if j < len(name_per_val) else j}')
+                    # 若你懶得分 x/y/v，也可以直接：
+                    # columns.append(f'kpt{i}_{j}')
+
+            df = pd.DataFrame(data, columns=columns)
+
+            # 存成 CSV（推薦）
+            df.to_csv('targets_flatten.csv', index=False, float_format='%.6f')
+            '''
+            # ---------------------------------
+
+            loss_kd,   logs_kd   = pose_loss_from_labels(
+                kd_raw, batch_dict, NUM_CLS, NUM_KPT, KPT_VALS, img_size=config.IMGSZ
+            )
+            loss_dep,  logs_dep  = pose_loss_from_labels(
+                deploy_raw, batch_dict, NUM_CLS, NUM_KPT, KPT_VALS, img_size=config.IMGSZ
+            )
+
+            total_loss = loss_kd + loss_dep
+
+            if config.USE_AMP:
+                scaled_loss = opt.get_scaled_loss(total_loss)
+            else:
+                scaled_loss = total_loss
+
+            # total_loss_kd, logs = pose_loss((kd_feats, kd_kpts), batch_dict)
+            # total_loss_depoly, logs_depoly = pose_loss((deploy_feats, deploy_kpts), batch_dict)
+            # total_loss = total_loss_kd + total_loss_depoly 
             
 
         grads = tape.gradient(total_loss, student.trainable_variables)
+        if config.USE_AMP:
+            grads = opt.get_unscaled_gradients(grads)
         opt.apply_gradients(zip(grads, student.trainable_variables))
         '''
         # parts_* 是 dict
@@ -512,6 +577,13 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
         mae_v   = parts_dp.get('kobj', 0.0)
         mae_all = mae_box + mae_cls + mae_kxy + mae_v
         '''
+
+        logs = {}
+        for k, v in logs_kd.items():
+            logs[f"kd_{k}"] = v
+        for k, v in logs_dep.items():
+            logs[f"dep_{k}"] = v
+
         return total_loss, logs
 
     # 6) 評估：epoch 末計算 MAE（Student vs Teacher）與 across-N 變異數
