@@ -485,25 +485,25 @@ def main():
         print("\n[⚠️ Interrupt] KeyboardInterrupt caught. Will export current weights...\n")
     finally:
         
-# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
-        # if config.TRAIN_SUPERVISION == 'label':
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝ ERROR ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+        # # if config.TRAIN_SUPERVISION == 'label':
         
-        #     student = make_ultra_infer_model(student, branch='kd')   # 或 'deploy' 視你需要
+        # student = make_ultra_infer_model(student, branch='kd')   # 或 'deploy' 視你需要
 
-        #     # 計算 C 值
-        #     C = 4 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
-        #     conf_thr = 0.4
+        # # 計算 C 值
+        # C = 4 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
+        # conf_thr = 0.4
 
-        #     for i in range(3):
-        #         # 執行推論並儲存 .txt 檔案
-        #         sample_one, y_t_BNC, kd_BNC, dep_BNC = save_model_outputs_to_txt(
-        #             teacher, student, ds, C, output_paths
-        #         )
+        # for i in range(3):
+        #     # 執行推論並儲存 .txt 檔案
+        #     sample_one, y_t_BNC, kd_BNC, dep_BNC = save_model_outputs_to_txt(
+        #         teacher, student, ds, C, output_paths
+        #     )
 
-        #         # 繪製視覺化結果並儲存 .png 檔案
-        #         save_visualization_results_to_png(
-        #             sample_one, y_t_BNC, kd_BNC, dep_BNC, output_paths, i, conf_thr
-        #         )
+        #     # 繪製視覺化結果並儲存 .png 檔案
+        #     save_visualization_results_to_png(
+        #         sample_one, y_t_BNC, kd_BNC, dep_BNC, output_paths, i, conf_thr
+        #     )
         
         
 # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝

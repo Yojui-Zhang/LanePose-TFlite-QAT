@@ -1,0 +1,2 @@
+epoch,loss,learning_rate,mae_box,mae_cls,mae_kpt,mae_ksc
+1,11.444199,0.01000000

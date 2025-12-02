@@ -1,0 +1,30 @@
+description: Ultralytics YOLOv8_Rep-Pose model trained on ./dataset/lanepose-carkeypoint.yaml
+author: Ultralytics
+date: '2025-11-28T16:59:01.516715'
+version: 8.3.166
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 16
+task: pose
+batch: 1
+imgsz:
+- 288
+- 512
+names:
+  0: roadlane
+  1: car
+  2: rider
+  3: person
+  4: lights
+  5: sign_c
+  6: sing_t
+args:
+  batch: 1
+  fraction: 1.0
+  half: false
+  int8: true
+  nms: false
+channels: 3
+kpt_shape:
+- 15
+- 3
