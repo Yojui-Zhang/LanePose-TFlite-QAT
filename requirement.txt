@@ -6,7 +6,7 @@ numpy
 tqdm
 matplotlib
 tf-keras==2.15.0
-tensorflow==2.15.0
+# tensorflow==2.15.0
 
 #pip install --extra-index-url https://pypi.nvidia.com "tensorflow[and-cuda]==2.15.0"
 

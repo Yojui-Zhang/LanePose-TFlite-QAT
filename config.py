@@ -8,7 +8,7 @@ Training Settings
 
 IMGSZ = 640
 BATCH = 32
-EPOCHS = 5              # 可先跑 5~10 看收斂
+EPOCHS = 200              # 可先跑 5~10 看收斂
 
 base_lr = 0.01
 end_lr = 0.01
@@ -17,7 +17,7 @@ momentum = 0.9
 BNSTOP__ = True         # 凍結 BN , Ture不凍結/ False凍結
 USE_AMP = False         # 設定為 True 以啟用混合精度訓練 (Tensor 版本不支援)
 
-PLOT_Switch = False     # 是否繪製數據圖, 若 matplotlib 版本不符可關閉
+PLOT_Switch = True     # 是否繪製數據圖, 若 matplotlib 版本不符可關閉
 EXPORT_ONLY = False      # True 是否只進行輸出測試（.ckpt）, False 進行蒸餾QAT輸出
 
 TFLITE_QUANT_MODE = "int8"  # 可選: "int8" | "fp16" | "fp32"
@@ -35,13 +35,13 @@ Location (Input/Output)
 REP_DIR_train = [
     # "../dataset/lanepose/20220830/images/*.jpg",
     # "../dataset/lanepose/20240321_night/images/*.jpg",
-    "../dataset/lanepose/acc_datasets/images/*.jpg",
+    # "../dataset/lanepose/acc_datasets/images/*.jpg",
     # "../dataset/lanepose/s3_20230803/images/*.jpg",
     # "../dataset/lanepose/Traffic_dataset_20240720_345_k/images/*.jpg",
     # "../dataset/lanepose/yolov8data2_20250804/images/*.jpg"
     # "../dataset/lanepose/mix_QAT/images/*.jpg"
 
-    # "../dataset/lanepose/test1/images/*.jpg"    
+    "../dataset/lanepose/test1/images/*.jpg"    
     # "../dataset/lanepose/20220830/images/*.jpg"
     # "../dataset/lanepose/20220830/labels/*.txt"
 ]

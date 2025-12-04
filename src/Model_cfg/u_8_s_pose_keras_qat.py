@@ -426,15 +426,18 @@ def build_u8s_pose_dual(
     x17   = L.Concatenate(axis=-1, name='cat_17')([x16, x4])
     x18   = repvgg_block(x17, ch(32), k=3, s=1, name='RepVGG_18', act='LeakyRelu')
 
+    # x19   = L.UpSampling2D(size=(2,2), name='UP_19')(x18)                                   # 1/4
+    # x20   = L.Concatenate(axis=-1, name='cat_20')([x19, x2])
+    # x21   = repvgg_block(x20, ch(16), k=3, s=1, name='RepVGG_21', act='LeakyRelu')
 
-    head_kd  = U8PoseCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, reg_max=REG_MAX, name="kd_head")
-    kd_feats, kd_kpts = head_kd((x18, x14, x9))  # ← Ultralytics 訓練態格式
+    # feats = (p3, p4, p5)  # 一定要這個順序！
+    head_kd = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="kd_head", apply_sigmoid=False)
+    kd_preds = head_kd((x18, x14, x9))
 
-    head_dep = U8PoseCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, reg_max=REG_MAX, name="deploy_head")
-    deploy_feats, deploy_kpts = head_dep((x18, x14, x9))        # ← 維持你原先 (B,N,C) 便於部署
+    head_dep = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="deploy_head", apply_sigmoid=False)
+    deploy_preds = head_dep((x18, x14, x9))   
 
-    model = K.Model(inp, [(deploy_feats, deploy_kpts), (kd_feats, kd_kpts)], name="u8s_pose_keras_dual")
-    return model
+    return K.Model(inp, [deploy_preds, kd_preds], name='u8s_pose_keras_dual')
 
 
 def build_u8s_pose_dual_distill(

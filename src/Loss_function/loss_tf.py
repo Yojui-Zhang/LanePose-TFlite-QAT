@@ -1,249 +1,241 @@
-# src/Loss_function/loss_tf.py
 import tensorflow as tf
-import math
+import numpy as np
 import config
-from src.process.pred_model import (split_BNC, ensure_BNC_static)
 
-# ==========================
+# ==============================================================================
 # Helper Functions
-# ==========================
+# ==============================================================================
+
+def iou_batch(bboxes1, bboxes2):
+    """
+    計算 IoU (Intersection over Union)
+    bboxes1: (B, N, 4) - Anchors (xywh)
+    bboxes2: (B, M, 4) - GT Boxes (xywh)
+    回傳: (B, N, M)
+    """
+    # 轉換成 x1, y1, x2, y2 格式以便計算
+    b1_x1 = bboxes1[..., 0] - bboxes1[..., 2] / 2.0
+    b1_y1 = bboxes1[..., 1] - bboxes1[..., 3] / 2.0
+    b1_x2 = bboxes1[..., 0] + bboxes1[..., 2] / 2.0
+    b1_y2 = bboxes1[..., 1] + bboxes1[..., 3] / 2.0
+
+    b2_x1 = bboxes2[..., 0] - bboxes2[..., 2] / 2.0
+    b2_y1 = bboxes2[..., 1] - bboxes2[..., 3] / 2.0
+    b2_x2 = bboxes2[..., 0] + bboxes2[..., 2] / 2.0
+    b2_y2 = bboxes2[..., 1] + bboxes2[..., 3] / 2.0
+
+    # Expand dims for broadcasting: (B, N, 1) vs (B, 1, M)
+    b1_x1, b1_y1, b1_x2, b1_y2 = [tf.expand_dims(x, -1) for x in [b1_x1, b1_y1, b1_x2, b1_y2]]
+    b2_x1, b2_y1, b2_x2, b2_y2 = [tf.expand_dims(x, 1) for x in [b2_x1, b2_y1, b2_x2, b2_y2]]
+
+    intersect_x1 = tf.maximum(b1_x1, b2_x1)
+    intersect_y1 = tf.maximum(b1_y1, b2_y1)
+    intersect_x2 = tf.minimum(b1_x2, b2_x2)
+    intersect_y2 = tf.minimum(b1_y2, b2_y2)
+
+    w = tf.maximum(0.0, intersect_x2 - intersect_x1)
+    h = tf.maximum(0.0, intersect_y2 - intersect_y1)
+    intersection = w * h
+
+    area1 = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
+    area2 = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
+    union = area1 + area2 - intersection
+
+    return intersection / (union + 1e-8)
 
 def huber_no_reduce(y_true, y_pred, delta=1.0):
-    """
-    計算 Huber Loss
-    """
-    y_true = tf.cast(y_true, tf.float32)
-    y_pred = tf.cast(y_pred, tf.float32)
-    diff = y_pred - y_true
-    abs_diff = tf.abs(diff)
-    small = 0.5 * tf.square(diff)
-    big   = delta * (abs_diff - 0.5 * delta)
-    return tf.where(abs_diff <= delta, small, big)
+    """標準 Huber Loss，但不做 reduce_mean，保留形狀以便後續加權"""
+    error = y_true - y_pred
+    is_small_error = tf.abs(error) <= delta
+    squared_loss = 0.5 * tf.square(error)
+    linear_loss = delta * (tf.abs(error) - 0.5 * delta)
+    return tf.where(is_small_error, squared_loss, linear_loss)
 
-# ==========================
-# Core Loss Function (Direct 0-1 Regression)
-# ==========================
-
-def pose_loss_from_labels(
-    pred_raw,
-    batch_dict,
-    num_cls,
-    num_kpt,
-    kpt_vals,
-    img_size,
-    lambda_box=5.0,    # Box 權重
-    lambda_kxy=9.0,    # Keypoint 權重
-    lambda_v=2.0,      # Visibility 權重
-    lambda_cls=1.0,    # Class 權重
-):
+def decode_box(pred_rel, anchors):
     """
-    完全回歸版 Loss:
-    1. 移除所有 Sigmoid/Log 轉換。
-    2. 強迫模型 Linear 輸出直接擬合 0~1 的目標值。
-    3. 適用於不希望修改推論腳本的情況。
+    【關鍵修正】
+    將模型輸出的相對數值 (0~1) 解碼為絕對座標。
+    pred_rel: (B, N, 4) range 0~1 (after sigmoid)
+    anchors:  (N, 4) range 0~1 [cx, cy, w, h]
     """
-
-    # ------------------------------------------------------
-    # 0. 準備預測值 (不做 Activation)
-    # ------------------------------------------------------
-    C = 4 + num_cls + num_kpt * kpt_vals
-    BNC = ensure_BNC_static(pred_raw, C)
+    # 擴展 anchors 以匹配 batch size
+    anchors = tf.expand_dims(anchors, axis=0) # (1, N, 4)
     
-    # 拆分預測值
-    box_pred, cls_pred, kxy_pred, v_pred = split_BNC(BNC, num_cls, num_kpt, kpt_vals)
+    a_xy = anchors[..., 0:2]
+    a_wh = anchors[..., 2:4]
 
-    # 型別轉換 (保持 Linear，不加 Sigmoid)
-    box_pred = tf.cast(box_pred, tf.float32)
+    p_xy = pred_rel[..., 0:2]
+    p_wh = pred_rel[..., 2:4]
+
+    # Decode Strategy:
+    # XY: 允許中心點在 Anchor 寬高範圍內偏移。
+    # 0.5 代表在 Anchor 中心。
+    # box_cx = anchor_cx + (pred_cx - 0.5) * anchor_w
+    decoded_xy = a_xy + (p_xy - 0.5) * a_wh
     
-    # [Box] 直接取值，不做 sigmoid，也不做 exp
-    # 預期模型輸出: [x(0~1), y(0~1), w(0~1), h(0~1)]
-    pred_xywh = box_pred 
+    # WH: 允許寬高縮放。
+    # 0.5 代表跟 Anchor 一樣大。
+    # box_w = anchor_w * (2 * pred_w)^2  (使用平方是為了讓梯度更平滑且確保非負)
+    decoded_wh = a_wh * tf.square(p_wh * 2.0)
 
-    # [Keypoint] 直接取值
-    if kxy_pred is not None:
-        kxy_pred = tf.cast(kxy_pred, tf.float32)
+    return tf.concat([decoded_xy, decoded_wh], axis=-1)
+
+def decode_kpt(pred_kpt_rel, anchors, num_kpt, kpt_vals):
+    """
+    解碼 Keypoints
+    pred_kpt_rel: (B, N, num_kpt * kpt_vals)
+    """
+    anchors = tf.expand_dims(anchors, axis=0) # (1, N, 4)
+    a_xy = anchors[..., 0:2]
+    a_wh = anchors[..., 2:4]
+
+    # Reshape: (B, N, num_kpt, kpt_vals)
+    B = tf.shape(pred_kpt_rel)[0]
+    N = tf.shape(pred_kpt_rel)[1]
     
-    # [Class] 直接取值 (將用 Huber Loss 回歸 0/1)
-    if cls_pred is not None: 
-        cls_pred = tf.cast(cls_pred, tf.float32)
-
-    # [Visibility] 調整形狀
-    if v_pred is not None:
-        B_dyn = tf.shape(box_pred)[0]
-        N_dyn = tf.shape(box_pred)[1]
-        v_pred = tf.cast(v_pred, tf.float32)
-        v_pred = tf.reshape(v_pred, [B_dyn, N_dyn, num_kpt])
-
-    # ------------------------------------------------------
-    # 1. 解析 Ground Truth
-    # ------------------------------------------------------
-    gt_batch = tf.cast(tf.reshape(batch_dict["batch_idx"], [-1]), tf.int32)
-    gt_cls   = tf.cast(tf.reshape(batch_dict["cls"],       [-1]), tf.int32)
-    # 這些原始數據已經是 0~1 歸一化的
-    gt_box   = tf.cast(batch_dict["bboxes"],    tf.float32) # (G, 4) -> xywh (0~1)
-    gt_kpts  = tf.cast(batch_dict["keypoints"], tf.float32) # (G, K, V) (0~1)
-
-    # ------------------------------------------------------
-    # 2. 定義 Strides 與建立 Targets (全圖 0~1)
-    # ------------------------------------------------------
-    strides = [8, 16, 32]
-    # 這裡只需要計算網格索引來決定「誰負責預測」，不需要計算偏移量
-    if isinstance(img_size, (tuple, list)):
-        img_w = float(img_size[0])
+    pred_kpt = tf.reshape(pred_kpt_rel, (B, N, num_kpt, kpt_vals))
+    
+    # 取出 xy (前兩個數值)
+    kp_xy = pred_kpt[..., 0:2] # (B, N, K, 2)
+    
+    # 擴展 anchors 維度以匹配 K
+    a_xy_exp = tf.expand_dims(a_xy, axis=2) # (1, N, 1, 2)
+    a_wh_exp = tf.expand_dims(a_wh, axis=2) # (1, N, 1, 2)
+    
+    # Decode: kpt_x = anchor_cx + (pred_x - 0.5) * anchor_w * scale
+    # 這裡假設 keypoints 範圍比較大，給予 4 倍 anchor 大小的搜尋範圍
+    decoded_kp_xy = a_xy_exp + (kp_xy - 0.5) * a_wh_exp * 4.0
+    
+    # 組合回去 (如果有 visibility 屬性則保留原值)
+    if kpt_vals > 2:
+        kp_rest = pred_kpt[..., 2:] # Visibility or others
+        decoded_kpt = tf.concat([decoded_kp_xy, kp_rest], axis=-1)
     else:
-        img_w = float(img_size)
-    
-    grid_dims = [int(img_w / s) for s in strides]
-    offsets = [0]
-    for gd in grid_dims[:-1]:
-        offsets.append(offsets[-1] + gd * gd)
-    
-    box_t_list, cls_t_list, kxy_t_list, v_t_list, pos_mask_list = [], [], [], [], []
-    B_int = int(tf.shape(box_pred)[0])
+        decoded_kpt = decoded_kp_xy
 
-    for b in range(B_int):
-        # 初始化
-        box_t_b = tf.zeros_like(pred_xywh[b])
-        pos_mask_b = tf.zeros([tf.shape(box_pred)[1]], tf.float32)
-        cls_t_b = tf.zeros_like(cls_pred[b]) if cls_pred is not None else None
-        kxy_t_b = tf.zeros_like(kxy_pred[b]) if kxy_pred is not None else None
-        v_t_b   = tf.zeros_like(v_pred[b])   if v_pred is not None else None
+    # Flatten back
+    return tf.reshape(decoded_kpt, (B, N, num_kpt * kpt_vals))
 
-        # 找出 GT
-        b_tensor = tf.cast(b, gt_batch.dtype)
-        gt_mask_b = tf.reshape(tf.where(tf.equal(gt_batch, b_tensor)), [-1])
-        Mb = tf.shape(gt_mask_b)[0]
+# ==============================================================================
+# Main Loss Function
+# ==============================================================================
+def pose_loss_from_labels(y_true, y_pred, anchors=None, 
+                          num_cls=1, num_kpt=17, kpt_vals=3, 
+                          lambda_box=10.0, lambda_cls=1.0, lambda_kpt=5.0):
+    """
+    y_true: dict, 包含 'bboxes', 'cls', 'keypoints', 'num_objects'
+        bboxes   shape: (B, M, 4),  [cx, cy, w, h]，0~1
+        cls      shape: (B, M, 1) or (B, M)
+        keypoints:       (B, M, K, V)
+        num_objects:     (B, 1)
 
-        if Mb > 0:
-            raw_boxes = tf.gather(gt_box, gt_mask_b) # (Mb, 4) 0~1
-            raw_cls   = tf.gather(gt_cls, gt_mask_b) 
-            raw_kpts  = tf.gather(gt_kpts, gt_mask_b) # (Mb, K, V) 0~1
+    y_pred: Tensor, shape (B, N, 4 + num_cls + num_kpt*kpt_vals)，
+            格式假設與 pred_save_model 相同：
+            [cx, cy, w, h, cls_scores..., kpt0_x, kpt0_y, kpt0_v, ...]
 
-            # 絕對座標用於計算落在哪個 Grid
-            abs_x = raw_boxes[:, 0] * img_w
-            abs_y = raw_boxes[:, 1] * img_w # 假設正方形
-            
-            all_indices = []
-            all_target_boxes = []
-            all_target_cls = []
-            all_target_kxy = []
-            all_target_v = []
+    anchors: 目前不再使用，只保留參數以相容呼叫端。
+    """
 
-            for i, s in enumerate(strides):
-                gs = grid_dims[i]
-                offset = offsets[i]
+    # 1. 解析模型輸出（不要再做 sigmoid / anchor decode）
+    # -------------------------------------------------------------------------
+    C = 4 + num_cls + num_kpt * kpt_vals
+    y_pred = tf.reshape(y_pred, (-1, tf.shape(y_pred)[1], C))
 
-                # 計算 Grid Index (僅用於定位)
-                gx = abs_x / s
-                gy = abs_y / s
-                gi = tf.cast(tf.math.floor(gx), tf.int32)
-                gj = tf.cast(tf.math.floor(gy), tf.int32)
-                gi = tf.clip_by_value(gi, 0, gs - 1)
-                gj = tf.clip_by_value(gj, 0, gs - 1)
-                anch_idx = offset + gj * gs + gi
+    idx_box_end = 4
+    idx_cls = 4 + num_cls
 
-                # ★★★ 重點：Target 直接使用歸一化數值 ★★★
-                
-                # 1. Box Target: 直接用 0~1 的 raw_boxes
-                t_box = raw_boxes 
+    # 直接當成絕對 xywh（0~1）
+    pred_box      = y_pred[..., :idx_box_end]   # (B, N, 4)
+    pred_cls_prob = y_pred[..., idx_box_end:idx_cls]      # (B, N, num_cls)
+    pred_kpt_flat = y_pred[..., idx_cls:]                 # (B, N, K*V)
 
-                # 2. Keypoint Target: 直接用 0~1 的 raw_kpts
-                t_kxy = raw_kpts[..., 0:2]
+    # 2. 從 GT 取出 box / cls / kpts，並做匹配
+    # -------------------------------------------------------------------------
+    gt_boxes   = y_true['bboxes']      # (B, M, 4)
+    gt_classes = y_true['cls']         # (B, M, 1) or (B, M)
+    gt_kpts    = y_true['keypoints']   # (B, M, K, V)
+    num_objs   = y_true['num_objects'] # (B, 1)
 
-                # 3. Class Target: One-hot (0或1)
-                t_cls = tf.one_hot(raw_cls, depth=num_cls)
+    # 用「預測的 box」跟 GT 算 IoU： (B, N, M)
+    iou_map = iou_batch(pred_box, gt_boxes)
 
-                # 4. Visibility Target
-                if kpt_vals > 2:
-                    t_v = raw_kpts[..., 2]
-                else:
-                    t_v = tf.ones_like(raw_kpts[..., 0])
+    # 每個 prediction 找到 IoU 最大的 GT
+    best_gt_idx = tf.argmax(iou_map, axis=2, output_type=tf.int32)  # (B, N)
+    best_iou    = tf.reduce_max(iou_map, axis=2)                    # (B, N)
 
-                all_indices.append(anch_idx)
-                all_target_boxes.append(t_box)
-                all_target_cls.append(t_cls)
-                all_target_kxy.append(t_kxy)
-                all_target_v.append(t_v)
+    # 只允許匹配到「有效 GT」（index < num_objects）
+    num_objs_expand = tf.broadcast_to(num_objs, tf.shape(best_gt_idx))  # (B, N)
+    valid_gt_mask   = best_gt_idx < num_objs_expand
 
-            # 合併與寫入
-            indices_flat = tf.concat(all_indices, axis=0)
-            
-            # 使用 tensor_scatter_nd_update
-            box_t_b = tf.tensor_scatter_nd_update(
-                box_t_b, tf.expand_dims(indices_flat, 1), tf.concat(all_target_boxes, axis=0)
-            )
-            pos_mask_b = tf.tensor_scatter_nd_update(
-                pos_mask_b, tf.expand_dims(indices_flat, 1), tf.ones_like(indices_flat, dtype=tf.float32)
-            )
-            if cls_t_b is not None:
-                cls_t_b = tf.tensor_scatter_nd_update(
-                    cls_t_b, tf.expand_dims(indices_flat, 1), tf.concat(all_target_cls, axis=0)
-                )
-            if kxy_t_b is not None:
-                kxy_t_b = tf.tensor_scatter_nd_update(
-                    kxy_t_b, tf.expand_dims(indices_flat, 1), tf.concat(all_target_kxy, axis=0)
-                )
-            if v_t_b is not None:
-                v_t_b = tf.tensor_scatter_nd_update(
-                    v_t_b, tf.expand_dims(indices_flat, 1), tf.concat(all_target_v, axis=0)
-                )
+    # IoU 閾值，可以先設低一點讓學習較穩
+    iou_thr = 0.2
+    pos_mask   = (best_iou > iou_thr) & valid_gt_mask  # (B, N)
+    pos_mask_f = tf.cast(pos_mask, tf.float32)         # (B, N)
 
-        box_t_list.append(box_t_b)
-        pos_mask_list.append(pos_mask_b)
-        if cls_t_list is not None: cls_t_list.append(cls_t_b)
-        if kxy_t_list is not None: kxy_t_list.append(kxy_t_b)
-        if v_t_list is not None:   v_t_list.append(v_t_b)
+    num_pos      = tf.reduce_sum(pos_mask_f)
+    num_pos_safe = tf.maximum(num_pos, 1.0)
 
-    # ------------------------------------------------------
-    # 4. 計算 Loss
-    # ------------------------------------------------------
-    box_t = tf.stack(box_t_list, axis=0)
-    pos_mask_f = tf.cast(tf.stack(pos_mask_list, axis=0), tf.float32)
-    cls_t = tf.stack(cls_t_list, axis=0) if cls_t_list else None
-    kxy_t = tf.stack(kxy_t_list, axis=0) if kxy_t_list else None
-    v_t   = tf.stack(v_t_list, axis=0)   if v_t_list else None
+    # 3. 根據 best_gt_idx 把對應的 GT 拉出來
+    # -------------------------------------------------------------------------
+    batch_size   = tf.shape(gt_boxes)[0]
+    num_preds    = tf.shape(pred_box)[1]
 
-    num_pos = tf.maximum(tf.reduce_sum(pos_mask_f), 1.0)
+    batch_indices = tf.reshape(tf.range(batch_size), (batch_size, 1))
+    batch_indices = tf.tile(batch_indices, [1, num_preds])    # (B, N)
 
-    # 4.1 Box Loss (使用 Huber 直接回歸)
-    # pred_xywh 是 Linear，box_t 是 0~1
-    box_diff = tf.reduce_sum(huber_no_reduce(box_t, pred_xywh), axis=-1)
-    box_loss = lambda_box * tf.reduce_sum(box_diff * pos_mask_f) / num_pos
+    gather_idx = tf.stack([batch_indices, best_gt_idx], axis=-1)  # (B, N, 2)
 
-    # 4.2 Class Loss (改用 Huber 或 MSE，避免 Logits 問題)
-    # 因為沒有 Sigmoid，不能用 CrossEntropyWithLogits
-    cls_loss = 0.0
-    if cls_pred is not None:
-        cls_diff = huber_no_reduce(cls_t, cls_pred)
-        cls_loss = lambda_cls * tf.reduce_sum(tf.reduce_mean(cls_diff, axis=-1) * pos_mask_f) / num_pos
+    target_box = tf.gather_nd(gt_boxes,   gather_idx)  # (B, N, 4)
+    target_cls = tf.gather_nd(gt_classes, gather_idx)  # (B, N, 1) or (B, N)
+    target_kpt = tf.gather_nd(gt_kpts,    gather_idx)  # (B, N, K, V)
 
-    # 4.3 Keypoint Loss (直接回歸)
-    kxy_loss = 0.0
-    if kxy_pred is not None and v_pred is not None:
-        kxy_diff = huber_no_reduce(kxy_t, kxy_pred)
-        
-        vis_mask = v_t[..., None]
-        anchor_mask = pos_mask_f[..., None, None]
-        valid_mask = vis_mask * anchor_mask
-        valid_mask = tf.broadcast_to(valid_mask, tf.shape(kxy_diff))
-        
-        num_valid_kpt = tf.maximum(tf.reduce_sum(valid_mask), 1.0)
-        kxy_loss = lambda_kxy * tf.reduce_sum(kxy_diff * valid_mask) / num_valid_kpt
+    target_kpt_flat = tf.reshape(target_kpt,
+                                 (batch_size, num_preds, num_kpt * kpt_vals))
 
-    # 4.4 Visibility Loss
-    v_loss = 0.0
-    if v_pred is not None and v_t is not None:
-        v_diff = huber_no_reduce(v_t, v_pred)
-        anchor_mask_v = tf.broadcast_to(pos_mask_f[..., None], tf.shape(v_diff))
-        v_loss = lambda_v * tf.reduce_sum(v_diff * anchor_mask_v) / num_pos
+    # 4. Box Loss（直接用 pred_box 和 target_box 比）
+    # -------------------------------------------------------------------------
+    box_diff = huber_no_reduce(target_box, pred_box)         # (B, N, 4)
+    loss_box = tf.reduce_sum(tf.reduce_mean(box_diff, axis=-1) * pos_mask_f)
+    loss_box = lambda_box * (loss_box / num_pos_safe)
 
-    total_loss = box_loss + cls_loss + kxy_loss + v_loss
+    # 5. Class Loss
+    # -------------------------------------------------------------------------
+    if num_cls > 0:
+        if len(target_cls.shape) == 3:
+            target_cls = tf.squeeze(target_cls, -1)
+        target_cls = tf.cast(target_cls, tf.int32)
 
-    logs = {
-        "loss_box": box_loss,
-        "loss_cls": cls_loss,
-        "loss_kxy": kxy_loss,
-        "loss_v": v_loss,
-        "num_pos": num_pos
-    }
-    return total_loss, logs
+        # one-hot → (B, N, num_cls)
+        t_cls_onehot = tf.one_hot(target_cls, depth=num_cls)
+
+        # 背景處理：非正樣本 → target 全 0
+        pos_mask_exp = tf.expand_dims(pos_mask_f, -1)   # (B, N, 1)
+        t_cls_onehot = t_cls_onehot * pos_mask_exp
+
+        # Huber 差異
+        cls_diff = huber_no_reduce(t_cls_onehot, pred_cls_prob)  # (B, N, C)
+
+        # 正樣本權重 1.0，負樣本 0.1，避免背景淹沒
+        neg_weight = 0.1
+        weights = pos_mask_exp * 1.0 + (1.0 - pos_mask_exp) * neg_weight  # (B,N,1)
+
+        loss_cls = tf.reduce_sum(
+            tf.reduce_mean(cls_diff, axis=-1) * tf.squeeze(weights, -1)
+        )
+        loss_cls = lambda_cls * (loss_cls / num_pos_safe)
+    else:
+        loss_cls = tf.constant(0.0, dtype=tf.float32)
+
+    # 6. Keypoint Loss（同樣直接用 pred_kpt_flat）
+    # -------------------------------------------------------------------------
+    if num_kpt > 0 and kpt_vals > 0:
+        kpt_diff = huber_no_reduce(target_kpt_flat, pred_kpt_flat)  # (B, N, K*V)
+        loss_kpt = tf.reduce_sum(tf.reduce_mean(kpt_diff, axis=-1) * pos_mask_f)
+        loss_kpt = lambda_kpt * (loss_kpt / num_pos_safe)
+    else:
+        loss_kpt = tf.constant(0.0, dtype=tf.float32)
+
+    # 7. 總 loss & 回傳（保持原本介面）
+    # -------------------------------------------------------------------------
+    total_loss = loss_box + loss_cls + loss_kpt
+    return total_loss, loss_box, loss_cls, loss_kpt

@@ -584,17 +584,17 @@ def main():
             print("\n TFLite outputs:", interp.get_output_details())
                 
             # === One-shot diagnostics ===
-            print("\n--- Running one-shot diagnostics ---")
-            run_diagnostics_once(
-                export_mod=export_mod,
-                teacher=teacher,
-                tflite_path=tflite_path,
-                sample_one=sample_one,     # 與部署端同一張預處理影像
-                C=C,
-                NUM_CLS=config.NUM_CLS,
-                NUM_KPT=config.NUM_KPT,
-                KPT_VALS=config.KPT_VALS,
-            )
+            # print("\n--- Running one-shot diagnostics ---")
+            # run_diagnostics_once(
+            #     export_mod=export_mod,
+            #     teacher=teacher,
+            #     tflite_path=tflite_path,
+            #     sample_one=sample_one,     # 與部署端同一張預處理影像
+            #     C=C,
+            #     NUM_CLS=config.NUM_CLS,
+            #     NUM_KPT=config.NUM_KPT,
+            #     KPT_VALS=config.KPT_VALS,
+            # )
             
     # 10) 完成
     end_time = time.time()
