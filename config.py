@@ -8,7 +8,7 @@ Training Settings
 
 IMGSZ = 640
 BATCH = 32
-EPOCHS = 200              # 可先跑 5~10 看收斂
+EPOCHS = 20              # 可先跑 5~10 看收斂
 
 base_lr = 0.01
 end_lr = 0.01
@@ -35,13 +35,13 @@ Location (Input/Output)
 REP_DIR_train = [
     # "../dataset/lanepose/20220830/images/*.jpg",
     # "../dataset/lanepose/20240321_night/images/*.jpg",
-    # "../dataset/lanepose/acc_datasets/images/*.jpg",
+    "../dataset/lanepose/acc_datasets/images/*.jpg",
     # "../dataset/lanepose/s3_20230803/images/*.jpg",
     # "../dataset/lanepose/Traffic_dataset_20240720_345_k/images/*.jpg",
     # "../dataset/lanepose/yolov8data2_20250804/images/*.jpg"
     # "../dataset/lanepose/mix_QAT/images/*.jpg"
 
-    "../dataset/lanepose/test1/images/*.jpg"    
+    # "../dataset/lanepose/test1/images/*.jpg"    
     # "../dataset/lanepose/20220830/images/*.jpg"
     # "../dataset/lanepose/20220830/labels/*.txt"
 ]

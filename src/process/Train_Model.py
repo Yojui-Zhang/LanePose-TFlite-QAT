@@ -687,9 +687,10 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
                     num_cls=NUM_CLS,
                     num_kpt=NUM_KPT,
                     kpt_vals=KPT_VALS,
+                    anchors=anchors_dep,              # ★ 新增：使用同一組 anchors_all
                     out_dir=output_paths['plots'], 
                     max_images=1,
-                    score_thr=0.3          
+                    score_thr=0.3
                 )
             # ---------------------------------
 
@@ -837,7 +838,7 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
                         batch_imgs,
                         labels_list,
                         step=global_step,        # 用這個當檔名編號
-                        debug_save_every=20     # 例如每 100 step 存一次 GT + 圖
+                        debug_save_every=100     # 例如每 100 step 存一次 GT + 圖
                     )
                     global_step += 1
                     epoch_loss_agg.update_state(loss)
