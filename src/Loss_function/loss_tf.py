@@ -342,6 +342,7 @@ def pose_loss_from_labels(
         t_cls_onehot = t_cls_onehot * pos_mask_exp
 
         # --------------------------
+        '''
         # [修正後] 使用 TF 內建函數，更穩定且支援自動權重
         bce = tf.keras.losses.BinaryCrossentropy(from_logits=False, reduction=tf.keras.losses.Reduction.NONE)
         cls_loss_per_class = bce(t_cls_onehot, pred_cls_prob) # (B, N) or (B, N, 1)
@@ -361,6 +362,7 @@ def pose_loss_from_labels(
 
         '''
         # 將 pred 當成機率（如果你之後改成 logits，就在這裡先做 sigmoid）
+        epsilon = 1e-7
         p = tf.clip_by_value(pred_cls_prob, 1e-6, 1.0 - 1e-6)
 
         # Binary Cross Entropy: -(y*log p + (1-y)*log(1-p))
@@ -368,6 +370,15 @@ def pose_loss_from_labels(
             t_cls_onehot * tf.math.log(p) +
             (1.0 - t_cls_onehot) * tf.math.log(1.0 - p)
         )  # (B, N, num_cls)
+
+        # 3. 應用類別權重 (Class Weights)
+        # 現在 cls_loss_per_class 是 (B, N, num_cls)，可以跟 cw (1, 1, num_cls) 相乘了
+        if class_weights is not None:
+            cw = tf.convert_to_tensor(class_weights, dtype=pred_cls_prob.dtype)
+            cw = tf.reshape(cw, [1, 1, num_cls])  # (1, 1, C)
+            
+            # 這裡看你的需求，通常是直接乘上去
+            cls_loss_per_class = cls_loss_per_class * cw
 
         # across classes
         cls_loss_per_anchor = tf.reduce_sum(cls_loss_per_class, axis=-1)  # (B, N)
@@ -378,7 +389,7 @@ def pose_loss_from_labels(
 
         loss_cls = tf.reduce_sum(cls_loss_per_anchor * weights)
         loss_cls = lambda_cls * (loss_cls / num_pos_safe)
-        '''
+        
         # --------------------------
     else:
         loss_cls = tf.constant(0.0, dtype=tf.float32)
