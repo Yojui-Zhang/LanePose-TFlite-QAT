@@ -842,7 +842,7 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths, class_weights=N
                     )
                     global_step += 1
                     epoch_loss_agg.update_state(loss)
-                    progress_bar.set_postfix(loss=f"{loss:.4f}")
+                    progress_bar.set_postfix(loss=f"{loss:.4f}", box=f"{loss_log['box_loss']:.4f}", cls=f"{loss_log['cls_loss']:.4f}", kpt=f"{loss_log['kpt_loss']:.4f}")
 
 
                 else:

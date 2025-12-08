@@ -64,9 +64,9 @@ def pose_loss_from_labels(
     num_cls=1,
     num_kpt=17,
     kpt_vals=3,
-    lambda_box=2.0,
-    lambda_cls=5.0,
-    lambda_kpt=2.0,
+    lambda_box=7.0,
+    lambda_cls=1.0,
+    lambda_kpt=1.0,
     class_weights=None,
 ):
     """
@@ -120,7 +120,7 @@ def pose_loss_from_labels(
     # pred_box      = tf.clip_by_value(pred_box, 0.0, 1.0)
     # pred_cls_prob = tf.clip_by_value(pred_cls_prob, 0.0, 1.0)
     # pred_kpt_flat = tf.clip_by_value(pred_kpt_flat, 0.0, 1.0)
-
+    '''
     # ----------------------
     # 2) IoU-based 配對：用 anchors 做 assignment
     # ----------------------
@@ -155,6 +155,88 @@ def pose_loss_from_labels(
     num_pos = tf.reduce_sum(pos_mask_f)
     num_neg = tf.reduce_sum(1.0 - pos_mask_f)
 
+    num_pos_safe = tf.maximum(num_pos, 1.0)
+    num_neg_safe = tf.maximum(num_neg, 1.0)
+    '''
+    # ----------------------
+    # 2) Anchor-free center-based assignment
+    #     - 只用 anchors 的 (cx, cy) 當 grid point
+    #     - 不用 IoU threshold 決定正樣本
+    # ----------------------
+    if anchors is None:
+        raise ValueError("Anchor-free assignment 需要 anchors 提供 grid center (cx,cy).")
+
+    # anchors: (N, 4) -> 取前兩維 [cx, cy]
+    anchors_xy = tf.cast(anchors[:, :2], tf.float32)          # (N, 2)
+    anchors_xy = tf.expand_dims(anchors_xy, axis=0)           # (1, N, 2)
+    B_true     = tf.shape(gt_boxes)[0]
+    grid_xy    = tf.tile(anchors_xy, [B_true, 1, 1])          # (B, N, 2)
+
+    # GT box: (B, M, 4) [cx, cy, w, h] -> (x1,y1,x2,y2)
+    gx, gy, gw, gh = tf.unstack(gt_boxes, axis=-1)            # (B, M) each
+    x1 = gx - gw / 2.0
+    y1 = gy - gh / 2.0
+    x2 = gx + gw / 2.0
+    y2 = gy + gh / 2.0
+
+    # expand dims for broadcast: (B, 1, M)
+    x1 = tf.expand_dims(x1, axis=1)
+    y1 = tf.expand_dims(y1, axis=1)
+    x2 = tf.expand_dims(x2, axis=1)
+    y2 = tf.expand_dims(y2, axis=1)
+
+    # grid_xy: (B, N, 2)
+    cx = grid_xy[..., 0:1]   # (B, N, 1)
+    cy = grid_xy[..., 1:2]   # (B, N, 1)
+
+    # 每個 (B,N,1) 跟 (B,1,M) 比較 → (B,N,M)
+    inside_x = (cx >= x1) & (cx <= x2)
+    inside_y = (cy >= y1) & (cy <= y2)
+    inside   = inside_x & inside_y            # (B, N, M)
+
+    # 過濾 padding GT（num_objects 以外的 GT 不參與）
+    valid_mask_exp = tf.expand_dims(valid_gt_mask, axis=1)   # (B, 1, M)
+    inside = inside & tf.cast(valid_mask_exp, tf.bool)       # (B, N, M)
+
+    # 若要只用「中心附近」的點，可加 center_radius：例如 2.5
+    # center_radius = 2.5
+    # cx_gt = tf.expand_dims(gx, axis=1)  # (B,1,M)
+    # cy_gt = tf.expand_dims(gy, axis=1)
+    # rx = (gw / 2.0) / center_radius     # (B,M)
+    # ry = (gh / 2.0) / center_radius
+    # rx = tf.expand_dims(rx, axis=1)     # (B,1,M)
+    # ry = tf.expand_dims(ry, axis=1)
+    # center_x1 = cx_gt - rx
+    # center_x2 = cx_gt + rx
+    # center_y1 = cy_gt - ry
+    # center_y2 = cy_gt + ry
+    # in_cx = (cx >= center_x1) & (cx <= center_x2)
+    # in_cy = (cy >= center_y1) & (cy <= center_y2)
+    # center_region = in_cx & in_cy
+    # inside = inside & center_region   # 再進一步收窄候選區
+
+    # 若某個 anchor 對多個 GT 都是 inside，選距離最近的 GT
+    # 計算 grid point 到各 GT center 的 L1 距離
+    gx_exp = tf.expand_dims(gx, axis=1)   # (B,1,M)
+    gy_exp = tf.expand_dims(gy, axis=1)   # (B,1,M)
+
+    dist_x = tf.abs(cx - gx_exp)         # (B,N,M)
+    dist_y = tf.abs(cy - gy_exp)         # (B,N,M)
+    dist   = dist_x + dist_y
+
+    # 對於不在 inside 的位置給一個很大的距離，避免被選為 best GT
+    big = tf.constant(1e6, dtype=dist.dtype)
+    dist = tf.where(inside, dist, big)
+
+    # 針對每個 anchor (B,N)，選擇距離最小的 GT
+    best_gt_idx = tf.argmin(dist, axis=-1, output_type=tf.int32)   # (B,N)
+
+    # pos_mask: 只要有任何 GT 把它當作 inside，就算正樣本
+    pos_mask = tf.reduce_any(inside, axis=-1)    # (B,N) bool
+    pos_mask_f = tf.cast(pos_mask, tf.float32)
+
+    num_pos = tf.reduce_sum(pos_mask_f)
+    num_neg = tf.reduce_sum(1.0 - pos_mask_f)
     num_pos_safe = tf.maximum(num_pos, 1.0)
     num_neg_safe = tf.maximum(num_neg, 1.0)
 
