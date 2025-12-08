@@ -2,8 +2,11 @@
 import config
 
 import os
+import cv2
 import pandas as pd
 import numpy as np
+
+from src.process.pred_model import ensure_BNC_static
 
 if config.PLOT_Switch == True:
     import matplotlib.pyplot as plt
@@ -168,232 +171,148 @@ def save_gt_and_plot(step, batch_imgs, batch_dict,
         plt.savefig(img_out_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         
-def save_pred_and_plot(step, batch_imgs, pred_raw, 
-                       num_cls, num_kpt, kpt_vals,
-                       anchors,
-                       out_dir="debug_pred", max_images=1, score_thr=0.4):
-    """
-    Route A 版本：
-    - pred_raw: 模型輸出的 Tensor (B, N, C)，仍是 logits
-    - anchors:  anchor tensor/ndarray, 形狀 (N, 4)，為 0~1 的 [cx, cy, w, h]
 
-    流程：
-    1) 將 box / kpt / cls logits 做 sigmoid → 0~1 的相對數值
-    2) 依照 anchors (與 loss_tf.decode_box / decode_kpt 相同的公式) 解碼為
-       0~1 的絕對座標
-    3) 依 score_thr 篩選 → 畫在影像上並輸出 CSV
+def save_pred_and_plot(
+    step,
+    batch_imgs,
+    pred_raw,
+    num_cls,
+    num_kpt,
+    kpt_vals,
+    anchors,
+    out_dir,
+    max_images=1,
+    score_thr=0.3,
+):
+    """
+    將模型預測結果 decode 成 bbox + kpt 並畫在圖片上，同時輸出 CSV。
+
+    ★ 重點：這裡的 decode 完全模仿 pred_save_model.py：
+        pred[i] = [cx, cy, w, h, cls0, cls1, ..., kpt0_x, kpt0_y, kpt0_v, ...]
+        全部都是 0~1 的 normalized 值
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    # ---------- 轉成 numpy ----------
-    if hasattr(batch_imgs, "numpy"):
-        imgs_np = batch_imgs.numpy()
-    else:
-        imgs_np = np.asarray(batch_imgs, dtype=np.float32)
-    imgs_np = np.clip(imgs_np, 0.0, 1.0)     # 確保在 [0,1]
+    expected_C = 4 + num_cls + num_kpt * kpt_vals
 
-    if hasattr(pred_raw, "numpy"):
-        preds_np = pred_raw.numpy()
-    else:
-        preds_np = np.asarray(pred_raw, dtype=np.float32)
+    # ---- 1) 轉成 (B, N, C) ----
+    # pred_raw 可能是 list / dict / tensor，統一轉成 BNC
+    preds_BNC = ensure_BNC_static(
+        pred_raw,
+        expected_C=expected_C,   # 只傳 expected_C 這一個參數
+    )  # (B, N, C)
 
-    B, H, W, _ = imgs_np.shape
-    B2, N, C = preds_np.shape
-    assert B2 == B, f"B dimension mismatch: imgs {B}, preds {B2}"
+    preds_BNC = preds_BNC.numpy() if hasattr(preds_BNC, "numpy") else np.array(preds_BNC)
 
-    # ---------- anchors 處理 ----------
-    if anchors is None:
-        raise ValueError("Route A 版本的 save_pred_and_plot 需要 anchors 參數")
+    B, N, C = preds_BNC.shape
+    
+    if C != expected_C:
+        # 保險：只取前 expected_C 維度
+        preds_BNC = preds_BNC[:, :, :expected_C]
+        C = expected_C
 
-    if hasattr(anchors, "numpy"):
-        anchors_np = anchors.numpy()
-    else:
-        anchors_np = np.asarray(anchors, dtype=np.float32)
+    # ---- 2) 每張圖處理 ----
+    num_imgs = min(B, max_images)
 
-    # 確認 anchor 個數與 N 一致，若不一致則取 min(N) 以避免 crash
-    if anchors_np.shape[0] != N:
-        minN = min(N, anchors_np.shape[0])
-        preds_np   = preds_np[:, :minN, :]
-        anchors_np = anchors_np[:minN, :]
-        N = minN
+    for b in range(num_imgs):
+        img = batch_imgs[b]  # tensor 或 numpy
+        if hasattr(img, "numpy"):
+            img = img.numpy()
+        img = np.asarray(img)
 
-    anchors_np = anchors_np.astype(np.float32)          # (N, 4)
-
-    def sigmoid(x):
-        return 1.0 / (1.0 + np.exp(-x))
-
-    # ---------- 先把所有 batch 的 box / cls / kpt decode 完 ----------
-    # 1) box logits → sigmoid → 0~1 相對值
-    box_logits = preds_np[..., :4]                      # (B, N, 4)
-    box_rel    = sigmoid(box_logits)                    # 0~1，相對 anchor
-
-    # 2) class logits
-    if num_cls > 0:
-        cls_logits    = preds_np[..., 4 : 4 + num_cls]  # (B, N, num_cls)
-        cls_probs_all = sigmoid(cls_logits)             # 0~1
-        kpt_start_idx = 4 + num_cls
-    else:
-        cls_probs_all = None
-        kpt_start_idx = 4
-
-    # 3) keypoint logits
-    if num_kpt > 0:
-        kpt_logits = preds_np[..., kpt_start_idx : kpt_start_idx + num_kpt * kpt_vals]
-        kpt_rel    = sigmoid(kpt_logits)                # (B, N, K*V)
-    else:
-        kpt_logits = None
-        kpt_rel    = None
-
-    # ---- anchors: (N,4) → (1,N,4) ----
-    anchors_b1 = anchors_np[None, ...]                  # (1, N, 4)
-    a_xy = anchors_b1[..., 0:2]                         # (1, N, 2)
-    a_wh = anchors_b1[..., 2:4]                         # (1, N, 2)
-
-    # ---------- box decode：對齊 loss_tf.decode_box ----------
-    # decoded_xy = a_xy + (p_xy - 0.5) * a_wh
-    # decoded_wh = a_wh * (2 * p_wh)^2
-    p_xy = box_rel[..., 0:2]                            # (B, N, 2)
-    p_wh = box_rel[..., 2:4]                            # (B, N, 2)
-    decoded_xy = a_xy + (p_xy - 0.5) * a_wh             # (B, N, 2)
-    decoded_wh = a_wh * np.square(p_wh * 2.0)           # (B, N, 2)
-    boxes_decoded = np.concatenate([decoded_xy, decoded_wh], axis=-1)  # (B, N, 4)
-
-    # ---------- kpt decode：對齊 loss_tf.decode_kpt ----------
-    if num_kpt > 0 and kpt_rel is not None:
-        Bn, Nn, _ = kpt_rel.shape
-        assert Bn == B and Nn == N
-        pred_kpt = kpt_rel.reshape(B, N, num_kpt, kpt_vals)  # (B, N, K, V)
-        kp_xy    = pred_kpt[..., 0:2]                        # (B, N, K, 2)
-
-        # a_xy_exp / a_wh_exp: (1, N, 1, 2)，透過 broadcast 擴到 (B, N, K, 2)
-        a_xy_exp = a_xy[..., None, :]                        # (1, N, 1, 2)
-        a_wh_exp = a_wh[..., None, :]                        # (1, N, 1, 2)
-
-        # decoded_kp_xy = a_xy + (kp_xy - 0.5) * a_wh * 4.0
-        decoded_kp_xy = a_xy_exp + (kp_xy - 0.5) * a_wh_exp * 4.0
-
-        if kpt_vals > 2:
-            kp_rest = pred_kpt[..., 2:]                      # (B, N, K, V-2)
-            decoded_kpt = np.concatenate([decoded_kp_xy, kp_rest], axis=-1)
+        # 假設 img 為 (H, W, 3)，0~1 → 0~255
+        if img.max() <= 1.0:
+            img = (img * 255.0).astype(np.uint8)
         else:
-            decoded_kpt = decoded_kp_xy
+            img = img.astype(np.uint8)
 
-        kpts_decoded_flat = decoded_kpt.reshape(B, N, num_kpt * kpt_vals)
-    else:
-        kpts_decoded_flat = np.zeros((B, N, num_kpt * kpt_vals), dtype=np.float32)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        H, W = img.shape[:2]
 
-    # ---------- 準備 CSV 欄位 ----------
-    csv_data_list = []
-    columns = ['batch_idx', 'anchor_idx', 'score', 'cls_id', 'x', 'y', 'w', 'h']
-    name_per_val = ['x', 'y', 'v'][:kpt_vals]
-    for i in range(num_kpt):
-        for j in range(kpt_vals):
-            suffix = name_per_val[j] if j < len(name_per_val) else str(j)
-            columns.append(f'kpt{i}_{suffix}')
+        pred = preds_BNC[b]  # (N, C)
 
-    # ---------- 逐張圖片處理 & 畫圖 ----------
-    for b in range(min(B, max_images)):
-        img = imgs_np[b]
-        boxes_b      = boxes_decoded[b]                  # (N, 4)
-        kpts_flat_b  = kpts_decoded_flat[b]              # (N, K*V)
-        kpts_b       = kpts_flat_b.reshape(N, num_kpt, kpt_vals) if num_kpt > 0 else None
+        # ---- split columns ----
+        boxes   = pred[:, 0:4]                      # (N, 4) cx,cy,w,h (0~1)
+        cls_all = pred[:, 4:4 + num_cls]            # (N, num_cls)
+        kpt_all = pred[:, 4 + num_cls:]             # (N, num_kpt * kpt_vals)
 
-        # class score / id
-        if num_cls > 0:
-            cls_probs_b = cls_probs_all[b]               # (N, num_cls)
-            cls_ids     = np.argmax(cls_probs_b, axis=1)
-            scores      = np.max(cls_probs_b, axis=1)
-        else:
-            cls_ids = np.zeros(N, dtype=int)
-            scores  = np.ones(N, dtype=float)
+        # 選出 conf & cls_id
+        cls_ids  = np.argmax(cls_all, axis=-1)      # (N,)
+        cls_conf = np.max(cls_all, axis=-1)         # (N,)
 
-        # 依 score_thr 篩選
-        mask = scores > score_thr
-        if not np.any(mask):
-            continue
+        keep = cls_conf > score_thr
+        boxes   = boxes[keep]
+        cls_ids = cls_ids[keep]
+        cls_conf_keep = cls_conf[keep]
+        kpt_all = kpt_all[keep]
 
-        valid_boxes   = boxes_b[mask]
-        valid_scores  = scores[mask]
-        valid_cls     = cls_ids[mask]
-        valid_kpts    = kpts_b[mask] if kpts_b is not None else None
-        valid_indices = np.where(mask)[0]
+        # 用來存 CSV
+        csv_rows = []
 
-        MAX_BOXES_DRAW = 50
-        num_valid = len(valid_scores)
-        if num_valid > MAX_BOXES_DRAW:
-            top_idx      = np.argsort(-valid_scores)[:MAX_BOXES_DRAW]
-            valid_boxes  = valid_boxes[top_idx]
-            valid_scores = valid_scores[top_idx]
-            valid_cls    = valid_cls[top_idx]
-            if valid_kpts is not None:
-                valid_kpts = valid_kpts[top_idx]
-            valid_indices = valid_indices[top_idx]
-            num_valid     = MAX_BOXES_DRAW
+        for i in range(boxes.shape[0]):
+            cx, cy, bw, bh = boxes[i]
 
-        # 3) 收集 CSV
-        if num_valid > 0:
-            batch_col = np.full((num_valid, 1), b)
-            anch_col  = valid_indices[:, None]
-            score_col = valid_scores[:, None]
-            cls_col   = valid_cls[:, None]
-            box_col   = valid_boxes
-            if valid_kpts is not None:
-                kpt_col = valid_kpts.reshape(num_valid, -1)
-            else:
-                kpt_col = np.zeros((num_valid, num_kpt * kpt_vals), dtype=np.float32)
+            # 轉成左上右下像素座標（跟 pred_save_model 邏輯一致）
+            x1 = int((cx - bw / 2.0) * W)
+            y1 = int((cy - bh / 2.0) * H)
+            x2 = int((cx + bw / 2.0) * W)
+            y2 = int((cy + bh / 2.0) * H)
 
-            row_data = np.concatenate(
-                [batch_col, anch_col, score_col, cls_col, box_col, kpt_col],
-                axis=1
-            )
-            csv_data_list.append(row_data)
+            # clamp
+            x1 = max(0, min(W - 1, x1))
+            y1 = max(0, min(H - 1, y1))
+            x2 = max(0, min(W - 1, x2))
+            y2 = max(0, min(H - 1, y2))
 
-        # 4) 繪圖
-        if config.PLOT_Switch:
-            fig, ax = plt.subplots()
-            ax.imshow(img)
+            # 畫 bbox
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            label = f"id:{int(cls_ids[i])} {cls_conf_keep[i]:.2f}"
+            cv2.putText(img, label, (x1, max(0, y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-            for i in range(num_valid):
-                cx, cy, bw, bh = valid_boxes[i]
-                # 轉回 pixel
-                cx *= W; cy *= H; bw *= W; bh *= H
-                x1 = cx - bw / 2
-                y1 = cy - bh / 2
+            # ---- keypoints ----
+            if num_kpt > 0 and kpt_vals > 0 and kpt_all.size > 0:
+                kpt_flat = kpt_all[i]  # (num_kpt * kpt_vals,)
+                kpt = kpt_flat.reshape(num_kpt, kpt_vals)
 
-                rect = Rectangle(
-                    (x1, y1), bw, bh,
-                    linewidth=1, edgecolor='red', facecolor='none'
-                )
-                ax.add_patch(rect)
+                for ki in range(num_kpt):
+                    kx = kpt[ki, 0]
+                    ky = kpt[ki, 1]
+                    kv = kpt[ki, 2] if kpt_vals > 2 else 1.0
 
-                lbl = f"{valid_cls[i]}:{valid_scores[i]:.2f}"
-                ax.text(
-                    x1, y1 - 5, lbl, fontsize=8, color='yellow',
-                    bbox=dict(facecolor='black', alpha=0.7, pad=1)
-                )
+                    # 跟 pred_save_model 一樣，用 kv > 0.5 當作可見
+                    if kv > 0.5:
+                        px = int(kx * W)
+                        py = int(ky * H)
+                        cv2.circle(img, (px, py), 3, (0, 0, 255), -1)
 
-                if valid_kpts is not None:
-                    kp = valid_kpts[i]
-                    for k in range(num_kpt):
-                        kx = kp[k, 0] * W
-                        ky = kp[k, 1] * H
-                        if kpt_vals > 2:
-                            vis = kp[k, 2]
-                            if vis < 0.5:
-                                continue
-                        ax.scatter(kx, ky, s=10, c='cyan')
+            # 組 CSV 一列：
+            # [cx, cy, w, h, cls_id, conf, kpt0_x, kpt0_y, kpt0_v, ...]
+            row = [cx, cy, bw, bh, int(cls_ids[i]), float(cls_conf_keep[i])]
+            if num_kpt > 0 and kpt_vals > 0 and kpt_all.size > 0:
+                row.extend(kpt_flat.tolist())
+            csv_rows.append(row)
 
-            ax.set_title(f"Pred step {step}, img {b} (thr={score_thr})")
-            ax.axis("off")
+        # ---- 存圖 ----
+        img_name = os.path.join(out_dir, f"pred_step{step:06d}_img{b}.png")
+        cv2.imwrite(img_name, img)
 
-            img_out_path = os.path.join(out_dir, f"pred_step{step:06d}_img{b}.png")
-            plt.savefig(img_out_path, dpi=150, bbox_inches="tight")
-            plt.close(fig)
+        # ---- 存 CSV ----
+        import pandas as pd
+        columns = ["cx", "cy", "w", "h", "cls_id", "conf"]
 
-    # 5) 儲存 CSV
-    if csv_data_list:
-        all_data = np.concatenate(csv_data_list, axis=0)
-        df = pd.DataFrame(all_data, columns=columns)
+        if num_kpt > 0 and kpt_vals > 0:
+            # kpt0_x, kpt0_y, kpt0_v, kpt1_x, ...
+            name_per_val = ['x', 'y', 'v'][:kpt_vals]
+            for ki in range(num_kpt):
+                for vj in range(kpt_vals):
+                    columns.append(f"kpt{ki}_{name_per_val[vj] if vj < len(name_per_val) else vj}")
+
         csv_path = os.path.join(out_dir, f"pred_step{step:06d}.csv")
-        df.to_csv(csv_path, index=False, float_format="%.4f")
-        print(f"📈 Pred plots & CSV saved to {out_dir}")
+        if len(csv_rows) == 0:
+            # 沒有任何 detection，仍然建一個空檔方便 debug
+            df = pd.DataFrame(columns=columns)
+        else:
+            df = pd.DataFrame(csv_rows, columns=columns)
+
+        df.to_csv(csv_path, index=False, float_format="%.6f")

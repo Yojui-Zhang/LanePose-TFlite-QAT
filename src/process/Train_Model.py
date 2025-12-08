@@ -411,7 +411,7 @@ def build_student_qat():
 
 
 
-def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
+def run_qat(student, teacher, ds, steps_per_epoch, output_paths, class_weights=None):
     """
     ==============================================================================
     執行 QAT 訓練，並把『學生輸出 N 維（P3/P4/P5）』在 train_step 中重排到與 Teacher 一致。
@@ -697,12 +697,12 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths):
             # 計算 Loss
             loss_kd, *logs_kd_tuple = pose_loss_from_labels(
                 batch_dict, s_BNC, anchors_kd, 
-                num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS
+                num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS, class_weights=class_weights
             )
             
             loss_dep, *logs_dep_tuple = pose_loss_from_labels(
                 batch_dict, d_BNC, anchors_dep,
-                num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS
+                num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS, class_weights=class_weights
             )
 
             total_loss = loss_kd + loss_dep

@@ -40,7 +40,7 @@ Local imports from your project
 '''
 import config
 
-from src.process.data import (build_dataset)
+from src.process.data import (build_dataset, compute_class_weights)
 from src.process.load_model import try_load_keras_model
 from src.process.interrupt_signal import install_interrupt_handlers
 from src.process.device import (enable_gpu_mem_growth, setup_mixed_precision)
@@ -468,6 +468,13 @@ def main():
     ds, n_files = build_dataset(img_glob=config.REP_DIR_train, batch=config.BATCH)
     steps_per_epoch = max(1, n_files // config.BATCH)
 
+    class_weights = compute_class_weights(
+        img_glob=config.REP_DIR_train,
+        num_classes=config.NUM_CLS,
+        num_kpt=config.NUM_KPT,
+        kpt_vals=config.KPT_VALS,
+    )
+
     try:
         if getattr(config, "EXPORT_ONLY", False):
             print("\n=== EXPORT_ONLY: skip training, use current/loaded weights ===")
@@ -476,7 +483,7 @@ def main():
             print(f"\n--- 🎉 Done (EXPORT_ONLY) in {((end_time - start_time) / 60):.2f} minutes. ---")
             return
         else:
-            loss_history = run_qat(student, teacher, ds, steps_per_epoch, output_paths)
+            loss_history = run_qat(student, teacher, ds, steps_per_epoch, output_paths, class_weights)
 
             if getattr(config, "PLOT_Switch", False):
                 plot_and_save_loss_curve(loss_history, output_paths['loss_plot'])
