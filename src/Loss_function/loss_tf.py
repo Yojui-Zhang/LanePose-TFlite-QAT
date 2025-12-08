@@ -6,6 +6,62 @@ import config
 # Helper Functions
 # ==============================================================================
 
+
+def bbox_ciou(pred_box, target_box, eps=1e-7):
+    """
+    pred_box, target_box: (B, N, 4)  [cx, cy, w, h]，都是 0~1
+    回傳: (B, N) 的 CIoU loss = 1 - CIoU
+    """
+    px, py, pw, ph = tf.unstack(pred_box, axis=-1)
+    gx, gy, gw, gh = tf.unstack(target_box, axis=-1)
+
+    # 轉成 (x1, y1, x2, y2)
+    px1 = px - pw / 2.0
+    py1 = py - ph / 2.0
+    px2 = px + pw / 2.0
+    py2 = py + ph / 2.0
+
+    gx1 = gx - gw / 2.0
+    gy1 = gy - gh / 2.0
+    gx2 = gx + gw / 2.0
+    gy2 = gy + gh / 2.0
+
+    # 交集
+    inter_x1 = tf.maximum(px1, gx1)
+    inter_y1 = tf.maximum(py1, gy1)
+    inter_x2 = tf.minimum(px2, gx2)
+    inter_y2 = tf.minimum(py2, gy2)
+
+    inter_w = tf.maximum(0.0, inter_x2 - inter_x1)
+    inter_h = tf.maximum(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_p = tf.maximum(pw * ph, 0.0)
+    area_g = tf.maximum(gw * gh, 0.0)
+    union = area_p + area_g - inter_area
+    iou = inter_area / (union + eps)
+
+    # 最小包圍框對角線長度
+    cw = tf.maximum(px2, gx2) - tf.minimum(px1, gx1)
+    ch = tf.maximum(py2, gy2) - tf.minimum(py1, gy1)
+    c2 = tf.square(cw) + tf.square(ch) + eps
+
+    # 中心距離
+    d2 = tf.square(px - gx) + tf.square(py - gy)
+
+    # aspect ratio 項
+    v = (4.0 / (np.pi ** 2)) * tf.square(
+        tf.atan(gw / (gh + eps)) - tf.atan(pw / (ph + eps))
+    )
+    with tf.name_scope("ciou_alpha"):
+            alpha = v / (1.0 - iou + v + eps)
+            alpha = tf.stop_gradient(alpha)  # <--- 加上這行！
+
+    ciou = iou - d2 / c2 - alpha * v
+    ciou = tf.clip_by_value(ciou, -1.0, 1.0)
+
+    return 1.0 - ciou   # 當成 loss
+
 def iou_batch(bboxes1, bboxes2):
     """
     計算 IoU (Intersection over Union)
@@ -262,8 +318,12 @@ def pose_loss_from_labels(
     # ----------------------
     # 4) Box Loss（Huber）
     # ----------------------
-    box_diff = huber_no_reduce(target_box, pred_box)      # (B, N, 4)
-    loss_box = tf.reduce_sum(tf.reduce_mean(box_diff, axis=-1) * pos_mask_f)
+
+    # box_diff = huber_no_reduce(target_box, pred_box)      # (B, N, 4)
+    # loss_box = tf.reduce_sum(tf.reduce_mean(box_diff, axis=-1) * pos_mask_f)
+    # loss_box = lambda_box * (loss_box / num_pos_safe)
+    ciou_loss = bbox_ciou(pred_box, target_box)    # (B, N)
+    loss_box = tf.reduce_sum(ciou_loss * pos_mask_f)
     loss_box = lambda_box * (loss_box / num_pos_safe)
 
     # ----------------------
@@ -277,29 +337,49 @@ def pose_loss_from_labels(
         # one-hot → (B, N, num_cls)
         t_cls_onehot = tf.one_hot(target_cls, depth=num_cls, dtype=pred_cls_prob.dtype)
 
-        # 只在正樣本上有 label（負樣本設成 0）
+        # 只在正樣本上有 label（負樣本當作全 0）
         pos_mask_exp = tf.expand_dims(pos_mask_f, -1)  # (B, N, 1)
         t_cls_onehot = t_cls_onehot * pos_mask_exp
 
-        # 這裡把 pred_cls_prob 當成「已經是機率 0~1」
-        cls_diff = huber_no_reduce(t_cls_onehot, pred_cls_prob)  # (B, N, num_cls)
+        # --------------------------
+        # [修正後] 使用 TF 內建函數，更穩定且支援自動權重
+        bce = tf.keras.losses.BinaryCrossentropy(from_logits=False, reduction=tf.keras.losses.Reduction.NONE)
+        cls_loss_per_class = bce(t_cls_onehot, pred_cls_prob) # (B, N) or (B, N, 1)
+        
+        # 確保維度正確 (B, N)
+        if len(cls_loss_per_class.shape) == 3:
+            cls_loss_per_anchor = tf.reduce_mean(cls_loss_per_class, axis=-1)
+        else:
+            cls_loss_per_anchor = cls_loss_per_class
 
-        # 平衡Dataset cls 數量
-        if class_weights is not None:
-            cw = tf.convert_to_tensor(class_weights, dtype=cls_diff.dtype)  # (C,)
-            # 保險起見再 normalize 一次平均值 ≈ 1
-            cw = cw / tf.reduce_mean(cw)
-            cw = tf.reshape(cw, (1, 1, -1))  # broadcast 到 (B, N, C)
-            cls_diff = cls_diff * cw
+        # 正樣本 1.0，負樣本 0.1 (YOLO 的平衡參數)
+        neg_weight = 0.5 # 建議稍微調高一點，0.1 有點太低，YOLOv8 預設常用 0.5
+        weights = pos_mask_f * 1.0 + (1.0 - pos_mask_f) * neg_weight
 
-        # 正樣本 1.0，負樣本 0.01
-        neg_weight = 0.1
-        weights = pos_mask_exp * 1.0 + (1.0 - pos_mask_exp) * neg_weight  # (B, N, 1)
-
-        loss_cls = tf.reduce_sum(
-            tf.reduce_mean(cls_diff, axis=-1) * tf.squeeze(weights, -1)
-        )
+        loss_cls = tf.reduce_sum(cls_loss_per_anchor * weights)
         loss_cls = lambda_cls * (loss_cls / num_pos_safe)
+
+        '''
+        # 將 pred 當成機率（如果你之後改成 logits，就在這裡先做 sigmoid）
+        p = tf.clip_by_value(pred_cls_prob, 1e-6, 1.0 - 1e-6)
+
+        # Binary Cross Entropy: -(y*log p + (1-y)*log(1-p))
+        cls_loss_per_class = -(
+            t_cls_onehot * tf.math.log(p) +
+            (1.0 - t_cls_onehot) * tf.math.log(1.0 - p)
+        )  # (B, N, num_cls)
+
+        # across classes
+        cls_loss_per_anchor = tf.reduce_sum(cls_loss_per_class, axis=-1)  # (B, N)
+
+        # 正樣本 1.0，負樣本 0.1
+        neg_weight = 0.1
+        weights = pos_mask_f * 1.0 + (1.0 - pos_mask_f) * neg_weight  # (B, N)
+
+        loss_cls = tf.reduce_sum(cls_loss_per_anchor * weights)
+        loss_cls = lambda_cls * (loss_cls / num_pos_safe)
+        '''
+        # --------------------------
     else:
         loss_cls = tf.constant(0.0, dtype=tf.float32)
 

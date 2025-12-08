@@ -216,6 +216,6 @@ if __name__ == "__main__":
 
     video = "./vecow-demo.mp4"
     # model_dir = "./model/carkeypoint-20251122-Rep-s2_saved_model" 
-    model_dir = "./model/20251206_181726/models/qat_saved_model_interrupted" 
+    model_dir = "./model/20251208_111850/models/qat_saved_model" 
     
     run_tf_inference_with_viz(video, model_dir, CONF_thres, IOU_thres)
