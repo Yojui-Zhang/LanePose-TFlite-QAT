@@ -184,7 +184,7 @@ def pose_loss_from_labels(
     num_kpt=17,
     kpt_vals=3,
     lambda_box=7.0,
-    lambda_cls=1.0,
+    lambda_cls=2.0,
     lambda_kpt=1.0,
     class_weights=None,
 ):
@@ -429,7 +429,7 @@ def pose_loss_from_labels(
         cls_loss_per_anchor = tf.reduce_sum(cls_loss_per_class, axis=-1)
 
         # 正樣本 1.0，負樣本 0.1 （你可以依需要調）
-        neg_weight = 0.1
+        neg_weight = 0.5
         weights = pos_mask_f * 1.0 + (1.0 - pos_mask_f) * neg_weight  # (B, N)
 
         loss_cls = tf.reduce_sum(cls_loss_per_anchor * weights)
