@@ -3,38 +3,35 @@ import tensorflow as tf
 import numpy as np
 
 # ---------------------------------------------------
-NUM_CLASSES = 7
-
+NUM_CLASSES = 7          # 跟你現在的一樣
 Image_Size_X = 640
 Image_Size_Y = 640
 
 CONF_thres = 0.4
-IOU_thres = 0.4
+IOU_thres  = 0.4
 
 # ---------------------------------------------------
-# 定義骨架連接關係
+# 定義骨架連接關係（沿用你原本的）
 SKELETON = [
     (16, 14), (14, 12), (17, 15), (15, 13), (12, 13), (6, 12), (7, 13),
     (6, 7), (6, 8), (7, 9), (8, 10), (9, 11), (2, 3), (1, 2), (1, 3),
     (2, 4), (3, 5), (4, 6), (5, 7)
 ]
-# 關鍵點顏色 (B, G, R)
-KP_COLOR = (0, 255, 0)
-# 連結線顏色
-LIMB_COLOR = (0, 255, 255)
-# 類別顏色 (多類別時用不同顏色區分框)
-CLASS_COLORS = [(0, 0, 255), (255, 0, 0), (0, 255, 255), (255, 0, 255)] 
+KP_COLOR   = (0, 255, 0)       # 關鍵點顏色 (BGR)
+LIMB_COLOR = (0, 255, 255)     # 骨架線顏色
+CLASS_COLORS = [(0, 0, 255), (255, 0, 0), (0, 255, 255), (255, 0, 255)]
 
-input_shape = (Image_Size_X, Image_Size_Y) 
-# ---------------------------------------------------
+input_shape = (Image_Size_X, Image_Size_Y)
 
-# ★★★ 新增：Sigmoid 函數 ★★★
-def sigmoid(x):
-    return 1 / (1 + np.exp(-x))
 
-def run_tf_inference_with_viz(video_path, model_path, conf_thres=0.1, iou_thres=0.01):
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def run_tf_inference_with_viz(video_path, model_path,
+                              conf_thres=CONF_thres, iou_thres=IOU_thres):
     # 1. 載入模型
-    print(f"正在載入模型: {model_path}...")
+    print(f"正在載入模型: {model_path} ...")
     try:
         model = tf.saved_model.load(model_path)
         infer = model.signatures['serving_default']
@@ -43,145 +40,138 @@ def run_tf_inference_with_viz(video_path, model_path, conf_thres=0.1, iou_thres=
         return
 
     cap = cv2.VideoCapture(video_path)
-    # 取得原始影片尺寸
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    print(f"開始推論 (類別數設定: {NUM_CLASSES})... (按 'q' 離開)")
 
-    has_saved_debug = False
+    print(f"開始推論 (NUM_CLASSES = {NUM_CLASSES}) ... (按 'q' 離開)")
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # --- 2. 影像前處理 ---
+        # 2. 影像前處理
         img_resized = cv2.resize(frame, input_shape)
         img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
-
-        img_norm = img_rgb / 255.0
+        img_norm = img_rgb.astype(np.float32) / 255.0
         img_tensor = tf.convert_to_tensor(img_norm[np.newaxis, ...], dtype=tf.float32)
 
-        # --- 3. 推論 ---
+        # 3. 推論
         output = infer(img_tensor)
-        raw_tensor = list(output.values())[0].numpy()
-        
-        # --- [保留] 儲存原始除錯檔案 (只存第一次) ---
-        if not has_saved_debug:
-            save_path_csv = "debug_yolo_output.csv"
-            
-            print(f"\n[DEBUG] 正在儲存 Raw Logits (未 Activation) 至: {save_path_csv}")
-            print(f"[DEBUG] 輸出形狀 (Shape): {raw_tensor.shape}")
-            print(f"[DEBUG] 最大值 (Max): {np.max(raw_tensor)}")
-            print(f"[DEBUG] 最小值 (Min): {np.min(raw_tensor)}")
-            
-            # 處理維度並存檔
-            if raw_tensor.ndim > 2:
-                data_to_save = raw_tensor.flatten()
-            else:
-                data_to_save = raw_tensor
-            
-            np.savetxt(save_path_csv, data_to_save, delimiter=",", fmt='%.6f')
-            has_saved_debug = True 
+        pred = list(output.values())[0].numpy()  # 例如 (1, 56, 8400) or (1, 8400, 56)
 
-        # ★★★ 核心修改：將 Logits 轉為 0~1 機率值 ★★★
-        # 這一步將解決負值座標與座標數值過大的問題
-        pred = sigmoid(raw_tensor)
-        
-        # 確保形狀是 (Batch, Anchors, Channels) -> (1, 8400, 56)
-        if pred.shape[1] < pred.shape[2]: 
+        # 統一成 (1, N, C)
+        if pred.shape[1] < pred.shape[2]:  # (1, C, N) -> (1, N, C)
             pred = np.transpose(pred, (0, 2, 1))
-        
-        pred = pred[0] # 取出 batch 0
 
-        # --- 4. 後處理 (Post-Processing) ---
-        
-        # 4.1 解析 Tensor (現在所有數值都在 0~1 之間)
-        # 座標: 前 4 個 [x, y, w, h]
-        bboxes = pred[:, :4] 
-        # 類別分數
-        class_scores = pred[:, 4 : 4 + NUM_CLASSES] 
-        # Keypoints: [x, y, conf, x, y, conf, ...]
-        kpts_data = pred[:, 4 + NUM_CLASSES :] 
+        pred = pred[0]   # (N, C)
 
-        # 4.2 找出每個 Anchor 的「最大信心類別」與「分數」
-        class_ids = np.argmax(class_scores, axis=1)
-        confidences = np.max(class_scores, axis=1)
+        # ====== 4. 依照「loss_tf 的假設」重新 decode ======
+        # [0:4]   : box logits
+        # [4:4+C] : class logits
+        # [其餘] : keypoints logits
+        box_logits = pred[:, :4]
+        cls_logits = pred[:, 4:4 + NUM_CLASSES]
+        kpt_logits = pred[:, 4 + NUM_CLASSES:]
 
-        # 4.3 過濾低信心度
+        # 把 logits 壓成 0~1
+        boxes = _sigmoid(box_logits)   # (N, 4), cx,cy,w,h in (0,1)
+        cls_prob = _sigmoid(cls_logits)  # (N, num_classes)
+        kpts = _sigmoid(kpt_logits)    # (N, num_kpt * 3)
+
+        # 每個 anchor 的最佳類別與信心
+        class_ids = np.argmax(cls_prob, axis=1)
+        confidences = np.max(cls_prob, axis=1)
+
+        # 4.1 過濾低信心
         mask = confidences > conf_thres
-        
-        bboxes_filtered = bboxes[mask]
-        class_ids_filtered = class_ids[mask]
-        confidences_filtered = confidences[mask]
-        kpts_filtered = kpts_data[mask]
-        
-        if len(bboxes_filtered) == 0:
+        boxes = boxes[mask]
+        class_ids = class_ids[mask]
+        confidences = confidences[mask]
+        kpts = kpts[mask]
+
+        # 沒預測到就直接顯示原圖
+        if len(boxes) == 0:
             cv2.imshow("Result", frame)
-            if cv2.waitKey(1) == ord('q'): break
+            if cv2.waitKey(1) == ord('q'):
+                break
             continue
 
-        # 4.4 準備 NMS 數據 (YOLO [cx, cy, w, h] -> [x, y, w, h])
-        boxes_xywh = bboxes_filtered.copy()
-        boxes_xywh[:, 0] = bboxes_filtered[:, 0] - bboxes_filtered[:, 2] / 2  # x_top_left
-        boxes_xywh[:, 1] = bboxes_filtered[:, 1] - bboxes_filtered[:, 3] / 2  # y_top_left
-        
-        # 4.5 執行 NMS
+        # 4.2 準備 NMS：YOLO [cx,cy,w,h] -> [x,y,w,h] (左上角座標 + 寬高，仍為 0~1)
+        boxes_xywh = boxes.copy()
+        boxes_xywh[:, 0] = boxes[:, 0] - boxes[:, 2] / 2.0  # x_min
+        boxes_xywh[:, 1] = boxes[:, 1] - boxes[:, 3] / 2.0  # y_min
+
+        # cv2.dnn.NMSBoxes 期待的是像素單位，但 IoU 與是否 scale 無關，
+        # 這裡直接轉成 640 基準像素再丟進去，避免 threshold 太敏感
+        pixel_boxes_xywh = np.zeros_like(boxes_xywh)
+        pixel_boxes_xywh[:, 0] = boxes_xywh[:, 0] * Image_Size_X
+        pixel_boxes_xywh[:, 1] = boxes_xywh[:, 1] * Image_Size_Y
+        pixel_boxes_xywh[:, 2] = boxes[:, 2] * Image_Size_X
+        pixel_boxes_xywh[:, 3] = boxes[:, 3] * Image_Size_Y
+
         indices = cv2.dnn.NMSBoxes(
-            bboxes=boxes_xywh.tolist(), 
-            scores=confidences_filtered.tolist(), 
-            score_threshold=conf_thres, 
+            bboxes=pixel_boxes_xywh.tolist(),
+            scores=confidences.tolist(),
+            score_threshold=conf_thres,
             nms_threshold=iou_thres
         )
 
-        # --- 5. 繪製結果 ---
-        scale_x = orig_w / input_shape[0]
-        scale_y = orig_h / input_shape[1]
+        # 4.3 還原到原始影像尺寸
+        scale_x = orig_w / Image_Size_X
+        scale_y = orig_h / Image_Size_Y
 
         if len(indices) > 0:
-            for i in indices:
-                idx = i[0] if isinstance(i, (list, np.ndarray)) else i
-                
-                # 取得該物件資訊
-                box = boxes_xywh[idx]
-                cls_id = class_ids_filtered[idx]
-                conf = confidences_filtered[idx]
+            for idx in indices:
+                # 可能是 [[i]] 或 [i]
+                if isinstance(idx, (list, np.ndarray)):
+                    idx = idx[0]
 
-                # 選擇顏色
+                box_xywh = pixel_boxes_xywh[idx]
+                cls_id = int(class_ids[idx])
+                conf = float(confidences[idx])
+                kpts_obj = kpts[idx]
+
                 color = CLASS_COLORS[cls_id % len(CLASS_COLORS)]
 
-                # 還原座標 (因為 box 已經是 0~1，直接乘回去即可)
-                x, y, w, h = box
+                x, y, w, h = box_xywh
+                # 轉回原始 frame 尺度
+                x = x * scale_x
+                y = y * scale_y
+                w = w * scale_x
+                h = h * scale_y
 
-                x = (x * Image_Size_X) * scale_x
-                y = (y * Image_Size_Y) * scale_y
-                w = (w * Image_Size_X) * scale_x
-                h = (h * Image_Size_Y) * scale_y
-                
-                # 畫 Bounding Box
-                cv2.rectangle(frame, (int(x), int(y)), (int(x+w), int(y+h)), color, 2)
-                
-                # 畫類別名稱與分數
+                # 畫 bbox
+                cv2.rectangle(
+                    frame,
+                    (int(x), int(y)),
+                    (int(x + w), int(y + h)),
+                    color,
+                    2
+                )
+
+                # 畫 label
                 label = f"Class {cls_id}: {conf:.2f}"
-                cv2.putText(frame, label, (int(x), int(y)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                cv2.putText(
+                    frame, label,
+                    (int(x), int(y) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, color, 2
+                )
 
-                # 處理 Keypoints
-                kpts = kpts_filtered[idx]
-                
+                # 解析並畫 keypoints
                 parsed_kpts = []
-                for k in range(0, len(kpts), 3):
-                    # 取出 kx, ky, kconf (都已經是 0~1)
-                    kx, ky, kconf = kpts[k], kpts[k+1], kpts[k+2]
-                    
-                    if kconf > 0.5: # 若有需要可調低此閾值
-                        # Keypoints 座標還原
-                        cx = int((kx * Image_Size_X) * scale_x)
-                        cy = int((ky * Image_Size_Y) * scale_y)
-                        parsed_kpts.append((cx, cy))
-                        cv2.circle(frame, (cx, cy), 4, KP_COLOR, -1)
-                    else:
+                for k in range(0, len(kpts_obj), 3):
+                    kx, ky, kconf = kpts_obj[k], kpts_obj[k+1], kpts_obj[k+2]
+
+                    if kconf < 0.5:
                         parsed_kpts.append(None)
+                        continue
+
+                    px = int(kx * Image_Size_X * scale_x)
+                    py = int(ky * Image_Size_Y * scale_y)
+                    parsed_kpts.append((px, py))
+                    cv2.circle(frame, (px, py), 4, KP_COLOR, -1)
 
                 # 畫骨架
                 for p1_idx, p2_idx in SKELETON:
@@ -191,6 +181,7 @@ def run_tf_inference_with_viz(video_path, model_path, conf_thres=0.1, iou_thres=
                         if pt1 is not None and pt2 is not None:
                             cv2.line(frame, pt1, pt2, LIMB_COLOR, 2)
 
+        # 顯示畫面
         cv2.imshow("Result", frame)
         if cv2.waitKey(1) == ord('q'):
             break
@@ -198,10 +189,8 @@ def run_tf_inference_with_viz(video_path, model_path, conf_thres=0.1, iou_thres=
     cap.release()
     cv2.destroyAllWindows()
 
-if __name__ == "__main__":
 
+if __name__ == "__main__":
     video = "./vecow-demo.mp4"
-    # model_dir = "./model/carkeypoint-20251122-Rep-s2_saved_model" 
-    model_dir = "./model/20251203_Label/models/qat_saved_model_interrupted" 
-    
+    model_dir = "./model/20251208_200732/models/qat_saved_model_interrupted"
     run_tf_inference_with_viz(video, model_dir, CONF_thres, IOU_thres)

@@ -108,6 +108,69 @@ def huber_no_reduce(y_true, y_pred, delta=1.0):
     lin = delta * (tf.abs(error) - 0.5 * delta)
     return tf.where(is_small, sq, lin)
 
+def decode_yolo_pose_outputs(
+    y_pred_raw,
+    num_cls,
+    num_kpt,
+    kpt_vals,
+    box_act="sigmoid",
+    cls_act=None,
+    kpt_act="sigmoid",
+):
+    """
+    將模型輸出的 logits 解析成:
+    - pred_box       : (B, N, 4)      -> [cx, cy, w, h] in [0,1]
+    - pred_cls_logit : (B, N, num_cls)-> 分類 logits
+    - pred_cls_prob  : (B, N, num_cls)-> 分類機率 (如需要)
+    - pred_kpt_flat  : (B, N, K*V)    -> 關鍵點 (0~1)
+
+    y_pred_raw: (B, N, 4 + num_cls + num_kpt*kpt_vals) 或 (B, C, N)
+                （你在 Train_Model 裡已經轉成 BNC 了）
+    """
+
+    C = 4 + num_cls + num_kpt * kpt_vals
+
+    # 保險：如果是 (B, C, N) 就轉成 (B, N, C)
+    y = y_pred_raw
+    if tf.shape(y)[1] < tf.shape(y)[2]:  # 例如 (B, 56, 8400)
+        y = tf.transpose(y, perm=[0, 2, 1])  # -> (B, 8400, 56)
+
+    y = tf.reshape(y, (-1, tf.shape(y)[1], C))  # (B, N, C)
+
+    box_logits = y[..., :4]                       # (B, N, 4)
+    cls_logits = y[..., 4:4+num_cls]             # (B, N, num_cls)
+    kpt_logits = y[..., 4+num_cls:]              # (B, N, K*V)
+
+    # --- boxes ---
+    if box_act == "sigmoid":
+        pred_box = tf.sigmoid(box_logits)        # clamp 到 0~1
+    elif box_act == "tanh":
+        pred_box = (tf.tanh(box_logits) + 1.0) / 2.0
+    elif box_act is None:
+        pred_box = box_logits                    # 不做任何 decode
+    else:
+        raise ValueError(f"Unknown box_act: {box_act}")
+
+    # --- class ---
+    pred_cls_logit = cls_logits
+    if cls_act == "sigmoid":
+        pred_cls_prob = tf.sigmoid(cls_logits)
+    elif cls_act == "softmax":
+        pred_cls_prob = tf.nn.softmax(cls_logits, axis=-1)
+    elif cls_act is None:
+        pred_cls_prob = cls_logits               # 只當 logits，用在 KD
+    else:
+        raise ValueError(f"Unknown cls_act: {cls_act}")
+
+    # --- keypoints ---
+    if kpt_act == "sigmoid":
+        pred_kpt_flat = tf.sigmoid(kpt_logits)   # (B, N, K*V) in [0,1]
+    elif kpt_act is None:
+        pred_kpt_flat = kpt_logits
+    else:
+        raise ValueError(f"Unknown kpt_act: {kpt_act}")
+
+    return pred_box, pred_cls_logit, pred_cls_prob, pred_kpt_flat
 
 # ==============================================================================
 # Main Loss Function (Route A)
@@ -162,20 +225,26 @@ def pose_loss_from_labels(
     # ----------------------
     # 1) 解析 Model Output（直接當最終輸出）
     # ----------------------
-    C = 4 + num_cls + num_kpt * kpt_vals
-    y_pred = tf.reshape(y_pred, (-1, tf.shape(y_pred)[1], C))   # (B, N, C)
+    # C = 4 + num_cls + num_kpt * kpt_vals
+    # y_pred = tf.reshape(y_pred, (-1, tf.shape(y_pred)[1], C))   # (B, N, C)
 
-    idx_box_end = 4
-    idx_cls_end = 4 + num_cls
+    # idx_box_end = 4
+    # idx_cls_end = 4 + num_cls
 
-    pred_box      = y_pred[..., :idx_box_end]          # (B, N, 4)，0~1 [cx,cy,w,h]
-    pred_cls_prob = y_pred[..., idx_box_end:idx_cls_end]  # (B, N, num_cls)，視為機率 0~1
-    pred_kpt_flat = y_pred[..., idx_cls_end:]          # (B, N, K*V)，0~1
+    # pred_box      = y_pred[..., :idx_box_end]          # (B, N, 4)，0~1 [cx,cy,w,h]
+    # pred_cls_prob = y_pred[..., idx_box_end:idx_cls_end]  # (B, N, num_cls)，視為機率 0~1
+    # pred_kpt_flat = y_pred[..., idx_cls_end:]          # (B, N, K*V)，0~1
 
-    # 如果想強制 clamp 在 0~1，可以打開這三行：
-    # pred_box      = tf.clip_by_value(pred_box, 0.0, 1.0)
-    # pred_cls_prob = tf.clip_by_value(pred_cls_prob, 0.0, 1.0)
-    # pred_kpt_flat = tf.clip_by_value(pred_kpt_flat, 0.0, 1.0)
+    # ----------------------
+    pred_box, pred_cls_logit, pred_cls_prob, pred_kpt_flat = decode_yolo_pose_outputs(
+        y_pred,
+        num_cls=num_cls,
+        num_kpt=num_kpt,
+        kpt_vals=kpt_vals,
+        box_act="sigmoid",    # xywh -> 0~1
+        cls_act=None,         # 保留 logits 給 loss，用不到機率就不 decode
+        kpt_act="sigmoid",    # kpt -> 0~1
+    )
     '''
     # ----------------------
     # 2) IoU-based 配對：用 anchors 做 assignment
@@ -327,70 +396,44 @@ def pose_loss_from_labels(
     loss_box = lambda_box * (loss_box / num_pos_safe)
 
     # ----------------------
-    # 5) Class Loss（Huber + 正負樣本權重）
+    # 5) Class Loss（使用 logits 的 BCE + 正負樣本權重）
     # ----------------------
     if num_cls > 0:
         if len(target_cls.shape) == 3:
             target_cls = tf.squeeze(target_cls, -1)
-        target_cls = tf.cast(target_cls, tf.int32)
+        target_cls = tf.cast(target_cls, tf.int32)      # (B, N)
 
         # one-hot → (B, N, num_cls)
-        t_cls_onehot = tf.one_hot(target_cls, depth=num_cls, dtype=pred_cls_prob.dtype)
+        t_cls_onehot = tf.one_hot(target_cls, depth=num_cls, dtype=pred_cls_logit.dtype)
 
         # 只在正樣本上有 label（負樣本當作全 0）
-        pos_mask_exp = tf.expand_dims(pos_mask_f, -1)  # (B, N, 1)
-        t_cls_onehot = t_cls_onehot * pos_mask_exp
+        pos_mask_exp = tf.expand_dims(pos_mask_f, -1)   # (B, N, 1)
+        t_cls_onehot = t_cls_onehot * pos_mask_exp      # 背景 anchor label = 全 0
 
-        # --------------------------
-        '''
-        # [修正後] 使用 TF 內建函數，更穩定且支援自動權重
-        bce = tf.keras.losses.BinaryCrossentropy(from_logits=False, reduction=tf.keras.losses.Reduction.NONE)
-        cls_loss_per_class = bce(t_cls_onehot, pred_cls_prob) # (B, N) or (B, N, 1)
-        
-        # 確保維度正確 (B, N)
-        if len(cls_loss_per_class.shape) == 3:
-            cls_loss_per_anchor = tf.reduce_mean(cls_loss_per_class, axis=-1)
-        else:
-            cls_loss_per_anchor = cls_loss_per_class
+        # logits 版 Binary Cross Entropy:
+        # loss = max(x,0) - x*z + log(1 + exp(-|x|))
+        x = pred_cls_logit
+        z = t_cls_onehot
 
-        # 正樣本 1.0，負樣本 0.1 (YOLO 的平衡參數)
-        neg_weight = 0.5 # 建議稍微調高一點，0.1 有點太低，YOLOv8 預設常用 0.5
-        weights = pos_mask_f * 1.0 + (1.0 - pos_mask_f) * neg_weight
-
-        loss_cls = tf.reduce_sum(cls_loss_per_anchor * weights)
-        loss_cls = lambda_cls * (loss_cls / num_pos_safe)
-
-        '''
-        # 將 pred 當成機率（如果你之後改成 logits，就在這裡先做 sigmoid）
-        epsilon = 1e-7
-        p = tf.clip_by_value(pred_cls_prob, 1e-6, 1.0 - 1e-6)
-
-        # Binary Cross Entropy: -(y*log p + (1-y)*log(1-p))
-        cls_loss_per_class = -(
-            t_cls_onehot * tf.math.log(p) +
-            (1.0 - t_cls_onehot) * tf.math.log(1.0 - p)
+        cls_loss_per_class = (
+            tf.nn.relu(x) - x * z + tf.math.log1p(tf.exp(-tf.abs(x)))
         )  # (B, N, num_cls)
 
-        # 3. 應用類別權重 (Class Weights)
-        # 現在 cls_loss_per_class 是 (B, N, num_cls)，可以跟 cw (1, 1, num_cls) 相乘了
+        # 類別權重（可選）
         if class_weights is not None:
-            cw = tf.convert_to_tensor(class_weights, dtype=pred_cls_prob.dtype)
-            cw = tf.reshape(cw, [1, 1, num_cls])  # (1, 1, C)
-            
-            # 這裡看你的需求，通常是直接乘上去
+            cw = tf.convert_to_tensor(class_weights, dtype=cls_loss_per_class.dtype)
+            cw = tf.reshape(cw, [1, 1, num_cls])   # (1, 1, C)
             cls_loss_per_class = cls_loss_per_class * cw
 
-        # across classes
-        cls_loss_per_anchor = tf.reduce_sum(cls_loss_per_class, axis=-1)  # (B, N)
+        # 對類別做 sum → (B, N)
+        cls_loss_per_anchor = tf.reduce_sum(cls_loss_per_class, axis=-1)
 
-        # 正樣本 1.0，負樣本 0.1
+        # 正樣本 1.0，負樣本 0.1 （你可以依需要調）
         neg_weight = 0.1
         weights = pos_mask_f * 1.0 + (1.0 - pos_mask_f) * neg_weight  # (B, N)
 
         loss_cls = tf.reduce_sum(cls_loss_per_anchor * weights)
         loss_cls = lambda_cls * (loss_cls / num_pos_safe)
-        
-        # --------------------------
     else:
         loss_cls = tf.constant(0.0, dtype=tf.float32)
 
