@@ -8,7 +8,7 @@ Training Settings
 
 IMGSZ = 640
 BATCH = 32
-EPOCHS = 20              # 可先跑 5~10 看收斂
+EPOCHS = 100              # 可先跑 5~10 看收斂
 
 base_lr = 0.01
 end_lr = 0.01

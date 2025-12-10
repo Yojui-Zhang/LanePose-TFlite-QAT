@@ -185,7 +185,7 @@ def pose_loss_from_labels(
     kpt_vals=3,
     lambda_box=7.0,
     lambda_cls=2.0,
-    lambda_kpt=1.0,
+    lambda_kpt=14.0,
     class_weights=None,
 ):
     """
