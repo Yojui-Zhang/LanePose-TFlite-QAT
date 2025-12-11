@@ -8,8 +8,8 @@ NUM_CLASSES = 7
 Image_Size_X = 640
 Image_Size_Y = 640
 
-CONF_thres = 0.4
-IOU_thres = 0.4
+CONF_thres = 0.8
+IOU_thres = 0.2
 
 # ---------------------------------------------------
 # 定義骨架連接關係
@@ -183,27 +183,27 @@ def run_tf_inference_with_viz(video_path, model_path, conf_thres=0.1, iou_thres=
                 cv2.putText(frame, label, (int(x), int(y)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
                 # 處理 Keypoints
-                # kpts = kpts_filtered[idx]
+                kpts = kpts_filtered[idx]
                 
-                # parsed_kpts = []
-                # for k in range(0, len(kpts), 3):
-                #     kx, ky, kconf = kpts[k], kpts[k+1], kpts[k+2]
-                #     if kconf > 0.5: 
-                #         # Keypoints 座標還原
-                #         cx = int((kx * Image_Size_X) * scale_x)
-                #         cy = int((ky * Image_Size_Y) * scale_y)
-                #         parsed_kpts.append((cx, cy))
-                #         cv2.circle(frame, (cx, cy), 4, KP_COLOR, -1)
-                #     else:
-                #         parsed_kpts.append(None)
+                parsed_kpts = []
+                for k in range(0, len(kpts), 3):
+                    kx, ky, kconf = kpts[k], kpts[k+1], kpts[k+2]
+                    if kconf > 0.5: 
+                        # Keypoints 座標還原
+                        cx = int((kx * Image_Size_X) * scale_x)
+                        cy = int((ky * Image_Size_Y) * scale_y)
+                        parsed_kpts.append((cx, cy))
+                        cv2.circle(frame, (cx, cy), 4, KP_COLOR, -1)
+                    else:
+                        parsed_kpts.append(None)
 
-                # # 畫骨架
-                # for p1_idx, p2_idx in SKELETON:
-                #     if p1_idx-1 < len(parsed_kpts) and p2_idx-1 < len(parsed_kpts):
-                #         pt1 = parsed_kpts[p1_idx-1]
-                #         pt2 = parsed_kpts[p2_idx-1]
-                #         if pt1 is not None and pt2 is not None:
-                #             cv2.line(frame, pt1, pt2, LIMB_COLOR, 2)
+                # 畫骨架
+                for p1_idx, p2_idx in SKELETON:
+                    if p1_idx-1 < len(parsed_kpts) and p2_idx-1 < len(parsed_kpts):
+                        pt1 = parsed_kpts[p1_idx-1]
+                        pt2 = parsed_kpts[p2_idx-1]
+                        if pt1 is not None and pt2 is not None:
+                            cv2.line(frame, pt1, pt2, LIMB_COLOR, 2)
 
         cv2.imshow("Result", frame)
         if cv2.waitKey(1) == ord('q'):
@@ -216,6 +216,6 @@ if __name__ == "__main__":
 
     video = "./vecow-demo.mp4"
     # model_dir = "./model/carkeypoint-20251122-Rep-s2_saved_model" 
-    model_dir = "./model/20251209_135248/models/qat_saved_model" 
+    model_dir = "./model/20251210_logic/models/qat_saved_model" 
     
     run_tf_inference_with_viz(video, model_dir, CONF_thres, IOU_thres)

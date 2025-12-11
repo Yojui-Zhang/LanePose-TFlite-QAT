@@ -159,27 +159,27 @@ def run_tf_inference_with_viz(video_path, model_path,
                     0.5, color, 2
                 )
 
-                # 解析並畫 keypoints
-                parsed_kpts = []
-                for k in range(0, len(kpts_obj), 3):
-                    kx, ky, kconf = kpts_obj[k], kpts_obj[k+1], kpts_obj[k+2]
+                # # 解析並畫 keypoints
+                # parsed_kpts = []
+                # for k in range(0, len(kpts_obj), 3):
+                #     kx, ky, kconf = kpts_obj[k], kpts_obj[k+1], kpts_obj[k+2]
 
-                    if kconf < 0.5:
-                        parsed_kpts.append(None)
-                        continue
+                #     if kconf < 0.5:
+                #         parsed_kpts.append(None)
+                #         continue
 
-                    px = int(kx * Image_Size_X * scale_x)
-                    py = int(ky * Image_Size_Y * scale_y)
-                    parsed_kpts.append((px, py))
-                    cv2.circle(frame, (px, py), 4, KP_COLOR, -1)
+                #     px = int(kx * Image_Size_X * scale_x)
+                #     py = int(ky * Image_Size_Y * scale_y)
+                #     parsed_kpts.append((px, py))
+                #     cv2.circle(frame, (px, py), 4, KP_COLOR, -1)
 
-                # 畫骨架
-                for p1_idx, p2_idx in SKELETON:
-                    if p1_idx-1 < len(parsed_kpts) and p2_idx-1 < len(parsed_kpts):
-                        pt1 = parsed_kpts[p1_idx-1]
-                        pt2 = parsed_kpts[p2_idx-1]
-                        if pt1 is not None and pt2 is not None:
-                            cv2.line(frame, pt1, pt2, LIMB_COLOR, 2)
+                # # 畫骨架
+                # for p1_idx, p2_idx in SKELETON:
+                #     if p1_idx-1 < len(parsed_kpts) and p2_idx-1 < len(parsed_kpts):
+                #         pt1 = parsed_kpts[p1_idx-1]
+                #         pt2 = parsed_kpts[p2_idx-1]
+                #         if pt1 is not None and pt2 is not None:
+                #             cv2.line(frame, pt1, pt2, LIMB_COLOR, 2)
 
         # 顯示畫面
         cv2.imshow("Result", frame)
@@ -192,5 +192,5 @@ def run_tf_inference_with_viz(video_path, model_path,
 
 if __name__ == "__main__":
     video = "./vecow-demo.mp4"
-    model_dir = "./model/20251209_214705/models/qat_saved_model_interrupted"
+    model_dir = "./model/models-logic-alldataset100epochs/models/qat_saved_model"
     run_tf_inference_with_viz(video, model_dir, CONF_thres, IOU_thres)

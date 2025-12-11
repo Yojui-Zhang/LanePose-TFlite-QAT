@@ -184,7 +184,7 @@ def pose_loss_from_labels(
     num_kpt=17,
     kpt_vals=3,
     lambda_box=7.0,
-    lambda_cls=2.0,
+    lambda_cls=7.0,
     lambda_kpt=14.0,
     class_weights=None,
 ):
@@ -241,9 +241,9 @@ def pose_loss_from_labels(
         num_cls=num_cls,
         num_kpt=num_kpt,
         kpt_vals=kpt_vals,
-        box_act="sigmoid",    # xywh -> 0~1
-        cls_act=None,         # 保留 logits 給 loss，用不到機率就不 decode
-        kpt_act="sigmoid",    # kpt -> 0~1
+        box_act=None,    # xywh -> 0~1
+        cls_act="sigmoid",         # 保留 logits 給 loss，用不到機率就不 decode
+        kpt_act=None,    # kpt -> 0~1
     )
     '''
     # ----------------------
@@ -391,61 +391,242 @@ def pose_loss_from_labels(
     # box_diff = huber_no_reduce(target_box, pred_box)      # (B, N, 4)
     # loss_box = tf.reduce_sum(tf.reduce_mean(box_diff, axis=-1) * pos_mask_f)
     # loss_box = lambda_box * (loss_box / num_pos_safe)
-    ciou_loss = bbox_ciou(pred_box, target_box)    # (B, N)
-    loss_box = tf.reduce_sum(ciou_loss * pos_mask_f)
+    # -------------------
+    # ciou_loss = bbox_ciou(pred_box, target_box)    # (B, N)
+    # loss_box = tf.reduce_sum(ciou_loss * pos_mask_f)
+    # loss_box = lambda_box * (loss_box / num_pos_safe)
+    # -------------------
+    # 4.1 CIoU 主要項
+    ciou_loss = bbox_ciou(pred_box, target_box)    # (B, N), = 1 - CIoU
+    # ciou_loss = tf.square(ciou_loss)             # 小誤差權重放大
+
+    # 4.2 把 cx,cy,w,h 轉成像素做 Huber（讓微小偏移也有明顯罰則）
+    # -----------
+    imgsz = config.IMGSZ
+    if isinstance(imgsz, (tuple, list)):
+        H, W = imgsz
+    else:
+        H = W = imgsz
+
+    H = tf.cast(H, pred_box.dtype)
+    W = tf.cast(W, pred_box.dtype)
+
+    # 用 tf.stack 堆疊 scalar tensor，而不是 tf.constant 包 list
+    scale_px = tf.stack([W, H, W, H])          # 形狀 (4,)
+    scale_px = tf.reshape(scale_px, (1, 1, 4)) # → (1,1,4) 方便 broadcast
+
+    # -----------
+
+    target_box_px = target_box * scale_px                      # (B, N, 4)
+    pred_box_px   = pred_box   * scale_px                      # (B, N, 4)
+
+    box_diff  = huber_no_reduce(target_box_px, pred_box_px)    # (B, N, 4)
+    box_huber = tf.reduce_mean(box_diff, axis=-1)              # (B, N) 對 4 個參數平均
+
+    # 4.3 對小物件加權（類 YOLOv5：小 box loss 放大）
+    box_area = target_box[..., 2] * target_box[..., 3]         # (B, N), normalized area
+    box_scale = 2.0 - box_area                                 # 小 box → 係數接近 2
+    box_scale = tf.clip_by_value(box_scale, 1.0, 2.0)          # 避免太極端
+
+    # 4.4 組合成單一 box loss
+    alpha = 0.25  # Huber 權重（超參數，可調）
+    per_anchor_box = (ciou_loss + alpha * box_huber) * box_scale   # (B, N)
+
+    # 只對正樣本 anchor 做 box loss
+    loss_box = tf.reduce_sum(per_anchor_box * pos_mask_f)      # scalar
     loss_box = lambda_box * (loss_box / num_pos_safe)
 
     # ----------------------
     # 5) Class Loss（使用 logits 的 BCE + 正負樣本權重）
     # ----------------------
+    # if num_cls > 0:
+    #     if len(target_cls.shape) == 3:
+    #         target_cls = tf.squeeze(target_cls, -1)
+    #     target_cls = tf.cast(target_cls, tf.int32)      # (B, N)
+
+    #     # one-hot → (B, N, num_cls)
+    #     t_cls_onehot = tf.one_hot(target_cls, depth=num_cls, dtype=pred_cls_logit.dtype)
+
+    #     # 只在正樣本上有 label（負樣本當作全 0）
+    #     pos_mask_exp = tf.expand_dims(pos_mask_f, -1)   # (B, N, 1)
+    #     t_cls_onehot = t_cls_onehot * pos_mask_exp      # 背景 anchor label = 全 0
+
+    #     # logits 版 Binary Cross Entropy:
+    #     # loss = max(x,0) - x*z + log(1 + exp(-|x|))
+    #     x = pred_cls_logit
+    #     z = t_cls_onehot
+
+    #     cls_loss_per_class = (
+    #         tf.nn.relu(x) - x * z + tf.math.log1p(tf.exp(-tf.abs(x)))
+    #     )  # (B, N, num_cls)
+
+    #     # 類別權重（可選）
+    #     if class_weights is not None:
+    #         cw = tf.convert_to_tensor(class_weights, dtype=cls_loss_per_class.dtype)
+    #         cw = tf.reshape(cw, [1, 1, num_cls])   # (1, 1, C)
+    #         cls_loss_per_class = cls_loss_per_class * cw
+
+    #     # 對類別做 sum → (B, N)
+    #     cls_loss_per_anchor = tf.reduce_sum(cls_loss_per_class, axis=-1)
+
+    #     # 正樣本 1.0，負樣本 0.1 （你可以依需要調）
+    #     neg_weight = 0.5
+    #     weights = pos_mask_f * 1.0 + (1.0 - pos_mask_f) * neg_weight  # (B, N)
+
+    #     loss_cls = tf.reduce_sum(cls_loss_per_anchor * weights)
+    #     loss_cls = lambda_cls * (loss_cls / num_pos_safe)
+    # else:
+    #     loss_cls = tf.constant(0.0, dtype=tf.float32)
+    
+    # ------------------
+    
     if num_cls > 0:
+        # 先把 target_cls 攤平成 (B, N)
         if len(target_cls.shape) == 3:
             target_cls = tf.squeeze(target_cls, -1)
         target_cls = tf.cast(target_cls, tf.int32)      # (B, N)
 
-        # one-hot → (B, N, num_cls)
-        t_cls_onehot = tf.one_hot(target_cls, depth=num_cls, dtype=pred_cls_logit.dtype)
+        # one-hot → (B, N, num_cls)，只對正樣本 anchor 有有效 label
+        t_cls_onehot = tf.one_hot(target_cls, depth=num_cls,
+                                  dtype=pred_cls_logit.dtype)  # (B, N, C)
+        pos_mask_exp = tf.expand_dims(pos_mask_f, -1)          # (B, N, 1)
+        t_cls_onehot = t_cls_onehot * pos_mask_exp             # 負樣本的 one-hot 全 0
 
-        # 只在正樣本上有 label（負樣本當作全 0）
-        pos_mask_exp = tf.expand_dims(pos_mask_f, -1)   # (B, N, 1)
-        t_cls_onehot = t_cls_onehot * pos_mask_exp      # 背景 anchor label = 全 0
+        # 預測機率 (B, N, C)
+        p_cls = pred_cls_prob
+        eps = 1e-6
 
-        # logits 版 Binary Cross Entropy:
-        # loss = max(x,0) - x*z + log(1 + exp(-|x|))
-        x = pred_cls_logit
-        z = t_cls_onehot
+        # --------------------------------------------------
+        # 5.1 隱式 Objectness Loss：p_obj = Σ_c p_cls,c
+        # --------------------------------------------------
+        # p_obj 代表「這個 anchor 有物件」的機率：所有類別機率加總，clamp 到 [0,1]
+        p_obj = tf.reduce_sum(p_cls, axis=-1)           # (B, N)
+        p_obj = tf.clip_by_value(p_obj, 0.0, 1.0)
 
-        cls_loss_per_class = (
-            tf.nn.relu(x) - x * z + tf.math.log1p(tf.exp(-tf.abs(x)))
-        )  # (B, N, num_cls)
+        t_obj = pos_mask_f                              # (B, N)，有物件就 1，背景 0
 
-        # 類別權重（可選）
+        # BCE on objectness
+        obj_ce = - (t_obj * tf.math.log(p_obj + eps) +
+                    (1.0 - t_obj) * tf.math.log(1.0 - p_obj + eps))   # (B, N)
+
+        # Focal-like weight for objectness
+        gamma_obj = 2.0
+        pt_obj = t_obj * p_obj + (1.0 - t_obj) * (1.0 - p_obj)        # (B, N)
+        focal_w_obj = tf.pow(1.0 - pt_obj, gamma_obj)
+
+        loss_obj = tf.reduce_sum(obj_ce * focal_w_obj) / num_pos_safe
+
+        # --------------------------------------------------
+        # 5.2 Conditional Class Loss：只在正樣本上做 Focal BCE
+        # --------------------------------------------------
+        z = t_cls_onehot                                     # (B, N, C)
+        x = pred_cls_logit                                   # (B, N, C)
+        p = p_cls                                            # sigmoid(x)
+
+        # standard BCE
+        ce_cls = - (z * tf.math.log(p + eps) +
+                    (1.0 - z) * tf.math.log(1.0 - p + eps))  # (B, N, C)
+
+        # focal weight：對正樣本較高，避免少樣本被 easy negative 淹沒
+        gamma_cls = 2.0
+        # pt = p if z=1 else 1-p
+        pt = z * p + (1.0 - z) * (1.0 - p)
+        alpha_pos = 0.75
+        alpha_neg = 0.25
+        alpha_factor = alpha_pos * z + alpha_neg * (1.0 - z)
+
+        focal_w_cls = alpha_factor * tf.pow(1.0 - pt, gamma_cls)
+
+        cls_loss_per_class = ce_cls * focal_w_cls          # (B, N, C)
+
+        # 類別權重（針對少樣本類別可加大權重）
         if class_weights is not None:
-            cw = tf.convert_to_tensor(class_weights, dtype=cls_loss_per_class.dtype)
-            cw = tf.reshape(cw, [1, 1, num_cls])   # (1, 1, C)
+            cw = tf.convert_to_tensor(class_weights,
+                                      dtype=cls_loss_per_class.dtype)  # (C,)
+            cw = tf.reshape(cw, [1, 1, num_cls])                        # (1,1,C)
             cls_loss_per_class = cls_loss_per_class * cw
 
-        # 對類別做 sum → (B, N)
-        cls_loss_per_anchor = tf.reduce_sum(cls_loss_per_class, axis=-1)
+        # 把負樣本的 class loss 壓得更低（主要靠 obj_loss 處理背景）
+        # pos: 1.0, neg: small
+        neg_cls_weight = 0.5
+        anchor_weight = pos_mask_exp + (1.0 - pos_mask_exp) * neg_cls_weight  # (B,N,1)
+        cls_loss_per_class = cls_loss_per_class * anchor_weight
 
-        # 正樣本 1.0，負樣本 0.1 （你可以依需要調）
-        neg_weight = 0.5
-        weights = pos_mask_f * 1.0 + (1.0 - pos_mask_f) * neg_weight  # (B, N)
+        # 對類別 sum → (B, N)，再 sum → scalar
+        cls_loss_per_anchor = tf.reduce_sum(cls_loss_per_class, axis=-1)      # (B,N)
+        loss_cls_cond = tf.reduce_sum(cls_loss_per_anchor) / num_pos_safe
 
-        loss_cls = tf.reduce_sum(cls_loss_per_anchor * weights)
-        loss_cls = lambda_cls * (loss_cls / num_pos_safe)
+        # --------------------------------------------------
+        # 5.3 合併 obj + cls
+        # --------------------------------------------------
+        lambda_obj = 1.0   # 你可以視情況調整這個係數
+        loss_cls = lambda_cls * (loss_cls_cond + lambda_obj * loss_obj)
+
     else:
         loss_cls = tf.constant(0.0, dtype=tf.float32)
+
+
 
     # ----------------------
     # 6) Keypoint Loss（直接對齊 pred_save_model 的 kpt domain）
     # ----------------------
+    # if num_kpt > 0 and kpt_vals > 0:
+    #     kpt_diff = huber_no_reduce(target_kpt_flat, pred_kpt_flat)  # (B, N, K*V)
+    #     loss_kpt = tf.reduce_sum(tf.reduce_mean(kpt_diff, axis=-1) * pos_mask_f)
+    #     loss_kpt = lambda_kpt * (loss_kpt / num_pos_safe)
+    # else:
+    #     loss_kpt = tf.constant(0.0, dtype=tf.float32)
+
+    # ---------- Re Image ------------
     if num_kpt > 0 and kpt_vals > 0:
-        kpt_diff = huber_no_reduce(target_kpt_flat, pred_kpt_flat)  # (B, N, K*V)
-        loss_kpt = tf.reduce_sum(tf.reduce_mean(kpt_diff, axis=-1) * pos_mask_f)
+        # target_kpt_flat, pred_kpt_flat: (B, N, K*V)
+        B = tf.shape(pred_kpt_flat)[0]
+        N = tf.shape(pred_kpt_flat)[1]
+
+        # 回復成 (B, N, K, V)
+        t_kpt = tf.reshape(target_kpt_flat, (B, N, num_kpt, kpt_vals))
+        p_kpt = tf.reshape(pred_kpt_flat, (B, N, num_kpt, kpt_vals))
+
+        # 取得影像尺寸 (假設 config.IMGSZ 是單一邊長，例如 640)
+        img_size = tf.cast(config.IMGSZ, t_kpt.dtype)
+
+        # 只把 x, y 放大到像素座標，v 繼續保留 0~1
+        # t_xy, p_xy: (B, N, K, 2) 單位 = pixel
+        t_xy = t_kpt[..., :2] * img_size
+        p_xy = p_kpt[..., :2] * img_size
+
+        if kpt_vals > 2:
+            # 其餘維度（通常是 visibility）可以維持原本 0~1 domain
+            t_rest = t_kpt[..., 2:]  # (B, N, K, V-2)
+            p_rest = p_kpt[..., 2:]
+
+            # 決定要不要對 v 也做 Huber：
+            # 方案1：也對 v 做 Huber（但不縮放）
+            t_kpt_scaled = tf.concat([t_xy, t_rest], axis=-1)
+            p_kpt_scaled = tf.concat([p_xy, p_rest], axis=-1)
+        else:
+            # 只有 x,y
+            t_kpt_scaled = t_xy      # (B, N, K, 2)
+            p_kpt_scaled = p_xy
+
+        # 在像素座標 (以及 v) 上算 Huber，不做 reduce
+        kpt_diff = huber_no_reduce(t_kpt_scaled, p_kpt_scaled)  # (B, N, K, ?)
+
+        # 攤回 (B, N, K*?)
+        kpt_diff = tf.reshape(kpt_diff, (B, N, -1))             # (B, N, K*V')
+
+        # 先在最後一維平均 → 每個 anchor 一個 scalar loss
+        per_anchor_kpt = tf.reduce_mean(kpt_diff, axis=-1)      # (B, N)
+
+        # 只對正樣本 anchor 做 keypoint loss
+        loss_kpt = tf.reduce_sum(per_anchor_kpt * pos_mask_f)   # scalar
+
+        # 做正樣本數量的平均、加上權重
         loss_kpt = lambda_kpt * (loss_kpt / num_pos_safe)
     else:
         loss_kpt = tf.constant(0.0, dtype=tf.float32)
+
+
 
     # ----------------------
     # 7) Total
