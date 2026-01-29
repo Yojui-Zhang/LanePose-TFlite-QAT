@@ -570,59 +570,74 @@ def pose_loss_from_labels(
     # ----------------------
     # 6) Keypoint Loss（直接對齊 pred_save_model 的 kpt domain）
     # ----------------------
-    # if num_kpt > 0 and kpt_vals > 0:
-    #     kpt_diff = huber_no_reduce(target_kpt_flat, pred_kpt_flat)  # (B, N, K*V)
-    #     loss_kpt = tf.reduce_sum(tf.reduce_mean(kpt_diff, axis=-1) * pos_mask_f)
-    #     loss_kpt = lambda_kpt * (loss_kpt / num_pos_safe)
-    # else:
-    #     loss_kpt = tf.constant(0.0, dtype=tf.float32)
 
-    # ---------- Re Image ------------
     if num_kpt > 0 and kpt_vals > 0:
         # target_kpt_flat, pred_kpt_flat: (B, N, K*V)
         B = tf.shape(pred_kpt_flat)[0]
         N = tf.shape(pred_kpt_flat)[1]
 
-        # 回復成 (B, N, K, V)
+        # 1. 回復成 (B, N, K, V)
         t_kpt = tf.reshape(target_kpt_flat, (B, N, num_kpt, kpt_vals))
         p_kpt = tf.reshape(pred_kpt_flat, (B, N, num_kpt, kpt_vals))
-
-        # 取得影像尺寸 (假設 config.IMGSZ 是單一邊長，例如 640)
+        
+        # 取得影像尺寸
         img_size = tf.cast(config.IMGSZ, t_kpt.dtype)
 
-        # 只把 x, y 放大到像素座標，v 繼續保留 0~1
-        # t_xy, p_xy: (B, N, K, 2) 單位 = pixel
+        # 2. 拆分座標 (xy) 與 可視度 (v)
+        # 座標放大回 pixel domain
         t_xy = t_kpt[..., :2] * img_size
         p_xy = p_kpt[..., :2] * img_size
-
-        if kpt_vals > 2:
-            # 其餘維度（通常是 visibility）可以維持原本 0~1 domain
-            t_rest = t_kpt[..., 2:]  # (B, N, K, V-2)
-            p_rest = p_kpt[..., 2:]
-
-            # 決定要不要對 v 也做 Huber：
-            # 方案1：也對 v 做 Huber（但不縮放）
-            t_kpt_scaled = tf.concat([t_xy, t_rest], axis=-1)
-            p_kpt_scaled = tf.concat([p_xy, p_rest], axis=-1)
+        
+        # 3. 製作遮罩 (Mask)
+        if kpt_vals >= 3:
+            # 取出 ground truth 的 visibility (假設第 3 維是 v)
+            t_vis = t_kpt[..., 2:3]  # (B, N, K, 1)
+            
+            # ★ 關鍵修正：只有 v > 0 的點，才計算座標誤差 ★
+            # 對於類別 2-6 (v=0)，這個 mask 會是 0，座標 loss 直接歸零
+            mask_xy = tf.cast(t_vis > 0.0, dtype=t_kpt.dtype)
+            
+            # 取出 v 的部分 (0~1)，這部分還是要算 loss (為了讓模型學會預測 v=0)
+            t_v = t_kpt[..., 2:]
+            p_v = p_kpt[..., 2:]
         else:
-            # 只有 x,y
-            t_kpt_scaled = t_xy      # (B, N, K, 2)
-            p_kpt_scaled = p_xy
+            # 如果只有 x,y 沒有 v，就全算
+            mask_xy = tf.ones_like(t_xy[..., 0:1])
+            t_v = None
+            p_v = None
 
-        # 在像素座標 (以及 v) 上算 Huber，不做 reduce
-        kpt_diff = huber_no_reduce(t_kpt_scaled, p_kpt_scaled)  # (B, N, K, ?)
+        # 4. 計算座標 Loss (Pixel Huber)
+        diff_xy = huber_no_reduce(t_xy, p_xy)   # (B, N, K, 2)
+        loss_xy = diff_xy * mask_xy             # ★ 乘上遮罩
+        
+        # 5. 計算 Visibility Loss (如果有 v)
+        if t_v is not None:
+            # v 也在 0~1 之間，可以用 Huber 或 BCE
+            # 這裡用 Huber 保持一致性，且不乘 mask (因為要學會預測 invisible)
+            diff_v = huber_no_reduce(t_v, p_v)  # (B, N, K, V-2)
+            loss_v = diff_v
+            
+            # 合併 loss: xy 和 v 加在一起
+            # loss_xy 是 (B, N, K, 2), loss_v 是 (B, N, K, 1)
+            # 先各自 sum 掉最後一維
+            loss_xy_sum = tf.reduce_sum(loss_xy, axis=-1) # (B, N, K)
+            loss_v_sum  = tf.reduce_sum(loss_v, axis=-1)  # (B, N, K)
+            
+            total_kpt_loss = loss_xy_sum + loss_v_sum     # (B, N, K)
+        else:
+            total_kpt_loss = tf.reduce_sum(loss_xy, axis=-1) # (B, N, K)
 
-        # 攤回 (B, N, K*?)
-        kpt_diff = tf.reshape(kpt_diff, (B, N, -1))             # (B, N, K*V')
-
-        # 先在最後一維平均 → 每個 anchor 一個 scalar loss
-        per_anchor_kpt = tf.reduce_mean(kpt_diff, axis=-1)      # (B, N)
+        # 6. 平均與加權
+        # 對 Keypoints 維度取平均 -> (B, N)
+        # 註：這裡分母還是 K，這樣對於只有少數點可見的物件，loss 會比較小，這符合直覺
+        per_anchor_kpt = tf.reduce_mean(total_kpt_loss, axis=-1)
 
         # 只對正樣本 anchor 做 keypoint loss
         loss_kpt = tf.reduce_sum(per_anchor_kpt * pos_mask_f)   # scalar
 
         # 做正樣本數量的平均、加上權重
         loss_kpt = lambda_kpt * (loss_kpt / num_pos_safe)
+        
     else:
         loss_kpt = tf.constant(0.0, dtype=tf.float32)
 
