@@ -251,13 +251,16 @@ class ChannelAttention(L.Layer):
     def __init__(self, ratio=16, **kw):
         super().__init__(**kw)
         self.ratio = int(ratio)
-        self.mlp1 = L.Conv2D(None, 1)  # 佔位，build 時根據輸入通道設置
-        self.mlp2 = L.Conv2D(None, 1)
+        # 修正：不要在這裡實例化 Conv2D(None, ...)，這是導致 KeyError: 'name' 的元兇
+        self.mlp1 = None
+        self.mlp2 = None
 
     def build(self, input_shape):
         C = int(input_shape[-1])
+        # 在這裡正確實例化
         self.mlp1 = L.Conv2D(C // self.ratio, 1, activation="relu", use_bias=True, name=f"{self.name}/mlp1")
         self.mlp2 = L.Conv2D(C,              1, activation=None,   use_bias=True, name=f"{self.name}/mlp2")
+        super().build(input_shape) # 建議調用父類 build
 
     def call(self, x):
         avg = L.GlobalAveragePooling2D(keepdims=True, name=f"{self.name}/gap")(x)
@@ -265,13 +268,14 @@ class ChannelAttention(L.Layer):
         avg = self.mlp2(self.mlp1(avg))
         mx  = self.mlp2(self.mlp1(mx))
         
-        # 修正：使用 Keras Layer
         sum_feat = L.Add(name=f"{self.name}/add")([avg, mx])
         scale = L.Activation('sigmoid', name=f"{self.name}/sigmoid")(sum_feat)
         return L.Multiply(name=f"{self.name}/scale")([x, scale])
 
     def get_config(self):
-        cfg = super().get_config(); cfg.update({"ratio": self.ratio}); return cfg
+        cfg = super().get_config()
+        cfg.update({"ratio": self.ratio})
+        return cfg
 
 @tf.keras.utils.register_keras_serializable(package="QAT")
 class SpatialAttention(L.Layer):
@@ -298,11 +302,22 @@ class SpatialAttention(L.Layer):
 class CBAM(L.Layer):
     def __init__(self, ratio=16, kernel_size=7, **kw):
         super().__init__(**kw)
+        self.ratio = ratio
+        self.kernel_size = kernel_size
         self.ca = ChannelAttention(ratio=ratio, name=f"{self.name}/ca")
         self.sa = SpatialAttention(kernel_size=kernel_size, name=f"{self.name}/sa")
 
     def call(self, x):
         return self.sa(self.ca(x))
+
+    # 新增：必須實現 get_config
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "ratio": self.ratio,
+            "kernel_size": self.kernel_size
+        })
+        return cfg
 # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
 # 新增：Ultralytics 相容的 YOLOv8-Pose Head（兩分支輸出）
 class U8PoseCompatHead(tf.keras.layers.Layer):
@@ -312,11 +327,12 @@ class U8PoseCompatHead(tf.keras.layers.Layer):
         self.nk = int(num_kpt)
         self.kv = int(kpt_vals)
         self.reg_max = int(reg_max)
-        self.no = self.nc + (4 if not config.USE_DFL else 4 * self.reg_max)  # <-- Ultralytics: cls + DFL(4*reg_max)
+        self.ch = int(ch) # 保存 ch 以便序列化
 
-        # 你原本的三塔結構（可直接重用）
+        self.no = self.nc + (4 if not config.USE_DFL else 4 * self.reg_max)
+
         def tower(prefix):
-            return [
+             return [
                 L.Conv2D(ch, 3, padding='same', use_bias=False, name=f'{prefix}.0/conv'),
                 L.BatchNormalization(name=f'{prefix}.0/bn'),
                 L.ReLU(max_value=6.0, name=f'{prefix}.0/relu6'),
@@ -330,7 +346,6 @@ class U8PoseCompatHead(tf.keras.layers.Layer):
         self.twr_kpt = [tower('head.kpt.p3'), tower('head.kpt.p4'), tower('head.kpt.p5')]
 
         box_ch = (4 if not config.USE_DFL else 4 * self.reg_max)
-        # 最終 1x1 輸出層
         self.out_reg = [
             L.Conv2D(box_ch, 1, name='head.regout.p3'),
             L.Conv2D(box_ch, 1, name='head.regout.p4'),
@@ -380,6 +395,17 @@ class U8PoseCompatHead(tf.keras.layers.Layer):
 
         # 回傳格式與 Ultralytics 一致： (feats_list, kpts_list)
         return feats_out, kpts_out
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "num_cls": self.nc,
+            "num_kpt": self.nk,
+            "kpt_vals": self.kv,
+            "reg_max": self.reg_max,
+            "ch": self.ch
+        })
+
 # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
 
 
@@ -408,21 +434,24 @@ def build_u8s_pose_dual(
 
     x5 = dw_conv_bn_act(x4, ch(64), k=3, s=2, name='DWConv_5')                              # 1/16
     x6 = repvgg_block(x5, ch(64), k=3, s=1, use_se=True, name='RepVGG_6', act='relu6')
-    # x7 = CBAM(ratio=16, kernel_size=7, name="CBAM_7")(x6)
+    x6 = repvgg_block(x6, ch(64), k=3, s=1, use_se=True, name='RepVGG_6', act='relu6')
+    x7 = CBAM(ratio=16, kernel_size=7, name="CBAM_7")(x6)
 
-    x8 = dw_conv_bn_act(x6, ch(128), k=3, s=2, name='DWConv_8')                             # 1/32
+    x8 = dw_conv_bn_act(x7, ch(128), k=3, s=2, name='DWConv_8')                             # 1/32
     x9 = repvgg_block(x8, ch(128), k=3, s=1, use_se=True, name='RepVGG_9', act='relu6')
-    # x10 = CBAM(ratio=16, kernel_size=7, name="CBAM_10")(x9)
+    x9 = repvgg_block(x9, ch(128), k=3, s=1, use_se=True, name='RepVGG_9', act='relu6')
+    x9 = repvgg_block(x9, ch(128), k=3, s=1, use_se=True, name='RepVGG_9', act='relu6')
+    x10 = CBAM(ratio=16, kernel_size=7, name="CBAM_10")(x9)
 
-    x11 = sppf_block(x9, ch(128), name='SPPF_11')
+    x11 = sppf_block(x10, ch(128), name='SPPF_11')
 
     # Neck
     x12   = L.UpSampling2D(size=(2,2), name='UP_12')(x11)                                   # 1/16
     x13   = L.Concatenate(axis=-1, name='cat_13')([x12, x6])
     x14   = repvgg_block(x13, ch(64), k=3, s=1, name='RepVGG_14', act='LeakyRelu')
-    # x15   = CBAM(ratio=16, kernel_size=7, name="CBAM_15")(x14)
+    x15   = CBAM(ratio=16, kernel_size=7, name="CBAM_15")(x14)
 
-    x16   = L.UpSampling2D(size=(2,2), name='UP_16')(x14)                                   # 1/8
+    x16   = L.UpSampling2D(size=(2,2), name='UP_16')(x15)                                   # 1/8
     x17   = L.Concatenate(axis=-1, name='cat_17')([x16, x4])
     x18   = repvgg_block(x17, ch(32), k=3, s=1, name='RepVGG_18', act='LeakyRelu')
 
