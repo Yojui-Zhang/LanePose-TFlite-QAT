@@ -428,20 +428,27 @@ def build_u8s_pose_dual(
 
     x1 = dw_conv_bn_act(x0, ch(16), k=3, s=2, name='DWConv_1')                              # 1/4
     x2 = repvgg_block(x1, ch(16), k=3, s=1, use_se=True, name='RepVGG_2', act='relu6')
+    # x2 = SpatialAttention(kernel_size=7, name="SA_2")(x2)
 
     x3 = dw_conv_bn_act(x2, ch(32), k=3, s=2, name='DWConv_3')                              # 1/8
     x4 = repvgg_block(x3, ch(32), k=3, s=1, use_se=True, name='RepVGG_4', act='relu6')
+    # x4 = SpatialAttention(kernel_size=7, name="SA_4")(x4)
 
     x5 = dw_conv_bn_act(x4, ch(64), k=3, s=2, name='DWConv_5')                              # 1/16
     x6 = repvgg_block(x5, ch(64), k=3, s=1, use_se=True, name='RepVGG_6', act='relu6')
-    x6 = repvgg_block(x6, ch(64), k=3, s=1, use_se=True, name='RepVGG_6', act='relu6')
-    x7 = CBAM(ratio=16, kernel_size=7, name="CBAM_7")(x6)
-
+    x6 = SpatialAttention(kernel_size=7, name="SA_6")(x6)
+    x7 = repvgg_block(x6, ch(64), k=3, s=1, use_se=True, name='RepVGG_7', act='relu6')
+    x7 = SpatialAttention(kernel_size=7, name="SA_7")(x7)
+    # x7 = CBAM(ratio=16, kernel_size=7, name="CBAM_7")(x6)
+    
     x8 = dw_conv_bn_act(x7, ch(128), k=3, s=2, name='DWConv_8')                             # 1/32
-    x9 = repvgg_block(x8, ch(128), k=3, s=1, use_se=True, name='RepVGG_9', act='relu6')
-    x9 = repvgg_block(x9, ch(128), k=3, s=1, use_se=True, name='RepVGG_9', act='relu6')
-    x9 = repvgg_block(x9, ch(128), k=3, s=1, use_se=True, name='RepVGG_9', act='relu6')
-    x10 = CBAM(ratio=16, kernel_size=7, name="CBAM_10")(x9)
+    x9 = repvgg_block(x8, ch(128), k=3, s=1, use_se=True, name='RepVGG_9_1', act='relu6')
+    x9 = SpatialAttention(kernel_size=7, name="SA_9_1")(x9)
+    x9 = repvgg_block(x9, ch(128), k=3, s=1, use_se=True, name='RepVGG_9_2', act='relu6')
+    x9 = SpatialAttention(kernel_size=7, name="SA_9_2")(x9)
+    x9 = repvgg_block(x9, ch(128), k=3, s=1, use_se=True, name='RepVGG_9_3', act='relu6')
+    x10 = SpatialAttention(kernel_size=7, name="SA_9_3")(x9)
+    # x10 = CBAM(ratio=16, kernel_size=7, name="CBAM_10")(x9)
 
     x11 = sppf_block(x10, ch(128), name='SPPF_11')
 
@@ -449,11 +456,13 @@ def build_u8s_pose_dual(
     x12   = L.UpSampling2D(size=(2,2), name='UP_12')(x11)                                   # 1/16
     x13   = L.Concatenate(axis=-1, name='cat_13')([x12, x6])
     x14   = repvgg_block(x13, ch(64), k=3, s=1, name='RepVGG_14', act='LeakyRelu')
-    x15   = CBAM(ratio=16, kernel_size=7, name="CBAM_15")(x14)
+    x15 = SpatialAttention(kernel_size=7, name="SA_15")(x14)
+    # x15   = CBAM(ratio=16, kernel_size=7, name="CBAM_15")(x14)
 
     x16   = L.UpSampling2D(size=(2,2), name='UP_16')(x15)                                   # 1/8
     x17   = L.Concatenate(axis=-1, name='cat_17')([x16, x4])
     x18   = repvgg_block(x17, ch(32), k=3, s=1, name='RepVGG_18', act='LeakyRelu')
+    x19 = SpatialAttention(kernel_size=7, name="SA_19")(x18)
 
     # x19   = L.UpSampling2D(size=(2,2), name='UP_19')(x18)                                   # 1/4
     # x20   = L.Concatenate(axis=-1, name='cat_20')([x19, x2])
@@ -461,10 +470,10 @@ def build_u8s_pose_dual(
 
     # feats = (p3, p4, p5)  # 一定要這個順序！
     head_kd = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="kd_head", apply_sigmoid=False)
-    kd_preds = head_kd((x18, x14, x9))
+    kd_preds = head_kd((x19, x15, x11))
 
     head_dep = TeacherCompatHead(num_cls=config.NUM_CLS, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS, name="deploy_head", apply_sigmoid=False)
-    deploy_preds = head_dep((x18, x14, x9))   
+    deploy_preds = head_dep((x19, x15, x11))   
 
     return K.Model(inp, [deploy_preds, kd_preds], name='u8s_pose_keras_dual')
 
