@@ -183,9 +183,9 @@ def pose_loss_from_labels(
     num_cls=1,
     num_kpt=17,
     kpt_vals=3,
-    lambda_box=7.0,
-    lambda_cls=7.0,
-    lambda_kpt=14.0,
+    lambda_box=10.0,
+    lambda_cls=10.0,
+    lambda_kpt=1.0,
     class_weights=None,
 ):
     """
@@ -430,7 +430,9 @@ def pose_loss_from_labels(
 
     # 4.4 組合成單一 box loss
     alpha = 0.25  # Huber 權重（超參數，可調）
-    per_anchor_box = (ciou_loss + alpha * box_huber) * box_scale   # (B, N)
+    # per_anchor_box = (ciou_loss + alpha * box_huber) * box_scale   # (B, N)
+    per_anchor_box = ciou_loss * box_scale
+
 
     # 只對正樣本 anchor 做 box loss
     loss_box = tf.reduce_sum(per_anchor_box * pos_mask_f)      # scalar
@@ -585,8 +587,10 @@ def pose_loss_from_labels(
 
         # 2. 拆分座標 (xy) 與 可視度 (v)
         # 座標放大回 pixel domain
-        t_xy = t_kpt[..., :2] * img_size
-        p_xy = p_kpt[..., :2] * img_size
+        # t_xy = t_kpt[..., :2] * img_size
+        # p_xy = p_kpt[..., :2] * img_size
+        t_xy = t_kpt[..., :2] 
+        p_xy = p_kpt[..., :2]
         
         # 3. 製作遮罩 (Mask)
         if kpt_vals >= 3:
@@ -607,35 +611,39 @@ def pose_loss_from_labels(
             p_v = None
 
         # 4. 計算座標 Loss (Pixel Huber)
-        diff_xy = huber_no_reduce(t_xy, p_xy)   # (B, N, K, 2)
-        loss_xy = diff_xy * mask_xy             # ★ 乘上遮罩
+        kpt_loss_factor = 1.0  # 如果發現學習太慢，可以設為 10.0 或更大
         
-        # 5. 計算 Visibility Loss (如果有 v)
+        diff_xy = tf.abs(t_xy - p_xy) * kpt_loss_factor # L1 Loss
+        # 或者維持 Huber 但 delta 設很小
+        # diff_xy = huber_no_reduce(t_xy, p_xy, delta=0.01) 
+
+        loss_xy = diff_xy * mask_xy 
+        
         if t_v is not None:
-            # v 也在 0~1 之間，可以用 Huber 或 BCE
-            # 這裡用 Huber 保持一致性，且不乘 mask (因為要學會預測 invisible)
-            diff_v = huber_no_reduce(t_v, p_v)  # (B, N, K, V-2)
+            diff_v = huber_no_reduce(t_v, p_v) # Visibility 維持 Huber
             loss_v = diff_v
-            
-            # 合併 loss: xy 和 v 加在一起
-            # loss_xy 是 (B, N, K, 2), loss_v 是 (B, N, K, 1)
-            # 先各自 sum 掉最後一維
-            loss_xy_sum = tf.reduce_sum(loss_xy, axis=-1) # (B, N, K)
-            loss_v_sum  = tf.reduce_sum(loss_v, axis=-1)  # (B, N, K)
-            
-            total_kpt_loss = loss_xy_sum + loss_v_sum     # (B, N, K)
+            loss_xy_sum = tf.reduce_sum(loss_xy, axis=-1)
+            loss_v_sum  = tf.reduce_sum(loss_v, axis=-1)
+            total_kpt_loss = loss_xy_sum + loss_v_sum
         else:
-            total_kpt_loss = tf.reduce_sum(loss_xy, axis=-1) # (B, N, K)
+            total_kpt_loss = tf.reduce_sum(loss_xy, axis=-1)
 
-        # 6. 平均與加權
-        # 對 Keypoints 維度取平均 -> (B, N)
-        # 註：這裡分母還是 K，這樣對於只有少數點可見的物件，loss 會比較小，這符合直覺
         per_anchor_kpt = tf.reduce_mean(total_kpt_loss, axis=-1)
-
-        # 只對正樣本 anchor 做 keypoint loss
-        loss_kpt = tf.reduce_sum(per_anchor_kpt * pos_mask_f)   # scalar
-
-        # 做正樣本數量的平均、加上權重
+        loss_kpt = tf.reduce_sum(per_anchor_kpt * pos_mask_f)
+        
+        # 關鍵：因為我們去掉了 * img_size，Loss 數值會變很小 (0.xx)。
+        # 你原本 lambda_kpt=14.0 是針對 Pixel Loss (數值~100) 設計的。
+        # 現在 Loss 數值變小了 ~600 倍 (假設 img=640)。
+        # 所以你需要補償放大 lambda，或者接受較小的 Loss。
+        # 建議：把外面的 lambda_kpt 改大，或者在這裡乘上 img_size 的比例。
+        
+        # 這裡我們做一個動態補償，讓 Loss 數值回到人類可讀範圍，但梯度不會爆炸
+        # 實際上，通常 Normalize 後 lambda 設為 0.1~0.5 左右 (YOLOv8)，
+        # 但因為你原本用 Huber(Pixel)，現在改 L1(Norm)，建議先乘上一個常數試試。
+        
+        scale_compensation = 640.0 # 補償原本的像素尺度
+        loss_kpt = loss_kpt * scale_compensation
+        
         loss_kpt = lambda_kpt * (loss_kpt / num_pos_safe)
         
     else:
