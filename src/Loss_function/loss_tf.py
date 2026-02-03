@@ -62,6 +62,40 @@ def bbox_ciou(pred_box, target_box, eps=1e-7):
 
     return 1.0 - ciou   # 當成 loss
 
+
+def bbox_iou_pair(pred_box, target_box, eps=1e-7):
+    """
+    pred_box, target_box: (B, N, 4)  [cx, cy, w, h]，皆為 0~1
+    回傳: (B, N) 的 IoU (0~1)
+    """
+    px, py, pw, ph = tf.unstack(pred_box, axis=-1)
+    gx, gy, gw, gh = tf.unstack(target_box, axis=-1)
+
+    px1 = px - pw / 2.0
+    py1 = py - ph / 2.0
+    px2 = px + pw / 2.0
+    py2 = py + ph / 2.0
+
+    gx1 = gx - gw / 2.0
+    gy1 = gy - gh / 2.0
+    gx2 = gx + gw / 2.0
+    gy2 = gy + gh / 2.0
+
+    inter_x1 = tf.maximum(px1, gx1)
+    inter_y1 = tf.maximum(py1, gy1)
+    inter_x2 = tf.minimum(px2, gx2)
+    inter_y2 = tf.minimum(py2, gy2)
+
+    inter_w = tf.maximum(0.0, inter_x2 - inter_x1)
+    inter_h = tf.maximum(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_p = tf.maximum(pw * ph, 0.0)
+    area_g = tf.maximum(gw * gh, 0.0)
+    union = area_p + area_g - inter_area
+    iou = inter_area / (union + eps)
+    return tf.clip_by_value(iou, 0.0, 1.0)
+
 def iou_batch(bboxes1, bboxes2):
     """
     計算 IoU (Intersection over Union)
@@ -481,87 +515,77 @@ def pose_loss_from_labels(
     #     loss_cls = tf.constant(0.0, dtype=tf.float32)
     
     # ------------------
-    
+    # 5) Class & Objectness Loss（只改 loss；不改 head/assigner）
+    #   - 修正 implicit objectness: 使用 Noisy-OR，避免 sum 後 clip 飽和造成梯度消失
+    #   - Class loss 只在正樣本上做（背景主要由 obj_loss 來抑制）
+    #   - 針對正樣本，用 IoU 作為 quality target（類 QFL / VFL 思路），提升 mAP 可比性
+    # ------------------
+
     if num_cls > 0:
-        # 先把 target_cls 攤平成 (B, N)
+        # target_cls: (B, N)
         if len(target_cls.shape) == 3:
             target_cls = tf.squeeze(target_cls, -1)
-        target_cls = tf.cast(target_cls, tf.int32)      # (B, N)
+        target_cls = tf.cast(target_cls, tf.int32)
 
-        # one-hot → (B, N, num_cls)，只對正樣本 anchor 有有效 label
-        t_cls_onehot = tf.one_hot(target_cls, depth=num_cls,
-                                  dtype=pred_cls_logit.dtype)  # (B, N, C)
-        pos_mask_exp = tf.expand_dims(pos_mask_f, -1)          # (B, N, 1)
-        t_cls_onehot = t_cls_onehot * pos_mask_exp             # 負樣本的 one-hot 全 0
+        # one-hot label（只對正樣本有效）
+        t_cls_onehot = tf.one_hot(target_cls, depth=num_cls, dtype=pred_cls_logit.dtype)  # (B,N,C)
+        pos_mask_exp = tf.expand_dims(pos_mask_f, -1)                                     # (B,N,1)
+        t_cls_onehot = t_cls_onehot * pos_mask_exp
 
-        # 預測機率 (B, N, C)
-        p_cls = pred_cls_prob
+        # 預測機率（注意：這裡沿用你原本的 pred_cls_prob，不更動 decode）
+        p_cls = tf.clip_by_value(pred_cls_prob, 0.0, 1.0)
         eps = 1e-6
 
         # --------------------------------------------------
-        # 5.1 隱式 Objectness Loss：p_obj = Σ_c p_cls,c
+        # 5.1 Implicit Objectness (stable)
+        #    noisy-or: p_obj = 1 - Π(1 - p_cls)
         # --------------------------------------------------
-        # p_obj 代表「這個 anchor 有物件」的機率：所有類別機率加總，clamp 到 [0,1]
-        p_obj = tf.reduce_sum(p_cls, axis=-1)           # (B, N)
-        p_obj = tf.clip_by_value(p_obj, 0.0, 1.0)
+        p_obj = 1.0 - tf.reduce_prod(1.0 - p_cls + eps, axis=-1)  # (B,N)
+        p_obj = tf.clip_by_value(p_obj, eps, 1.0 - eps)
 
-        t_obj = pos_mask_f                              # (B, N)，有物件就 1，背景 0
+        t_obj = pos_mask_f  # (B,N)
 
-        # BCE on objectness
-        obj_ce = - (t_obj * tf.math.log(p_obj + eps) +
-                    (1.0 - t_obj) * tf.math.log(1.0 - p_obj + eps))   # (B, N)
+        obj_ce = -(t_obj * tf.math.log(p_obj) + (1.0 - t_obj) * tf.math.log(1.0 - p_obj))
 
-        # Focal-like weight for objectness
         gamma_obj = 2.0
-        pt_obj = t_obj * p_obj + (1.0 - t_obj) * (1.0 - p_obj)        # (B, N)
+        pt_obj = t_obj * p_obj + (1.0 - t_obj) * (1.0 - p_obj)
         focal_w_obj = tf.pow(1.0 - pt_obj, gamma_obj)
 
         loss_obj = tf.reduce_sum(obj_ce * focal_w_obj) / num_pos_safe
 
         # --------------------------------------------------
-        # 5.2 Conditional Class Loss：只在正樣本上做 Focal BCE
+        # 5.2 Quality-aware Class Loss (pos only)
+        #    用 IoU 當成正樣本的 soft target（0~1），提高分類與定位對齊
         # --------------------------------------------------
-        z = t_cls_onehot                                     # (B, N, C)
-        x = pred_cls_logit                                   # (B, N, C)
-        p = p_cls                                            # sigmoid(x)
+        iou_q = bbox_iou_pair(pred_box, target_box)              # (B,N)
+        iou_q = tf.stop_gradient(iou_q) * pos_mask_f             # 只讓它當 target，不回傳梯度
+        t_cls_quality = t_cls_onehot * tf.expand_dims(iou_q, -1) # (B,N,C)
 
-        # standard BCE
-        ce_cls = - (z * tf.math.log(p + eps) +
-                    (1.0 - z) * tf.math.log(1.0 - p + eps))  # (B, N, C)
+        # logits 版 BCE（較穩），搭配 QFL-style 權重 |t - p|^gamma
+        x = pred_cls_logit
+        p = tf.clip_by_value(p_cls, eps, 1.0 - eps)
 
-        # focal weight：對正樣本較高，避免少樣本被 easy negative 淹沒
+        bce = tf.nn.sigmoid_cross_entropy_with_logits(labels=t_cls_quality, logits=x)  # (B,N,C)
+
         gamma_cls = 2.0
-        # pt = p if z=1 else 1-p
-        pt = z * p + (1.0 - z) * (1.0 - p)
-        alpha_pos = 0.75
-        alpha_neg = 0.25
-        alpha_factor = alpha_pos * z + alpha_neg * (1.0 - z)
+        qfl_w = tf.pow(tf.abs(t_cls_quality - p), gamma_cls)                           # (B,N,C)
+        cls_loss_per_class = bce * qfl_w
 
-        focal_w_cls = alpha_factor * tf.pow(1.0 - pt, gamma_cls)
-
-        cls_loss_per_class = ce_cls * focal_w_cls          # (B, N, C)
-
-        # 類別權重（針對少樣本類別可加大權重）
+        # 類別權重（可選）
         if class_weights is not None:
-            cw = tf.convert_to_tensor(class_weights,
-                                      dtype=cls_loss_per_class.dtype)  # (C,)
-            cw = tf.reshape(cw, [1, 1, num_cls])                        # (1,1,C)
+            cw = tf.convert_to_tensor(class_weights, dtype=cls_loss_per_class.dtype)  # (C,)
+            cw = tf.reshape(cw, [1, 1, num_cls])                                       # (1,1,C)
             cls_loss_per_class = cls_loss_per_class * cw
 
-        # 把負樣本的 class loss 壓得更低（主要靠 obj_loss 處理背景）
-        # pos: 1.0, neg: small
-        neg_cls_weight = 0.5
-        anchor_weight = pos_mask_exp + (1.0 - pos_mask_exp) * neg_cls_weight  # (B,N,1)
-        cls_loss_per_class = cls_loss_per_class * anchor_weight
+        # 僅正樣本 anchor 參與 class loss（neg 交給 obj_loss）
+        cls_loss_per_class = cls_loss_per_class * pos_mask_exp
 
-        # 對類別 sum → (B, N)，再 sum → scalar
-        cls_loss_per_anchor = tf.reduce_sum(cls_loss_per_class, axis=-1)      # (B,N)
-        loss_cls_cond = tf.reduce_sum(cls_loss_per_anchor) / num_pos_safe
+        loss_cls_cond = tf.reduce_sum(cls_loss_per_class) / num_pos_safe
 
         # --------------------------------------------------
         # 5.3 合併 obj + cls
         # --------------------------------------------------
-        lambda_obj = 1.0   # 你可以視情況調整這個係數
+        lambda_obj = 1.0
         loss_cls = lambda_cls * (loss_cls_cond + lambda_obj * loss_obj)
 
     else:
@@ -570,84 +594,92 @@ def pose_loss_from_labels(
 
 
     # ----------------------
-    # 6) Keypoint Loss（直接對齊 pred_save_model 的 kpt domain）
+    # 6) Keypoint Loss（OKS + visibility BCE；只改 loss，不動 head）
+    #   - 移除 640 倍 scale_compensation，避免 kpt loss 壓死 obj/cls
+    #   - 以 OKS (scale-aware) 計算座標誤差：小物件更嚴格、大物件更寬容
     # ----------------------
 
     if num_kpt > 0 and kpt_vals > 0:
-        # target_kpt_flat, pred_kpt_flat: (B, N, K*V)
         B = tf.shape(pred_kpt_flat)[0]
         N = tf.shape(pred_kpt_flat)[1]
 
-        # 1. 回復成 (B, N, K, V)
         t_kpt = tf.reshape(target_kpt_flat, (B, N, num_kpt, kpt_vals))
-        p_kpt = tf.reshape(pred_kpt_flat, (B, N, num_kpt, kpt_vals))
-        
-        # 取得影像尺寸
-        img_size = tf.cast(config.IMGSZ, t_kpt.dtype)
+        p_kpt = tf.reshape(pred_kpt_flat,   (B, N, num_kpt, kpt_vals))
 
-        # 2. 拆分座標 (xy) 與 可視度 (v)
-        # 座標放大回 pixel domain
-        # t_xy = t_kpt[..., :2] * img_size
-        # p_xy = p_kpt[..., :2] * img_size
-        t_xy = t_kpt[..., :2] 
-        p_xy = p_kpt[..., :2]
-        
-        # 3. 製作遮罩 (Mask)
-        if kpt_vals >= 3:
-            # 取出 ground truth 的 visibility (假設第 3 維是 v)
-            t_vis = t_kpt[..., 2:3]  # (B, N, K, 1)
-            
-            # ★ 關鍵修正：只有 v > 0 的點，才計算座標誤差 ★
-            # 對於類別 2-6 (v=0)，這個 mask 會是 0，座標 loss 直接歸零
-            mask_xy = tf.cast(t_vis > 0.0, dtype=t_kpt.dtype)
-            
-            # 取出 v 的部分 (0~1)，這部分還是要算 loss (為了讓模型學會預測 v=0)
-            t_v = t_kpt[..., 2:]
-            p_v = p_kpt[..., 2:]
+        # 影像尺寸（支援 int 或 (H,W)）
+        imgsz = config.IMGSZ
+        if isinstance(imgsz, (tuple, list)):
+            H, W = imgsz
         else:
-            # 如果只有 x,y 沒有 v，就全算
-            mask_xy = tf.ones_like(t_xy[..., 0:1])
+            H = W = imgsz
+        H = tf.cast(H, t_kpt.dtype)
+        W = tf.cast(W, t_kpt.dtype)
+
+        # xy (normalized 0~1) -> pixel
+        t_xy = t_kpt[..., :2]
+        p_xy = p_kpt[..., :2]
+        scale_xy = tf.reshape(tf.stack([W, H]), (1, 1, 1, 2))
+        t_xy_px = t_xy * scale_xy
+        p_xy_px = p_xy * scale_xy
+
+        # visibility mask
+        if kpt_vals >= 3:
+            t_vis_raw = t_kpt[..., 2]                                # (B,N,K)
+            vis_mask  = tf.cast(t_vis_raw > 0.0, dtype=t_kpt.dtype)  # v>0 才算座標
+            t_v = tf.cast(t_vis_raw > 0.0, dtype=t_kpt.dtype)        # 目標：可見=1，不可見=0
+            p_v = p_kpt[..., 2]                                      # (B,N,K)
+        else:
+            vis_mask = tf.ones_like(t_xy_px[..., 0])
             t_v = None
             p_v = None
 
-        # 4. 計算座標 Loss (Pixel Huber)
-        kpt_loss_factor = 1.0  # 如果發現學習太慢，可以設為 10.0 或更大
-        
-        diff_xy = tf.abs(t_xy - p_xy) * kpt_loss_factor # L1 Loss
-        # 或者維持 Huber 但 delta 設很小
-        # diff_xy = huber_no_reduce(t_xy, p_xy, delta=0.01) 
+        # squared distance in pixel
+        d2 = tf.reduce_sum(tf.square(t_xy_px - p_xy_px), axis=-1)     # (B,N,K)
 
-        loss_xy = diff_xy * mask_xy 
-        
-        if t_v is not None:
-            diff_v = huber_no_reduce(t_v, p_v) # Visibility 維持 Huber
-            loss_v = diff_v
-            loss_xy_sum = tf.reduce_sum(loss_xy, axis=-1)
-            loss_v_sum  = tf.reduce_sum(loss_v, axis=-1)
-            total_kpt_loss = loss_xy_sum + loss_v_sum
+        # object area in pixel (B,N)
+        area_px = (target_box[..., 2] * W) * (target_box[..., 3] * H)
+        area_px = tf.maximum(area_px, 1.0)
+        area_px = tf.expand_dims(area_px, axis=-1)                    # (B,N,1)
+
+        # COCO keypoint sigmas (17)；若 K!=17 則用統一 sigma
+        if num_kpt == 17:
+            sigmas = tf.constant(
+                [0.26, 0.25, 0.25, 0.35, 0.35, 0.79, 0.79, 0.72, 0.72,
+                 0.62, 0.62, 1.07, 1.07, 0.87, 0.87, 0.89, 0.89],
+                dtype=t_kpt.dtype
+            ) / 10.0
         else:
-            total_kpt_loss = tf.reduce_sum(loss_xy, axis=-1)
+            sigmas = tf.fill([num_kpt], tf.cast(0.05, t_kpt.dtype))
 
-        per_anchor_kpt = tf.reduce_mean(total_kpt_loss, axis=-1)
-        loss_kpt = tf.reduce_sum(per_anchor_kpt * pos_mask_f)
-        
-        # 關鍵：因為我們去掉了 * img_size，Loss 數值會變很小 (0.xx)。
-        # 你原本 lambda_kpt=14.0 是針對 Pixel Loss (數值~100) 設計的。
-        # 現在 Loss 數值變小了 ~600 倍 (假設 img=640)。
-        # 所以你需要補償放大 lambda，或者接受較小的 Loss。
-        # 建議：把外面的 lambda_kpt 改大，或者在這裡乘上 img_size 的比例。
-        
-        # 這裡我們做一個動態補償，讓 Loss 數值回到人類可讀範圍，但梯度不會爆炸
-        # 實際上，通常 Normalize 後 lambda 設為 0.1~0.5 左右 (YOLOv8)，
-        # 但因為你原本用 Huber(Pixel)，現在改 L1(Norm)，建議先乘上一個常數試試。
-        
-        scale_compensation = 640.0 # 補償原本的像素尺度
-        loss_kpt = loss_kpt * scale_compensation
-        
-        loss_kpt = lambda_kpt * (loss_kpt / num_pos_safe)
-        
+        k = 2.0 * sigmas                                              # (K,)
+        k2 = tf.reshape(tf.square(k), (1, 1, num_kpt))                 # (1,1,K)
+
+        eps = tf.cast(1e-6, t_kpt.dtype)
+        denom = 2.0 * area_px * k2 + eps                               # (B,N,K)
+
+        oks_k = tf.exp(-d2 / denom) * vis_mask                         # (B,N,K)
+        oks   = tf.reduce_sum(oks_k, axis=-1) / (tf.reduce_sum(vis_mask, axis=-1) + eps)  # (B,N)
+        oks_loss = 1.0 - oks                                           # (B,N)
+
+        # pos-only
+        loss_xy = tf.reduce_sum(oks_loss * pos_mask_f) / num_pos_safe
+
+        # visibility loss（若有 v）
+        if t_v is not None:
+            p_v = tf.clip_by_value(p_v, eps, 1.0 - eps)
+            v_bce = -(t_v * tf.math.log(p_v) + (1.0 - t_v) * tf.math.log(1.0 - p_v))       # (B,N,K)
+            v_bce = v_bce * tf.expand_dims(pos_mask_f, -1)                                 # pos-only
+            loss_v = tf.reduce_sum(v_bce) / num_pos_safe
+        else:
+            loss_v = tf.constant(0.0, dtype=t_kpt.dtype)
+
+        # 合併（v loss 通常比 xy 小，給一個較小權重）
+        kpt_vis_w = 0.5
+        loss_kpt = lambda_kpt * (loss_xy + kpt_vis_w * loss_v)
+
     else:
         loss_kpt = tf.constant(0.0, dtype=tf.float32)
+
 
 
 
