@@ -2,6 +2,10 @@ import tensorflow as tf
 import numpy as np
 import config
 
+# If True: treat keypoint v=0 as 'unlabeled' and ignore it in BOTH xy and visibility losses.
+# If False: treat v=0 as 'not visible' (will supervise visibility to 0).
+KPT_V0_IS_UNLABELED = getattr(config, 'KPT_V0_IS_UNLABELED', True)
+
 # ==============================================================================
 # Helper Functions
 # ==============================================================================
@@ -622,14 +626,31 @@ def pose_loss_from_labels(
         t_xy_px = t_xy * scale_xy
         p_xy_px = p_xy * scale_xy
 
-        # visibility mask
+        # visibility / label-presence mask
         if kpt_vals >= 3:
-            t_vis_raw = t_kpt[..., 2]                                # (B,N,K)
-            vis_mask  = tf.cast(t_vis_raw > 0.0, dtype=t_kpt.dtype)  # v>0 才算座標
-            t_v = tf.cast(t_vis_raw > 0.0, dtype=t_kpt.dtype)        # 目標：可見=1，不可見=0
-            p_v = p_kpt[..., 2]                                      # (B,N,K)
+            t_vis_raw = t_kpt[..., 2]  # (B,N,K)
+
+            # COCO/Ultralytics convention: v=0 unlabeled, v>0 labeled.
+            # NOTE: many custom datasets only use {0,1}. In that case, v=1 simply means "labeled".
+            vis_labeled = tf.cast(t_vis_raw > 0.0, dtype=t_kpt.dtype)  # (B,N,K)
+
+            # XY (OKS) loss always uses labeled keypoints only
+            vis_mask = vis_labeled
+
+            # Visibility target + mask:
+            # - If v=0 means "unlabeled": ignore v=0 in visibility BCE, supervise labeled kpts to 1.
+            # - Else: supervise v==0 to 0 and v>0 to 1.
+            if KPT_V0_IS_UNLABELED:
+                v_loss_mask = vis_labeled
+                t_v = tf.ones_like(t_vis_raw, dtype=t_kpt.dtype) * vis_labeled
+            else:
+                v_loss_mask = tf.ones_like(vis_labeled, dtype=t_kpt.dtype)
+                t_v = tf.cast(t_vis_raw > 0.0, dtype=t_kpt.dtype)
+
+            p_v = p_kpt[..., 2]  # (B,N,K)
         else:
             vis_mask = tf.ones_like(t_xy_px[..., 0])
+            v_loss_mask = None
             t_v = None
             p_v = None
 
@@ -668,8 +689,16 @@ def pose_loss_from_labels(
         if t_v is not None:
             p_v = tf.clip_by_value(p_v, eps, 1.0 - eps)
             v_bce = -(t_v * tf.math.log(p_v) + (1.0 - t_v) * tf.math.log(1.0 - p_v))       # (B,N,K)
-            v_bce = v_bce * tf.expand_dims(pos_mask_f, -1)                                 # pos-only
-            loss_v = tf.reduce_sum(v_bce) / num_pos_safe
+            # build mask: pos-only, and optionally ignore v=0 (unlabeled)
+            v_mask = tf.expand_dims(pos_mask_f, -1)
+            if v_loss_mask is not None:
+                v_mask = v_mask * v_loss_mask
+
+            v_bce = v_bce * v_mask
+
+            # normalize by number of supervised keypoints (more stable when some samples have no labeled kpts)
+            den_v = tf.reduce_sum(v_mask) + eps
+            loss_v = tf.reduce_sum(v_bce) / den_v
         else:
             loss_v = tf.constant(0.0, dtype=t_kpt.dtype)
 
