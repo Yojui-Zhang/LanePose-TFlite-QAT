@@ -2,6 +2,10 @@ import cv2
 import tensorflow as tf
 import numpy as np
 
+from src.process.preprocess_tf import letterbox_tf
+import config
+
+
 # ---------------------------------------------------
 NUM_CLASSES = 7
 
@@ -28,6 +32,20 @@ CLASS_COLORS = [(0, 0, 255), (255, 0, 0), (0, 255, 255), (255, 0, 255)]
 input_shape = (Image_Size_X, Image_Size_Y) 
 # ---------------------------------------------------
 
+
+@tf.function
+def preprocess_frame_letterbox(frame_rgb_u8):
+    # frame_rgb_u8: uint8 [H,W,3]
+    img = tf.image.convert_image_dtype(frame_rgb_u8, tf.float32)  # -> [0,1]
+    img_lb, meta = letterbox_tf(
+        img,
+        new_size=config.IMGSZ,
+        pad_value=getattr(config, "LETTERBOX_PAD_VALUE", 114.0/255.0),
+        scaleup=True
+    )
+    img_lb = tf.ensure_shape(img_lb, [config.IMGSZ, config.IMGSZ, 3])
+    return img_lb, meta
+
 def run_tf_inference_with_viz(video_path, model_path, conf_thres=0.1, iou_thres=0.01):
     # 1. 載入模型
     print(f"正在載入模型: {model_path}...")
@@ -53,11 +71,12 @@ def run_tf_inference_with_viz(video_path, model_path, conf_thres=0.1, iou_thres=
             break
 
         # --- 2. 影像前處理 ---
-        img_resized = cv2.resize(frame, input_shape)
-        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img_lb, meta = preprocess_frame_letterbox(tf.convert_to_tensor(img_rgb, dtype=tf.uint8))
 
-        img_norm = img_rgb / 255.0
-        img_tensor = tf.convert_to_tensor(img_norm[np.newaxis, ...], dtype=tf.float32)
+        meta_np = meta.numpy()  # [orig_h, orig_w, scale, pad_x, pad_y]
+        img_tensor = tf.expand_dims(img_lb, axis=0)
+
 
         # --- 3. 推論 ---
         output = infer(img_tensor)
@@ -170,10 +189,31 @@ def run_tf_inference_with_viz(video_path, model_path, conf_thres=0.1, iou_thres=
                 # 還原座標
                 x, y, w, h = box
 
-                x = (x * Image_Size_X) * scale_x
-                y = (y * Image_Size_Y) * scale_y
-                w = (w * Image_Size_X) * scale_x
-                h = (h * Image_Size_Y) * scale_y
+                orig_h, orig_w, sc, px, py = meta_np
+
+                # box 是 NMS 後的 boxes_xywh[idx]，你這裡的 x,y,w,h 仍是 normalized(0..1) in 640 canvas
+                x, y, w, h = box
+
+                # 先轉成 letterbox canvas pixel
+                x_lb = x * Image_Size_X
+                y_lb = y * Image_Size_Y
+                w_lb = w * Image_Size_X
+                h_lb = h * Image_Size_Y
+
+                # 反解回原圖 pixel（重點：減 pad，再除 scale）
+                x0 = (x_lb - px) / sc
+                y0 = (y_lb - py) / sc
+                w0 = w_lb / sc
+                h0 = h_lb / sc
+
+                # clip
+                x0 = max(0.0, min(float(orig_w - 1), x0))
+                y0 = max(0.0, min(float(orig_h - 1), y0))
+                w0 = max(0.0, min(float(orig_w - x0), w0))
+                h0 = max(0.0, min(float(orig_h - y0), h0))
+
+                cv2.rectangle(frame, (int(x0), int(y0)), (int(x0 + w0), int(y0 + h0)), color, 2)
+
                 
                 # 畫 Bounding Box
                 cv2.rectangle(frame, (int(x), int(y)), (int(x+w), int(y+h)), color, 2)

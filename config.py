@@ -7,12 +7,14 @@ Training Settings
 '''
 
 IMGSZ = 640
-BATCH = 32
-EPOCHS = 100              # 可先跑 5~10 看收斂
+BATCH = 8
+EPOCHS = 20              # 可先跑 5~10 看收斂
 
 base_lr = 0.01
 end_lr = 0.01
 momentum = 0.9
+
+LETTERBOX_PAD_VALUE = 114.0 / 255.0 
 
 BNSTOP__ = True         # 凍結 BN , Ture不凍結/ False凍結
 USE_AMP = False         # 設定為 True 以啟用混合精度訓練 (Tensor 版本不支援)
@@ -26,6 +28,39 @@ TFLITE_QUANT_MODE = "int8"  # 可選: "int8" | "fp16" | "fp32"
 TRAIN_SUPERVISION = 'label'  # 原本只有蒸餾的話改成 'label' 就會走標註訓練
 
 USE_DFL  = False       # ← 關掉 DFL
+
+# 你的資料：v=0 仍有 xy，所以要開 True
+KPT_SUPERVISE_XY_WHEN_V0 = False
+
+KPT_CLASS_MASK = [
+    # cls=0 lane: 15 points
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+
+    # cls=1 vehicle skeleton: 12 points
+    # 依你這份標註：第9、14、15點是 v=0（1-based）
+    # => 0-based index = 8,13,14 關掉
+    [1,1,1,1,1,1,1,1,0,1,1,1,1,0,0],
+
+    # cls=2~6: placeholder center point with v=0 => disable all kpt loss
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],  # cls=2
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],  # cls=3
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],  # cls=4
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],  # cls=5
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],  # cls=6
+]
+
+TAL_TOPK = 10
+TAL_ALPHA = 0.5
+TAL_BETA  = 6.0
+TAL_CENTER_RADIUS = 2.5
+
+VFL_ALPHA = 0.75
+VFL_GAMMA = 2.0
+
+EMA_DECAY = 0.9998
+KPT_VIS_W = 0.5
+
+
 '''
 ===================================================
 Location (Input/Output)
@@ -33,17 +68,36 @@ Location (Input/Output)
 '''
 """Train Dataset"""
 REP_DIR_train = [
-    # "../dataset/lanepose/20220830/images/*.jpg",
-    # "../dataset/lanepose/20240321_night/images/*.jpg",
-    "../dataset/lanepose/acc_datasets/images/*.jpg",
-    # "../dataset/lanepose/s3_20230803/images/*.jpg",
-    # "../dataset/lanepose/Traffic_dataset_20240720_345_k/images/*.jpg",
-    # "../dataset/lanepose/yolov8data2_20250804/images/*.jpg"
-    # "../dataset/lanepose/mix_QAT/images/*.jpg"
+    
+    # "../Dataset/20220830/images/*.jpg",
+    # "../Dataset/20220830_enhance/images/*.jpg",
+    # "../Dataset/20220830-Stable_Diffusion-enhance/images/*.png",
 
-    # "../dataset/lanepose/test1/images/*.jpg"    
-    # "../dataset/lanepose/20220830/images/*.jpg"
-    # "../dataset/lanepose/20220830/labels/*.txt"
+    # "../Dataset/20240116-nocheck/images/*.jpg",
+    # "../Dataset/20240321_night/images/*.jpg",
+    # "../Dataset/20240321_night-Stable_Diffusion-enhance/images/*.png",
+    # "../Dataset/20240603-nocheck/images/*.jpg",
+    # "../Dataset/20240803-nocheck/images/*.jpg",
+    # "../Dataset/20240923-BigSun-nocheck/images/*.jpg",
+    # "../Dataset/20241010-nocheck/images/*.jpg",
+    # "../Dataset/20241126-Bridge-nocheck/images/*.jpg",
+    # "../Dataset/20250213-nocheck/images/*.jpg",
+
+    # "../Dataset/acc_dataset/images/*.jpg",
+    # "../Dataset/acc_dataset_enhance/images/*.jpg",
+    # "../Dataset/acc_dataset-Stable_Diffusion-enhance/images/*.png",
+    # "../Dataset/s3_20230803/images/*.jpg",
+    # "../Dataset/s3_20230803_enhance/images/*.jpg",
+    # "../Dataset/s3_20230803-Stable_Diffusion-enhance/images/*.png",
+    # "../Dataset/Traffic_dataset_20240720_345_k/images/*.jpg",
+    # "../Dataset/Traffic_dataset_20240720_345_k_enhance/images/*.jpg",
+
+    # "../Dataset/vecow-demo-nocheck/images/*.jpg",
+
+    # "../Dataset/yolov8data2_20250804/images/*.jpg",
+    # "../Dataset/yolov8data2_20250804_enhance/images/*.jpg"
+    "../dataset/lanepose/acc_datasets/images/*.jpg"
+    
 ]
 
 """TFlite Validation Dataset"""

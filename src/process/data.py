@@ -2,11 +2,11 @@
 import glob
 import tensorflow as tf
 import numpy as np
-import cv2
 import os
 import re
 
 from src.process.labels_yolo_pose_tf import parse_label_lines
+from src.process.preprocess_tf import decode_and_letterbox
 import config
 
 '''
@@ -17,55 +17,34 @@ import config
 
 AUTOTUNE = tf.data.AUTOTUNE
 
-def letterbox(img, new_size=config.IMGSZ):
-    h, w = img.shape[:2]
-    scale = new_size / max(h, w)
-    nh, nw = int(round(h * scale)), int(round(w * scale))
-    img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
-    top  = (new_size - nh) // 2
-    bottom = new_size - nh - top
-    left = (new_size - nw) // 2
-    right = new_size - nw - left
-    img = cv2.copyMakeBorder(img, top, bottom, left, right,
-                             cv2.BORDER_CONSTANT, value=(114,114,114))
-    return img
+
 
 def _decode_path(p):
     if isinstance(p, bytes):
         return p.decode('utf-8')
     return str(p)
 
-def parse_img(path):
-
-    p = _decode_path(path)
-    bgr = cv2.imread(p)
-    
-    #bgr to rgb
-    rgb = bgr[:, :, ::-1]
-    img = letterbox(rgb, config.IMGSZ).astype(np.float32) / 255.0
-    return img
-
-def tf_parse(path):
-    img = tf.numpy_function(parse_img, [path], Tout=tf.float32)
-    img.set_shape([config.IMGSZ, config.IMGSZ, 3])
-    return img
 
 
 def tf_parse_load(img_path):
-    # 保險：確保是 scalar tf.string
     img_path = tf.ensure_shape(img_path, [])
     tf.debugging.assert_type(img_path, tf.string,
-                                message="img_path must be tf.string. Check build_dataset inputs.")
-    img_bytes = tf.io.read_file(img_path)
-    img = tf.io.decode_image(img_bytes, channels=3, expand_animations=False)
-    img = tf.image.convert_image_dtype(img, tf.float32)
-    img = tf.image.resize(img, (config.IMGSZ, config.IMGSZ))
+                             message="img_path must be tf.string. Check build_dataset inputs.")
+
+    img, meta = decode_and_letterbox(
+        img_path,
+        new_size=config.IMGSZ,
+        pad_value=getattr(config, "LETTERBOX_PAD_VALUE", 114.0/255.0),
+        scaleup=True
+    )
 
     # ../images/xxx.jpg -> ../labels/xxx.txt
     lbl_path = tf.strings.regex_replace(img_path, r"/images/", "/labels/")
-    lbl_path = tf.strings.regex_replace(lbl_path, r"\.(jpg|jpeg|png|bmp)$", ".txt")
+    lbl_path = tf.strings.regex_replace(lbl_path, r"\\.(jpg|jpeg|png|bmp)$", ".txt")
 
-    return img, lbl_path  # (H,W,C), scalar string
+    # 回傳 meta：給訓練時把 label 做 letterbox 座標映射
+    return img, lbl_path, meta
+
 
 
 def build_dataset(img_glob, batch=config.BATCH, shuffle=True, repeat=True):
@@ -179,13 +158,12 @@ def compute_class_weights(img_glob, num_classes, num_kpt, kpt_vals):
 '''
 
 def rep_data_gen():
-    paths = sorted(glob.glob(config.REP_DIR_export))     # ← 這行改了
-
-    num_picture = 0
+    paths = sorted(glob.glob(config.REP_DIR_export))
     for p in paths:
-        img = parse_img(p)                        # float32 [H,W,3] /255
-        img = np.expand_dims(img, 0).astype(np.float32)
-        yield [img]
-        num_picture += 1
-
-    print(f"\n\nRead the data = {num_picture}\n")
+        img_lb, _meta = decode_and_letterbox(
+            tf.constant(p),
+            new_size=config.IMGSZ,
+            pad_value=getattr(config, "LETTERBOX_PAD_VALUE", 114.0/255.0),
+            scaleup=True
+        )
+        yield [tf.expand_dims(img_lb, 0).numpy().astype(np.float32)]

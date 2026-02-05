@@ -56,7 +56,8 @@ from src.Loss_function.pose_label_loss_tf import (
 )
 from src.process.pred_reshape import bcn_to_bnc
 
-from src.process.labels_yolo_pose_tf import parse_label_lines
+from src.process.labels_yolo_pose_tf import parse_label_lines, letterbox_adjust_yolo_pose
+
 
 from src.Loss_function.loss_tf import pose_loss_from_labels
 
@@ -144,6 +145,33 @@ def probe_kd_output_distribution(student_model, dataset, expected_C, imgsz=640):
 Core Logic
 ==================================================================================
 '''
+
+class ModelEMA:
+    def __init__(self, model, decay=0.9998):
+        self.decay = decay
+        # 建立影子變數 (Shadow Variables)
+        self.shadow = [tf.Variable(w, trainable=False) for w in model.weights]
+
+    def update(self, model):
+        d = self.decay
+        for s, w in zip(self.shadow, model.weights):
+            # [Fix] 只對浮點數變數做 EMA 運算
+            if w.dtype.is_floating:
+                s.assign(d * s + (1.0 - d) * w)
+            else:
+                # [Fix] 對於整數變數 (如 int32, int64)，直接複製值，不進行加權平均
+                s.assign(w)
+
+    def apply_to(self, model):
+        self.backup = [tf.identity(w) for w in model.weights]
+        for w, s in zip(model.weights, self.shadow):
+            w.assign(s)
+
+    def restore(self, model):
+        for w, b in zip(model.weights, self.backup):
+            w.assign(b)
+        self.backup = None
+
 
 def get_anchors(h, w, dtype=tf.float32):
     """
@@ -237,6 +265,7 @@ def build_batch_dict_from_targets(targets, num_kpt, kpt_vals):
     batch_kpts = []
     batch_indices = []
     batch_num_objs = [] 
+    batch_valid_mask = []
 
     for i, t in enumerate(targets):
         num_obj = tf.shape(t)[0]
@@ -247,11 +276,15 @@ def build_batch_dict_from_targets(targets, num_kpt, kpt_vals):
             cls_real = tf.zeros((0, 1), dtype=tf.float32)
             box_real = tf.zeros((0, 4), dtype=tf.float32)
             kpt_real = tf.zeros((0, num_kpt, kpt_vals), dtype=tf.float32)
+
+            mask_real = tf.zeros((0,), dtype=tf.float32)
         else:
             cls_real = t[:, 0:1]       # (M, 1)
             box_real = t[:, 1:5]       # (M, 4)
             kpt_data = t[:, 5:]        # (M, K*V)
             kpt_real = tf.reshape(kpt_data, (num_obj, num_kpt, kpt_vals))
+
+            mask_real = tf.ones((num_obj,), dtype=tf.float32)
 
         # --- Padding ---
         pad_len = max_len - num_obj
@@ -261,9 +294,13 @@ def build_batch_dict_from_targets(targets, num_kpt, kpt_vals):
         paddings_box = [[0, pad_len], [0, 0]]
         paddings_kpt = [[0, pad_len], [0, 0], [0, 0]]
 
+        paddings_mask = [[0, pad_len]]
+
         cls_padded = tf.pad(cls_real, paddings_cls, mode='CONSTANT', constant_values=0)
         box_padded = tf.pad(box_real, paddings_box, mode='CONSTANT', constant_values=0)
         kpt_padded = tf.pad(kpt_real, paddings_kpt, mode='CONSTANT', constant_values=0)
+
+        mask_padded = tf.pad(mask_real, paddings_mask, mode='CONSTANT', constant_values=0)
 
         # Batch Index
         b_idx = tf.fill([max_len, 1], tf.cast(i, tf.float32))
@@ -272,12 +309,16 @@ def build_batch_dict_from_targets(targets, num_kpt, kpt_vals):
         batch_bboxes.append(box_padded)
         batch_kpts.append(kpt_padded)
         batch_indices.append(b_idx)
+        batch_valid_mask.append(mask_padded)
 
     # 3. 堆疊成 Batch Tensor
     out_dict = {
         'bboxes': tf.stack(batch_bboxes, axis=0),
         'cls': tf.stack(batch_cls, axis=0),
         'keypoints': tf.stack(batch_kpts, axis=0),
+
+        'valid_mask': tf.stack(batch_valid_mask, axis=0), # [新增] 對應 loss: batch_dict["valid_mask"],
+
         'batch_idx': tf.stack(batch_indices, axis=0),
         # ✅ 修改處：使用 tf.stack 代替 tf.constant
         # batch_num_objs 是一個 Tensor list，必須用 stack 合併
@@ -696,12 +737,12 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths, class_weights=N
 
             # 計算 Loss
             loss_kd, *logs_kd_tuple = pose_loss_from_labels(
-                batch_dict, s_BNC, anchors_kd, 
+                s_BNC, batch_dict, anchors_kd, 
                 num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS, class_weights=class_weights
             )
-            
+
             loss_dep, *logs_dep_tuple = pose_loss_from_labels(
-                batch_dict, d_BNC, anchors_dep,
+                d_BNC, batch_dict, anchors_dep,
                 num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS, class_weights=class_weights
             )
 
@@ -776,6 +817,19 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths, class_weights=N
 
         global_step = 0
 
+        best_mae_box = float("inf")
+        sample_one = None
+
+        # ✅ 建 EMA 前要 build weights，但用 dummy input（避免吃掉 ds）
+        # 這裡用 config.IMGSZ 產生一張假的圖 build（不影響 ds）
+        H = int(config.IMGSZ) if not isinstance(config.IMGSZ, (list, tuple)) else int(config.IMGSZ[0])
+        W = int(config.IMGSZ) if not isinstance(config.IMGSZ, (list, tuple)) else int(config.IMGSZ[1])
+        dummy = tf.zeros([1, H, W, 3], dtype=tf.float32)
+        _ = student(dummy, training=False)
+
+        ema = ModelEMA(student, decay=getattr(config, "EMA_DECAY", 0.9998))
+
+
         for e in range(config.EPOCHS):
             epoch_loss_agg = tf.keras.metrics.Mean()
             it = iter(ds)
@@ -788,10 +842,17 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths, class_weights=N
                     break                               # <<< 新增
 
                 batch = next(it)
+                batch_meta = None
                 if isinstance(batch, (list, tuple)):
-                    batch_imgs, batch_label_paths = batch[0], batch[1]
+                    batch_imgs = batch[0]
+                    batch_label_paths = batch[1] if len(batch) > 1 else None
+                    batch_meta = batch[2] if len(batch) > 2 else None
                 else:
-                    batch_imgs, batch_label_paths = batch, None
+                    batch_imgs, batch_label_paths, batch_meta = batch, None, None
+
+
+                if sample_one is None:
+                    sample_one = batch_imgs[:1]
 
 # ==================================================================
                 if config.TRAIN_SUPERVISION == 'label' and batch_label_paths is not None:
@@ -810,8 +871,22 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths, class_weights=N
                                 lines = [ln.strip() for ln in f if ln.strip()]
                         else:
                             lines = []
+                            
                         arr = parse_label_lines(lines, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS)
+
+                        if batch_meta is not None:
+                            meta_np = batch_meta.numpy()  # [B,5] = [orig_h, orig_w, scale, pad_x, pad_y]
+                            oh, ow, sc, px, py = meta_np[len(labels_list)]  # 因為 labels_list 還沒 append
+                            arr = letterbox_adjust_yolo_pose(
+                                arr,
+                                orig_h=float(oh), orig_w=float(ow),
+                                scale=float(sc), pad_x=float(px), pad_y=float(py),
+                                new_size=int(config.IMGSZ),
+                                num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS
+                            )
+
                         labels_list.append(arr)
+
 
                     # build targets -> tensors
                     # 用實際 batch 的 H 來推 grid（若未知就退回 config.IMGSZ）
@@ -840,6 +915,9 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths, class_weights=N
                         step=global_step,        # 用這個當檔名編號
                         debug_save_every=100     # 例如每 100 step 存一次 GT + 圖
                     )
+
+                    ema.update(student)
+
                     global_step += 1
                     epoch_loss_agg.update_state(loss)
                     progress_bar.set_postfix(loss=f"{loss:.4f}", box=f"{loss_log['box_loss']:.4f}", cls=f"{loss_log['cls_loss']:.4f}", kpt=f"{loss_log['kpt_loss']:.4f}")
@@ -853,6 +931,9 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths, class_weights=N
                     epoch_loss_agg.update_state(loss)
                     progress_bar.set_postfix(loss=f"{loss:.4f}", MAE_ALL_s=f"{mae_all:.4f}",MAE_BOX=f"{mae_box:.4f}", MAE_CLS=f"{mae_cls:.4f}", MAE_kxy=f"{mae_kxy:.4f}", MAE_v=f"{mae_v:.4f}", MAE_depoly=f"{mae_dep_all:.4f}")
 
+                    ema.update(student)               # ✅ 補上這行
+                    global_step += 1                  # ✅ 建議 distill 也一致累加
+
 # ==================================================================
             
 
@@ -865,18 +946,36 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths, class_weights=N
             avg_loss = epoch_loss_agg.result().numpy().item()
             current_lr = schedule((e + 1) * steps_per_epoch).numpy().item()
             loss_history.append(avg_loss)
-            '''
-            # --- epoch-end diagnostics (MAE + variance) ---
-            mae_box_t, mae_cls_t, mae_kpt_t, mae_ksc_t = eval_epoch_metrics(sample_one)
-            mae_box_t = float(mae_box_t.numpy()); mae_cls_t = float(mae_cls_t.numpy()); mae_kpt_t = float(mae_kpt_t.numpy()); mae_ksc_t = float(mae_ksc_t.numpy())
-            
-            csv_writer.writerow([e + 1, f"{avg_loss:.6f}", f"{current_lr:.8f}",
-                                 f"{mae_box_t:.6f}", f"{mae_cls_t:.6f}", f"{mae_kpt_t:.6f}", f"{mae_ksc_t:.6f}"])
 
-            print(f"Epoch {e+1}/{config.EPOCHS} - Avg Loss: {avg_loss:.4f}, LR: {current_lr:.6f} | "
-                  f"MAE(box/cls/kpt/ksc): {mae_box_t:.4f}/{mae_cls_t:.4f}/{mae_kpt_t:.4f}/{mae_ksc_t:.4f}")
-                '''
-            csv_writer.writerow([e + 1, f"{avg_loss:.6f}", f"{current_lr:.8f}"])
+            # -------- epoch end: 用 EMA 權重評估 & 存 best --------
+            if sample_one is None:
+                # 理論上不會發生，除非 steps_per_epoch=0
+                sample_one = dummy
+
+            ema.apply_to(student)
+            try:
+                mae_box_t, mae_cls_t, mae_kpt_t, mae_ksc_t = eval_epoch_metrics(sample_one)
+                mae_box_t = float(mae_box_t.numpy())
+                mae_cls_t = float(mae_cls_t.numpy())
+                mae_kpt_t = float(mae_kpt_t.numpy())
+                mae_ksc_t = float(mae_ksc_t.numpy())
+
+                csv_writer.writerow([e + 1, f"{avg_loss:.6f}", f"{current_lr:.8f}",
+                                    f"{mae_box_t:.6f}", f"{mae_cls_t:.6f}", f"{mae_kpt_t:.6f}", f"{mae_ksc_t:.6f}"])
+
+                print(f"[EMA] Epoch {e+1}/{config.EPOCHS} - Avg Loss: {avg_loss:.4f}, LR: {current_lr:.6f} | "
+                    f"MAE(box/cls/kpt/ksc): {mae_box_t:.4f}/{mae_cls_t:.4f}/{mae_kpt_t:.4f}/{mae_ksc_t:.4f}")
+
+                if mae_box_t < best_mae_box:
+                    best_mae_box = mae_box_t
+                    best_path = output_paths.get("best_weights", "student_best_ema.weights.h5")
+                    student.save_weights(best_path)
+                    print(f"[EMA] ✅ Saved best EMA weights to: {best_path} (best_mae_box={best_mae_box:.6f})")
+
+            finally:
+                ema.restore(student)
+            # ---------------------------------------------
+
 
     print(f"✅ Training finished. Log saved to {output_paths['log_csv']}")
     return loss_history
