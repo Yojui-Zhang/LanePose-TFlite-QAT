@@ -465,7 +465,12 @@ def main():
 
     # 3) 準備資料集
     print("\n--- Preparing Dataset ---")
-    ds, n_files = build_dataset(img_glob=config.REP_DIR_train, batch=config.BATCH)
+    
+    ds, n_files = build_dataset(
+        img_glob=config.REP_DIR_train,
+        batch=config.BATCH,
+        with_labels=(config.TRAIN_SUPERVISION == "label")
+    )
     steps_per_epoch = max(1, n_files // config.BATCH)
 
     class_weights = compute_class_weights(

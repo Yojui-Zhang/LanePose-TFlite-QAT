@@ -7,6 +7,7 @@ import re
 
 from src.process.labels_yolo_pose_tf import parse_label_lines
 from src.process.preprocess_tf import decode_and_letterbox
+from src.process.labels_yolo_pose_tf import parse_label_file_tf 
 import config
 
 '''
@@ -17,7 +18,18 @@ import config
 
 AUTOTUNE = tf.data.AUTOTUNE
 
+@tf.function
+def img_to_label_path_tf(img_path: tf.Tensor) -> tf.Tensor:
+    # 1) folder: /images/ -> /labels/
+    lbl_path = tf.strings.regex_replace(img_path, r"/images/", "/labels/")
+    # 2) ext: .anything -> .txt  (支援 .jpg/.JPG/.png...，不需要列舉)
+    lbl_path = tf.strings.regex_replace(lbl_path, r"\.[^/.]+$", ".txt")
 
+    # 防呆：確認結尾是 .txt（如果不是，直接讓你早期爆掉，避免默默讀錯）
+    n = tf.strings.length(lbl_path)
+    suffix = tf.strings.substr(lbl_path, tf.maximum(n - 4, 0), 4)
+    tf.debugging.assert_equal(suffix, ".txt", message="[path] lbl_path is not .txt, check regex!")
+    return lbl_path
 
 def _decode_path(p):
     if isinstance(p, bytes):
@@ -39,15 +51,36 @@ def tf_parse_load(img_path):
     )
 
     # ../images/xxx.jpg -> ../labels/xxx.txt
-    lbl_path = tf.strings.regex_replace(img_path, r"/images/", "/labels/")
-    lbl_path = tf.strings.regex_replace(lbl_path, r"\\.(jpg|jpeg|png|bmp)$", ".txt")
+    lbl_path = img_to_label_path_tf(img_path)
 
     # 回傳 meta：給訓練時把 label 做 letterbox 座標映射
     return img, lbl_path, meta
 
+def tf_parse_load_with_labels(img_path):
+    img_path = tf.ensure_shape(img_path, [])
+    tf.debugging.assert_type(img_path, tf.string,
+                             message="img_path must be tf.string. Check build_dataset inputs.")
+
+    img, meta = decode_and_letterbox(
+        img_path,
+        new_size=config.IMGSZ,
+        pad_value=getattr(config, "LETTERBOX_PAD_VALUE", 114.0/255.0),
+        scaleup=True
+    )
+
+    lbl_path = img_to_label_path_tf(img_path)
+
+    labels = parse_label_file_tf(
+        lbl_path, meta,
+        new_size=int(config.IMGSZ),
+        num_kpt=int(config.NUM_KPT),
+        kpt_vals=int(config.KPT_VALS)
+    )
+
+    return img, labels, meta
 
 
-def build_dataset(img_glob, batch=config.BATCH, shuffle=True, repeat=True):
+def build_dataset(img_glob, batch=config.BATCH, shuffle=True, repeat=True, with_labels=False):
     
     # 初始化一個空列表來存放所有檔案路徑
     all_files = []
@@ -76,13 +109,43 @@ def build_dataset(img_glob, batch=config.BATCH, shuffle=True, repeat=True):
 
     ds = tf.data.Dataset.from_tensor_slices(files)
     if shuffle:
-        ds = ds.shuffle(len(files), reshuffle_each_iteration=True) # 加上 reshuffle_each_iteration
-        
-    ds = ds.map(tf_parse_load, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.batch(batch).prefetch(tf.data.AUTOTUNE)
+        ds = ds.shuffle(len(files), reshuffle_each_iteration=True)
+
+    if with_labels:
+        # （可選）避免少數資料 label txt 缺檔造成 tf.io.read_file crash：先在 Python 端補空檔（只做一次，不在每 step）
+        if getattr(config, "AUTO_TOUCH_MISSING_LABELS", True):
+            for f in files:
+                lp = re.sub(r"/images/", "/labels/", f)
+                lp = re.sub(r"\.[^/.]+$", ".txt", lp)
+                if not os.path.exists(lp):
+                    os.makedirs(os.path.dirname(lp), exist_ok=True)
+                    open(lp, "a", encoding="utf-8").close()
+
+        ds = ds.map(tf_parse_load_with_labels, num_parallel_calls=AUTOTUNE)
+
+        D = 5 + int(config.NUM_KPT) * int(config.KPT_VALS)
+        ds = ds.padded_batch(
+            batch,
+            padded_shapes=(
+                [int(config.IMGSZ), int(config.IMGSZ), 3],  # img
+                [None, D],                                  # labels
+                [5],                                        # meta
+            ),
+            padding_values=(
+                tf.constant(0.0, tf.float32),
+                tf.constant(0.0, tf.float32),
+                tf.constant(0.0, tf.float32),
+            ),
+            drop_remainder=False
+        ).prefetch(AUTOTUNE)
+
+    else:
+        ds = ds.map(tf_parse_load, num_parallel_calls=AUTOTUNE)
+        ds = ds.batch(batch).prefetch(AUTOTUNE)
+
     if repeat:
         ds = ds.repeat()
-        
+
     return ds, len(files)
 
 

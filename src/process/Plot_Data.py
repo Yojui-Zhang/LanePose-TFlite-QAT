@@ -316,3 +316,5 @@ def save_pred_and_plot(
             df = pd.DataFrame(csv_rows, columns=columns)
 
         df.to_csv(csv_path, index=False, float_format="%.6f")
+
+

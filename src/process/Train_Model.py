@@ -327,6 +327,51 @@ def build_batch_dict_from_targets(targets, num_kpt, kpt_vals):
     
     return out_dict
 
+def build_batch_dict_from_padded_labels(batch_labels, num_kpt, kpt_vals):
+    """
+    batch_labels: (B, M, D) float32
+      D = 5 + num_kpt * kpt_vals
+      format per row: [cls, cx, cy, w, h, kpts_flat...]
+      padding rows are zeros -> invalid
+    returns batch_dict compatible with pose_loss_from_labels():
+      bboxes:     (B,M,4)
+      cls:        (B,M,1)
+      keypoints:  (B,M,K,V)
+      valid_mask: (B,M) float32 0/1
+      num_objects:(B,1) int32
+      batch_idx:  (B,M,1) float32 (optional, for your existing debug utilities)
+    """
+    batch_labels = tf.convert_to_tensor(batch_labels, dtype=tf.float32)
+
+    B = tf.shape(batch_labels)[0]
+    M = tf.shape(batch_labels)[1]
+
+    cls = batch_labels[..., 0:1]      # (B,M,1)
+    bboxes = batch_labels[..., 1:5]   # (B,M,4)
+
+    kpt_flat = batch_labels[..., 5:]  # (B,M,K*V)
+    keypoints = tf.reshape(kpt_flat, [B, M, num_kpt, kpt_vals])
+
+    # valid if w>0 and h>0 (same logic you used in numpy path)
+    valid = tf.logical_and(batch_labels[..., 3] > 0.0, batch_labels[..., 4] > 0.0)
+    valid_mask = tf.cast(valid, tf.float32)  # (B,M)
+
+    num_objects = tf.reduce_sum(tf.cast(valid, tf.int32), axis=1, keepdims=True)  # (B,1)
+
+    batch_idx = tf.broadcast_to(
+        tf.reshape(tf.range(B, dtype=tf.float32), [B, 1, 1]),
+        [B, M, 1]
+    )
+
+    return {
+        "bboxes": bboxes,
+        "cls": cls,
+        "keypoints": keypoints,
+        "valid_mask": valid_mask,
+        "num_objects": num_objects,
+        "batch_idx": batch_idx,
+    }
+
 
 # 放在 Train_Model.py 顶部合適位置
 def ul_tuple_to_BNC(kd_raw, num_cls, num_kpt, kpt_vals):
@@ -632,118 +677,50 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths, class_weights=N
 
         return loss, mae_all_s, mae_box_s, mae_cls_s, mae_kxy_s, mae_v_s, mae_all_d
     
-    # @tf.function
-    def train_step_label(batch_imgs, targets_per_image, step=None, debug_save_every=0):
+    @tf.function(reduce_retracing=True)
+    def train_step_label(batch_imgs, batch_labels):
         NUM_CLS, NUM_KPT, KPT_VALS = config.NUM_CLS, config.NUM_KPT, config.KPT_VALS
         C = 4 + NUM_CLS + NUM_KPT * KPT_VALS
 
+        # Build GT dict in-graph (no python list / numpy)
+        batch_dict = build_batch_dict_from_padded_labels(
+            batch_labels, num_kpt=NUM_KPT, kpt_vals=KPT_VALS
+        )
+
         with tf.GradientTape() as tape:
-            
             y_s_out = student(batch_imgs, training=True)
 
-            kd_raw     = y_s_out[1] if isinstance(y_s_out, (list,tuple)) else y_s_out
-            deploy_raw = y_s_out[0] if isinstance(y_s_out, (list,tuple)) else y_s_out
+            kd_raw     = y_s_out[1] if isinstance(y_s_out, (list, tuple)) else y_s_out
+            deploy_raw = y_s_out[0] if isinstance(y_s_out, (list, tuple)) else y_s_out
 
-            # 轉成 Flatten 格式
+            # Flatten to (B,N,C) using your existing utility
             s_BNC = ensure_BNC_static(kd_raw, C)
             d_BNC = ensure_BNC_static(deploy_raw, C)
 
             anchors_kd  = anchors_all
             anchors_dep = anchors_all
 
-            # 安全檢查（建議加一下）
+            # Safety checks
             tf.debugging.assert_equal(
                 tf.shape(s_BNC)[1], tf.shape(anchors_kd)[0],
-                message="[KD] N_pred 與 anchors_kd 個數不一致"
+                message="[KD] N_pred != anchors_kd"
             )
             tf.debugging.assert_equal(
                 tf.shape(d_BNC)[1], tf.shape(anchors_dep)[0],
-                message="[DEP] N_pred 與 anchors_dep 個數不一致"
+                message="[DEP] N_pred != anchors_dep"
             )
 
-
-
-            # 建立 GT
-            batch_dict = build_batch_dict_from_targets(
-                targets_per_image, num_kpt=NUM_KPT, kpt_vals=KPT_VALS
-            )
-
-            # ---------------------------------
-
-            '''
-            bd = batch_dict   # 簡寫
-
-            # 轉成 numpy
-            batch_idx = bd['batch_idx'].numpy().reshape(-1)   # (G,)
-            cls       = bd['cls'].numpy().reshape(-1)         # (G,)
-            bboxes    = bd['bboxes'].numpy()                  # (G,4)
-            kpts      = bd['keypoints'].numpy()               # (G, num_kpt, kpt_vals)
-
-            G = batch_idx.shape[0]
-
-            kpts_flat = kpts.reshape(G, NUM_KPT * KPT_VALS)   # (G, num_kpt*kpt_vals)
-
-            # 把所有欄位串在一起 → (G, 2 + 4 + num_kpt*kpt_vals)
-            data = np.concatenate([
-                batch_idx[:, None],    # (G,1)
-                cls[:, None],          # (G,1)
-                bboxes,                # (G,4)
-                kpts_flat              # (G, num_kpt*kpt_vals)
-            ], axis=1)
-
-            columns = ['batch_idx', 'cls', 'x', 'y', 'w', 'h']
-
-            # keypoints 欄名：kpt{i}_{j}
-            # 例如 kpt0_x, kpt0_y, kpt0_v, kpt1_x, kpt1_y, ...
-            name_per_val = ['x', 'y', 'v'][:KPT_VALS]   # 若是 (x,y) 就設 ['x','y']
-
-            for i in range(NUM_KPT):
-                for j in range(KPT_VALS):
-                    columns.append(f'kpt{i}_{name_per_val[j] if j < len(name_per_val) else j}')
-                    # 若你懶得分 x/y/v，也可以直接：
-                    # columns.append(f'kpt{i}_{j}')
-
-            df = pd.DataFrame(data, columns=columns)
-
-            # 存成 CSV（推薦）
-            df.to_csv('targets_flatten.csv', index=False, float_format='%.6f')
-            '''
-
-            # # Plotting (保持原樣，只畫 Deploy)
-            if (debug_save_every > 0) and (step is not None) and (step % debug_save_every == 0) and (config.PLOT_Switch == True):
-                save_gt_and_plot(
-                    step=step,
-                    batch_imgs=batch_imgs,
-                    batch_dict=batch_dict,
-                    num_kpt=NUM_KPT,
-                    kpt_vals=KPT_VALS,
-                    out_dir=output_paths['plots'],
-                    max_images=1,
-                )
-
-                save_pred_and_plot(
-                    step=step,
-                    batch_imgs=batch_imgs,
-                    pred_raw=d_BNC,
-                    num_cls=NUM_CLS,
-                    num_kpt=NUM_KPT,
-                    kpt_vals=KPT_VALS,
-                    anchors=anchors_dep,              # ★ 新增：使用同一組 anchors_all
-                    out_dir=output_paths['plots'], 
-                    max_images=1,
-                    score_thr=0.3
-                )
-            # ---------------------------------
-
-            # 計算 Loss
+            # Compute loss (same as your original logic)
             loss_kd, *logs_kd_tuple = pose_loss_from_labels(
-                s_BNC, batch_dict, anchors_kd, 
-                num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS, class_weights=class_weights
+                s_BNC, batch_dict, anchors_kd,
+                num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS,
+                class_weights=class_weights
             )
 
             loss_dep, *logs_dep_tuple = pose_loss_from_labels(
                 d_BNC, batch_dict, anchors_dep,
-                num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS, class_weights=class_weights
+                num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS,
+                class_weights=class_weights
             )
 
             total_loss = loss_kd + loss_dep
@@ -761,15 +738,56 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths, class_weights=N
 
         opt.apply_gradients(zip(grads, student.trainable_variables))
 
-        logs = {}
-        logs["kd_loss"] = loss_kd
-        logs["dep_loss"] = loss_dep
+        logs = {
+            "kd_loss": loss_kd,
+            "dep_loss": loss_dep,
+        }
+        # Keep your deploy-side breakdown
         if logs_dep_tuple:
             logs["box_loss"] = logs_dep_tuple[0]
             logs["cls_loss"] = logs_dep_tuple[1]
             logs["kpt_loss"] = logs_dep_tuple[2]
 
         return total_loss, logs
+
+    def debug_plot_step(batch_imgs, batch_labels, step_int):
+        """
+        Eager-only debug. Call occasionally (e.g. every 100 steps).
+        """
+        NUM_CLS, NUM_KPT, KPT_VALS = config.NUM_CLS, config.NUM_KPT, config.KPT_VALS
+        C = 4 + NUM_CLS + NUM_KPT * KPT_VALS
+
+        batch_dict = build_batch_dict_from_padded_labels(batch_labels, NUM_KPT, KPT_VALS)
+
+        y_s_out = student(batch_imgs, training=False)
+        kd_raw     = y_s_out[1] if isinstance(y_s_out, (list, tuple)) else y_s_out
+        deploy_raw = y_s_out[0] if isinstance(y_s_out, (list, tuple)) else y_s_out
+
+        d_BNC = ensure_BNC_static(deploy_raw, C)
+
+        save_gt_and_plot(
+            step=step_int,
+            batch_imgs=batch_imgs,
+            batch_dict=batch_dict,
+            num_kpt=NUM_KPT,
+            kpt_vals=KPT_VALS,
+            out_dir=output_paths['plots'],
+            max_images=1,
+        )
+
+        save_pred_and_plot(
+            step=step_int,
+            batch_imgs=batch_imgs,
+            pred_raw=d_BNC,
+            num_cls=NUM_CLS,
+            num_kpt=NUM_KPT,
+            kpt_vals=KPT_VALS,
+            anchors=anchors_all,
+            out_dir=output_paths['plots'],
+            max_images=1,
+            score_thr=0.3,
+        )
+
 
     # 6) 評估：epoch 末計算 MAE（Student vs Teacher）與 across-N 變異數
     def eval_epoch_metrics(x_eval):
@@ -843,96 +861,88 @@ def run_qat(student, teacher, ds, steps_per_epoch, output_paths, class_weights=N
 
                 batch = next(it)
                 batch_meta = None
+                batch_labels = None
                 if isinstance(batch, (list, tuple)):
                     batch_imgs = batch[0]
-                    batch_label_paths = batch[1] if len(batch) > 1 else None
-                    batch_meta = batch[2] if len(batch) > 2 else None
+                    batch_labels = batch[1] if len(batch) > 1 else None
+                    batch_meta   = batch[2] if len(batch) > 2 else None
                 else:
-                    batch_imgs, batch_label_paths, batch_meta = batch, None, None
+                    batch_imgs, batch_labels, batch_meta = batch, None, None
 
 
                 if sample_one is None:
                     sample_one = batch_imgs[:1]
 
 # ==================================================================
-                if config.TRAIN_SUPERVISION == 'label' and batch_label_paths is not None:
-                    # safe convert tensor -> python list of str
-                    lp_np = tf.reshape(batch_label_paths, [-1]).numpy()
-                    def _to_str(x):
-                        if isinstance(x, (bytes, bytearray)):
-                            return x.decode('utf-8')
-                        return str(x)
-                    paths = [_to_str(p) for p in lp_np]
+                if config.TRAIN_SUPERVISION == 'label' and batch_labels is not None:
 
-                    labels_list = []
-                    for p in paths:
-                        if tf.io.gfile.exists(p):
-                            with tf.io.gfile.GFile(p, "r") as f:
-                                lines = [ln.strip() for ln in f if ln.strip()]
-                        else:
-                            lines = []
-                            
-                        arr = parse_label_lines(lines, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS)
+                    # 相容舊路徑：如果第二個輸出還是 string，代表你還在用 lbl_path 模式
+                    if batch_labels.dtype == tf.string:
+                        #（你舊的讀檔流程可以留著當 fallback；但正常情況 main.py 已經 with_labels=True 不會走到這）
+                        lp_np = tf.reshape(batch_labels, [-1]).numpy()
+                        def _to_str(x):
+                            if isinstance(x, (bytes, bytearray)):
+                                return x.decode('utf-8')
+                            return str(x)
+                        paths = [_to_str(p) for p in lp_np]
 
-                        if batch_meta is not None:
-                            meta_np = batch_meta.numpy()  # [B,5] = [orig_h, orig_w, scale, pad_x, pad_y]
-                            oh, ow, sc, px, py = meta_np[len(labels_list)]  # 因為 labels_list 還沒 append
-                            arr = letterbox_adjust_yolo_pose(
-                                arr,
-                                orig_h=float(oh), orig_w=float(ow),
-                                scale=float(sc), pad_x=float(px), pad_y=float(py),
-                                new_size=int(config.IMGSZ),
-                                num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS
-                            )
+                        labels_list = []
+                        for p in paths:
+                            if tf.io.gfile.exists(p):
+                                with tf.io.gfile.GFile(p, "r") as f:
+                                    lines = [ln.strip() for ln in f if ln.strip()]
+                            else:
+                                lines = []
+                            arr = parse_label_lines(lines, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS)
+                            labels_list.append(arr)
 
-                        labels_list.append(arr)
+                    else:
+                        # ✅ 新路徑：batch_labels 已經是 [B, M, D]，且已完成 letterbox 座標映射
+                        # ✅ keep labels as Tensor, no numpy, no python list
+                        batch_labels = tf.cast(batch_labels, tf.float32)
+
+                        # (optional) debug plot outside graph
+                        DEBUG_EVERY = 100
+                        if config.PLOT_Switch and DEBUG_EVERY > 0 and (global_step % DEBUG_EVERY == 0):
+                            # 只 debug 1 張，省很多時間
+                            debug_plot_step(batch_imgs[:1], batch_labels[:1], int(global_step))
 
 
-                    # build targets -> tensors
-                    # 用實際 batch 的 H 來推 grid（若未知就退回 config.IMGSZ）
-                    _h = batch_imgs.shape[1]
-                    try:
-                        imgsz_runtime = int(_h) if _h is not None else int(config.IMGSZ)
-                    except Exception:
-                        imgsz_runtime = int(config.IMGSZ)
-
-                    '''
-                    targets, pos_mask, _ = build_targets_from_labels(
-                        batch_labels=labels_list,
-                        num_classes=config.NUM_CLS,
-                        num_kpt=config.NUM_KPT,
-                        kpt_vals=config.KPT_VALS,
-                        imgsz=imgsz_runtime,
-                        strides=(8,16,32)
-                    )
-
-                    targets['pos_mask']  = pos_mask
-                    '''
-                    # call non-tf train step
-                    loss, loss_log = train_step_label(
-                        batch_imgs,
-                        labels_list,
-                        step=global_step,        # 用這個當檔名編號
-                        debug_save_every=100     # 例如每 100 step 存一次 GT + 圖
-                    )
+                    loss, loss_log = train_step_label(batch_imgs, batch_labels)
 
                     ema.update(student)
-
                     global_step += 1
                     epoch_loss_agg.update_state(loss)
-                    progress_bar.set_postfix(loss=f"{loss:.4f}", box=f"{loss_log['box_loss']:.4f}", cls=f"{loss_log['cls_loss']:.4f}", kpt=f"{loss_log['kpt_loss']:.4f}")
 
+                    # for tqdm formatting: convert tensors to python floats
+                    loss_v = float(loss.numpy())
+                    box_v  = float(loss_log.get("box_loss", 0.0).numpy()) if "box_loss" in loss_log else 0.0
+                    cls_v  = float(loss_log.get("cls_loss", 0.0).numpy()) if "cls_loss" in loss_log else 0.0
+                    kpt_v  = float(loss_log.get("kpt_loss", 0.0).numpy()) if "kpt_loss" in loss_log else 0.0
+
+                    progress_bar.set_postfix(
+                        loss=f"{loss_v:.4f}",
+                        box=f"{box_v:.4f}",
+                        cls=f"{cls_v:.4f}",
+                        kpt=f"{kpt_v:.4f}",
+                    )
 
                 else:
                     # distill path (fast, tf.function)
-                    # ensure we pass only images tensor, not tuple
                     loss, mae_all, mae_box, mae_cls, mae_kxy, mae_v, mae_dep_all = train_step_distill(batch_imgs)
-
                     epoch_loss_agg.update_state(loss)
-                    progress_bar.set_postfix(loss=f"{loss:.4f}", MAE_ALL_s=f"{mae_all:.4f}",MAE_BOX=f"{mae_box:.4f}", MAE_CLS=f"{mae_cls:.4f}", MAE_kxy=f"{mae_kxy:.4f}", MAE_v=f"{mae_v:.4f}", MAE_depoly=f"{mae_dep_all:.4f}")
+                    progress_bar.set_postfix(
+                        loss=f"{loss:.4f}",
+                        MAE_ALL_s=f"{mae_all:.4f}",
+                        MAE_BOX=f"{mae_box:.4f}",
+                        MAE_CLS=f"{mae_cls:.4f}",
+                        MAE_kxy=f"{mae_kxy:.4f}",
+                        MAE_v=f"{mae_v:.4f}",
+                        MAE_depoly=f"{mae_dep_all:.4f}"
+                    )
+                    ema.update(student)
+                    global_step += 1
 
-                    ema.update(student)               # ✅ 補上這行
-                    global_step += 1                  # ✅ 建議 distill 也一致累加
 
 # ==================================================================
             
