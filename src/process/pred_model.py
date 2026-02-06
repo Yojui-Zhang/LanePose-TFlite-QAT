@@ -301,3 +301,4 @@ def choose_student_split_order(student_infer, teacher, sample_one,
     reorder_idx = [split_index_by_len[l] for l in teacher_orders[best_order]]
     print(f"✅ Alignment complete: lens_perm={best_perm}, teacher_order={best_order}, MAE={best_mae:.6e}")
     return best_perm, reorder_idx
+

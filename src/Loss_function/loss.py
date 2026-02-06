@@ -1,4 +1,3 @@
-
 import tensorflow as tf
 import config
 
@@ -67,3 +66,5 @@ def distill_loss_pose(y_teacher, y_student,
             config.W_KPT_XY * kxy_l +
             config.W_KPT_S  * ks_l)
     return loss
+
+

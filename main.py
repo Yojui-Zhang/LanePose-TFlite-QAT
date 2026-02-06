@@ -40,7 +40,7 @@ Local imports from your project
 '''
 import config
 
-from src.process.data import (build_dataset, compute_class_weights)
+from src.process.data import (build_dataset, build_train_val_datasets, compute_class_weights)
 from src.process.load_model import try_load_keras_model
 from src.process.interrupt_signal import install_interrupt_handlers
 from src.process.device import (enable_gpu_mem_growth, setup_mixed_precision)
@@ -466,12 +466,15 @@ def main():
     # 3) 準備資料集
     print("\n--- Preparing Dataset ---")
     
-    ds, n_files = build_dataset(
+    ds_train, ds_val, n_train, n_val = build_train_val_datasets(
         img_glob=config.REP_DIR_train,
         batch=config.BATCH,
+        val_split=getattr(config, 'VAL_SPLIT', 0.0),
+        shuffle=True,
         with_labels=(config.TRAIN_SUPERVISION == "label")
     )
-    steps_per_epoch = max(1, n_files // config.BATCH)
+    steps_per_epoch = max(1, n_train // config.BATCH)
+    val_steps = max(1, n_val // config.BATCH) if (ds_val is not None and n_val > 0) else 0
 
     class_weights = compute_class_weights(
         img_glob=config.REP_DIR_train,
@@ -483,15 +486,24 @@ def main():
     try:
         if getattr(config, "EXPORT_ONLY", False):
             print("\n=== EXPORT_ONLY: skip training, use current/loaded weights ===")
-            export_only(student, teacher, ds, output_paths, tag="export_only")
+            export_only(student, teacher, ds_train, output_paths, tag="export_only")
             end_time = time.time()
             print(f"\n--- 🎉 Done (EXPORT_ONLY) in {((end_time - start_time) / 60):.2f} minutes. ---")
             return
         else:
-            loss_history = run_qat(student, teacher, ds, steps_per_epoch, output_paths, class_weights)
+            loss_history = run_qat(
+                student, teacher,
+                ds_train, steps_per_epoch, output_paths,
+                class_weights=class_weights,
+                ds_val=ds_val,
+                val_steps=val_steps,
+            )
 
             if getattr(config, "PLOT_Switch", False):
-                plot_and_save_loss_curve(loss_history, output_paths['loss_plot'])
+                try:
+                    plot_and_save_loss_curve(loss_history, output_paths['loss_plot'])
+                except Exception as e:
+                    print(f"[plot][WARN] failed, skip plotting: {e}")
 
     except KeyboardInterrupt:
         print("\n[⚠️ Interrupt] KeyboardInterrupt caught. Will export current weights...\n")
@@ -565,7 +577,16 @@ def main():
             
             # 7) 導出 SavedModel
             print("\n--- Exporting SavedModel ---")
-            export_mod = ExportModule( student_infer, C=C, apply_chmap=False, ch_map=None, apply_sigmoid_cls=False, apply_sigmoid_kptv=False )
+            export_mod = ExportModule(
+                student_infer,
+                C=C,
+                apply_chmap=False,
+                ch_map=None,
+                apply_sigmoid_box=True,
+                apply_sigmoid_cls=True,
+                apply_sigmoid_kptxy=True,
+                apply_sigmoid_kptv=True,
+            )
             
             saved_model_path = str(output_paths['models'] / ("qat_saved_model_interrupted" if config.STOP_REQUESTED else "qat_saved_model"))
             concrete_fn = export_mod.serving_fn.get_concrete_function()
@@ -614,3 +635,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

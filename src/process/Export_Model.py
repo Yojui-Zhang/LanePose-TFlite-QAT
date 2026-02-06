@@ -99,7 +99,10 @@ class ExportModule(tf.Module):
     """
     def __init__(self, model, C,
                  apply_chmap=False, ch_map=None,
-                 apply_sigmoid_cls=True, apply_sigmoid_kptv=True):
+                 apply_sigmoid_box=True,
+                 apply_sigmoid_cls=True,
+                 apply_sigmoid_kptxy=True,
+                 apply_sigmoid_kptv=True):
         super().__init__()
         self.model = model
         self.C = int(C)
@@ -108,7 +111,9 @@ class ExportModule(tf.Module):
             self.ch_map = tf.constant(list(map(int, ch_map)), tf.int32)  # 長度= C
         else:
             self.ch_map = None
+        self.apply_sigmoid_box = bool(apply_sigmoid_box)
         self.apply_sigmoid_cls = bool(apply_sigmoid_cls)
+        self.apply_sigmoid_kptxy = bool(apply_sigmoid_kptxy)
         self.apply_sigmoid_kptv = bool(apply_sigmoid_kptv)
 
     @tf.function(input_signature=[tf.TensorSpec([1, config.IMGSZ, config.IMGSZ, 3], tf.float32, name="images")])
@@ -132,28 +137,43 @@ class ExportModule(tf.Module):
         if self.apply_chmap and self.ch_map is not None:
             y_bcn = tf.gather(y_bcn, self.ch_map, axis=1)
 
-        # （可選）只對 cls 與 kpt v 做 sigmoid
+        # （可選）對 box/cls/kpt(xy,v) 做 sigmoid，輸出完全符合 TFlite.h decode 期待的 0..1 domain
         if self.apply_sigmoid_cls or self.apply_sigmoid_kptv:
             NUM_CLS = int(config.NUM_CLS)
             NUM_KPT = int(config.NUM_KPT)
             KVAL    = int(config.KPT_VALS)  # 通常 3 -> (x,y,v)
 
-            box = y_bcn[:, 0:4, :]                    # 線性
-            cls = y_bcn[:, 4:4+NUM_CLS, :]            # 可能要 sigmoid
-            kpt = y_bcn[:, 4+NUM_CLS:, :]             # [K*V, N]
+            box = y_bcn[:, 0:4, :]                    # logits by default
+            cls = y_bcn[:, 4:4+NUM_CLS, :]            # logits by default
+            kpt = y_bcn[:, 4+NUM_CLS:, :]             # [K*V, N] logits by default
 
+            # --- box: [cx,cy,w,h] normalized to 0..1 ---
+            if self.apply_sigmoid_box:
+                box = tf.sigmoid(box)
+
+            # --- cls: multi-label sigmoid (matches your training BCEWithLogits) ---
             if self.apply_sigmoid_cls and NUM_CLS > 0:
                 cls = tf.sigmoid(cls)
 
-            if self.apply_sigmoid_kptv and NUM_KPT > 0 and KVAL >= 3:
-                # reshape 成 (B, K, V, N)，對 v 通道做 sigmoid，再攤回去
+            # --- kpt: reshape to (B,K,V,N) then apply sigmoid to xy/v as configured ---
+            if NUM_KPT > 0:
                 B = tf.shape(y_bcn)[0]
                 N = tf.shape(y_bcn)[2]
                 kpt = tf.reshape(kpt, [B, NUM_KPT, KVAL, N])  # (B,K,V,N)
-                kxy = kpt[:, :, 0:2, :]                       # 線性
-                kv  = tf.sigmoid(kpt[:, :, 2:3, :])           # 機率
-                kpt = tf.concat([kxy, kv], axis=2)            # (B,K,3,N)
-                kpt = tf.reshape(kpt, [B, NUM_KPT*KVAL, N])   # (B,K*V,N)
+
+                kxy = kpt[:, :, 0:2, :]
+                if self.apply_sigmoid_kptxy:
+                    kxy = tf.sigmoid(kxy)
+
+                if KVAL >= 3:
+                    kv = kpt[:, :, 2:3, :]
+                    if self.apply_sigmoid_kptv:
+                        kv = tf.sigmoid(kv)
+                    kpt = tf.concat([kxy, kv], axis=2)          # (B,K,3,N)
+                else:
+                    kpt = kxy                                    # (B,K,2,N)
+
+                kpt = tf.reshape(kpt, [B, NUM_KPT*KVAL, N])      # (B,K*V,N)
 
             y_bcn = tf.concat([box, cls, kpt], axis=1)        # (B,C,N)
 
@@ -513,5 +533,7 @@ def run_diagnostics_once(
         v_k = var_across_N(out_keras, ch)
         v_t = var_across_N(out_tfl, ch)
         print(f"  ch {name:>8s} | var Keras={v_k:.3e} | var TFLite={v_t:.3e}")
+
+
 
 

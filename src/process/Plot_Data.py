@@ -1,4 +1,4 @@
-
+import tensorflow as tf
 import config
 
 import os
@@ -26,17 +26,43 @@ def plot_and_save_lr_schedule(schedule, total_steps, save_path):
     plt.close()
     print(f"📈 Learning rate schedule plot saved to {save_path}")
 
-def plot_and_save_loss_curve(history, save_path):
-    """繪製損失曲線並儲存。"""
+def plot_and_save_loss_curve(history, save_path, y_key="train_total"):
+    """支援:
+      1) history = [float, float, ...]
+      2) history = [{"epoch":1, "train_total":..., "val_total":...}, ...]
+    """
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    if history is None or len(history) == 0:
+        print("[plot] history is empty, skip.")
+        return
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    # case: list of dict
+    if isinstance(history, (list, tuple)) and isinstance(history[0], dict):
+        xs = [h.get("epoch", i + 1) for i, h in enumerate(history)]
+        ys = [h.get(y_key, np.nan) for h in history]
+    else:
+        xs = list(range(1, len(history) + 1))
+        ys = history
+
+    ys = np.asarray(ys, dtype=np.float32)
+
     plt.figure(figsize=(10, 5))
-    plt.plot(range(1, len(history) + 1), history)
-    plt.title('Distillation Loss Curve')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
+    plt.plot(xs, ys, label=y_key)
+    plt.title("Loss Curve")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
     plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
     print(f"📉 Loss curve plot saved to {save_path}")
+
 
     
 def save_gt_and_plot(step, batch_imgs, batch_dict,
@@ -236,6 +262,12 @@ def save_pred_and_plot(
         cls_all = pred[:, 4:4 + num_cls]            # (N, num_cls)
         kpt_all = pred[:, 4 + num_cls:]             # (N, num_kpt * kpt_vals)
 
+
+        # Sigmoid ***********************
+        # cls_all = tf.sigmoid(cls_all)
+        # kpt_all[...,2] = tf.sigmoid(kpt_all[...,2])
+
+
         # 選出 conf & cls_id
         cls_ids  = np.argmax(cls_all, axis=-1)      # (N,)
         cls_conf = np.max(cls_all, axis=-1)         # (N,)
@@ -316,5 +348,7 @@ def save_pred_and_plot(
             df = pd.DataFrame(csv_rows, columns=columns)
 
         df.to_csv(csv_path, index=False, float_format="%.6f")
+
+
 
 

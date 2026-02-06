@@ -7,14 +7,18 @@ Training Settings
 '''
 
 IMGSZ = 640
-BATCH = 8
+SEED = 42
+VAL_SPLIT = 0.05  # 建議 2%~10% 做驗證 (label 模式)
+BATCH = 2
 EPOCHS = 20              # 可先跑 5~10 看收斂
 
-base_lr = 0.01
-end_lr = 0.01
+base_lr = 0.001  # QAT 建議從小 LR fine-tune 起跑
+end_lr = 0.0001
 momentum = 0.9
 
 LETTERBOX_PAD_VALUE = 114.0 / 255.0 
+
+MAX_OBJS = 64   # 單張圖最大標註數
 
 BNSTOP__ = True         # 凍結 BN , Ture不凍結/ False凍結
 USE_AMP = False         # 設定為 True 以啟用混合精度訓練 (Tensor 版本不支援)
@@ -25,12 +29,16 @@ EXPORT_ONLY = False      # True 是否只進行輸出測試（.ckpt）, False �
 TFLITE_QUANT_MODE = "int8"  # 可選: "int8" | "fp16" | "fp32"
 
 # 監督來源：'distill' 或 'label#
-TRAIN_SUPERVISION = 'label'  # 原本只有蒸餾的話改成 'label' 就會走標註訓練
+TRAIN_SUPERVISION = 'label'  # 'label' 或 'distill'
+KD_LOSS_WEIGHT = 1.0
+DEPLOY_LOSS_WEIGHT = 1.0
 
 USE_DFL  = False       # ← 關掉 DFL
 
 # 你的資料：v=0 仍有 xy，所以要開 True
 KPT_SUPERVISE_XY_WHEN_V0 = False
+
+AUTO_TOUCH_MISSING_LABELS = False
 
 KPT_CLASS_MASK = [
     # cls=0 lane: 15 points
@@ -96,6 +104,8 @@ REP_DIR_train = [
 
     # "../Dataset/yolov8data2_20250804/images/*.jpg",
     # "../Dataset/yolov8data2_20250804_enhance/images/*.jpg"
+    #"../dataset/lanepose/acc_datasets/images/*.jpg"
+
     "../dataset/lanepose/acc_datasets/images/*.jpg"
     
 ]
@@ -148,3 +158,14 @@ XYWH_IS_NORMALIZED_01 = False   # 模型輸出是否經過歸一化
 
 STOP_REQUESTED = False          # 全域旗標：一旦收到中斷訊號就設 True
 
+
+
+
+
+# ===================================================
+# Export / TFLite output semantics (must match TFlite.h)
+# ===================================================
+EXPORT_APPLY_SIGMOID_BOX = True
+EXPORT_APPLY_SIGMOID_CLS = True
+EXPORT_APPLY_SIGMOID_KPTXY = True
+EXPORT_APPLY_SIGMOID_KPTV = True

@@ -1,4 +1,3 @@
-
 """
 PoseLabelLoss (TensorFlow): Train directly from YOLOv8-style pose labels.
 Targets:
@@ -318,3 +317,5 @@ def build_targets_from_labels(batch_labels, num_classes:int, num_kpt:int, kpt_va
     pos_mask = tf.convert_to_tensor(pos)
     out['pos_mask'] = pos_mask
     return out, pos_mask, shapes
+
+

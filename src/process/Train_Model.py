@@ -497,496 +497,303 @@ def build_student_qat():
 
 
 
-def run_qat(student, teacher, ds, steps_per_epoch, output_paths, class_weights=None):
-    """
-    ==============================================================================
-    執行 QAT 訓練，並把『學生輸出 N 維（P3/P4/P5）』在 train_step 中重排到與 Teacher 一致。
-    ==============================================================================
-    """
-    # pose_loss = v8PoseLossTF()
-    
-    
-    print("\n--- Starting QAT Fine-tuning ---")
 
-    for l in student.submodules:
-        if isinstance(l, tf.keras.layers.BatchNormalization):
-            l.trainable = config.BNSTOP__
-    print(f" BN layers trainable = {config.BNSTOP__}.")
+def run_qat(student, teacher, ds, steps_per_epoch, output_paths,
+            class_weights=None,
+            ds_val=None,
+            val_steps=0):
+    """
+    2026 update (label-focused):
+    - 在 label 監督下，loss 的 decode 與 export 完全一致：box/cls/kpt(xy,v) 都以 sigmoid 映射到 0..1 domain。
+    - 支援可選 val dataset；以 val_total_loss 做 best checkpoint（比 teacher-mae 更合理）。
+    - 仍保留 distill 路徑（如果 config.TRAIN_SUPERVISION != 'label'）。
+    """
+    # ------------------------------------------------------------
+    # Common setup
+    # ------------------------------------------------------------
+    NUM_CLS, NUM_KPT, KPT_VALS = int(config.NUM_CLS), int(config.NUM_KPT), int(config.KPT_VALS)
+    C = 4 + NUM_CLS + NUM_KPT * KPT_VALS
 
-    # 2) 學習率排程
-    class WarmupCosine(tf.keras.optimizers.schedules.LearningRateSchedule):
-        def __init__(self, base_lr, end_lr, warmup_steps, total_steps):
+    os.makedirs(output_paths['logs'], exist_ok=True)
+    log_csv = output_paths.get('log_csv', os.path.join(output_paths['logs'], "training_log.csv"))
+
+    # learning-rate schedule: warmup + cosine
+    base_lr = float(getattr(config, "base_lr", 1e-3))
+    end_lr  = float(getattr(config, "end_lr", 1e-4))
+    total_steps = int(config.EPOCHS) * int(steps_per_epoch)
+    alpha = max(0.0, min(1.0, end_lr / base_lr)) if base_lr > 0 else 0.0
+
+    cosine = tf.keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=base_lr,
+        decay_steps=max(1, total_steps),
+        alpha=alpha
+    )
+
+    warmup_steps = int(getattr(config, "WARMUP_STEPS", max(100, steps_per_epoch // 2)))
+    class WarmupThen(tf.keras.optimizers.schedules.LearningRateSchedule):
+        def __init__(self, warmup_steps, base_schedule):
             super().__init__()
-            self.base_lr, self.end_lr = float(base_lr), float(end_lr)
-            self.warmup_steps, self.total_steps = int(warmup_steps), int(max(total_steps, warmup_steps + 1))
+            self.warmup_steps = tf.constant(int(warmup_steps), tf.float32)
+            self.base_schedule = base_schedule
+
         def __call__(self, step):
-            step = tf.cast(step, tf.float32)
-            ws, ts = tf.cast(self.warmup_steps, tf.float32), tf.cast(self.total_steps, tf.float32)
-            warm = self.base_lr * (step + 1.0) / tf.maximum(ws, 1.0)
-            t = (step - ws) / tf.maximum(ts - ws, 1.0)
-            cos = self.end_lr + 0.5 * (self.base_lr - self.end_lr) * (1.0 + tf.cos(np.pi * t))
-            return tf.where(step < ws, warm, cos)
-        def get_config(self):
-            return {"base_lr": self.base_lr, "end_lr": self.end_lr, "warmup_steps": self.warmup_steps, "total_steps": self.total_steps}
+            step_f = tf.cast(step, tf.float32)
+            lr = self.base_schedule(step_f)
+            w = tf.clip_by_value(step_f / tf.maximum(self.warmup_steps, 1.0), 0.0, 1.0)
+            return lr * w
 
-    total_steps  = max(1, config.EPOCHS * steps_per_epoch)
-    warmup_steps = min(1000, max(1, total_steps // 10))
-    schedule     = WarmupCosine(config.base_lr, config.end_lr, warmup_steps, total_steps)
-    opt = tf.keras.optimizers.SGD(learning_rate=schedule, momentum=config.momentum, nesterov=True, clipnorm=1.0)
-    if config.USE_AMP:
+    lr_schedule = WarmupThen(warmup_steps, cosine)
+
+    opt = tf.keras.optimizers.SGD(
+        learning_rate=lr_schedule,
+        momentum=float(getattr(config, "momentum", 0.9)),
+        nesterov=bool(getattr(config, "NESTEROV", True)),
+        clipnorm=float(getattr(config, "CLIPNORM", 1.0)),
+    )
+
+    if getattr(config, "USE_AMP", False):
         opt = tf.keras.mixed_precision.LossScaleOptimizer(opt)
-    print(f" Optimizer: SGD + WarmupCosine (total steps: {total_steps}).")
-    
-    if config.PLOT_Switch == True:
-        plot_and_save_lr_schedule(schedule, total_steps, output_paths['lr_plot'])
 
-    try:
-        sample_batch = next(iter(ds))
-        if isinstance(sample_batch, (list, tuple)) and len(sample_batch) >= 2:
-            sample_imgs, label_paths = sample_batch[0], sample_batch[1]
-        else:
-            sample_imgs, label_paths = sample_batch, None
-
-        labels_list = None
-        if label_paths is not None:
-
-            # 轉成 1D 並拿到 numpy
-            lp_np = tf.reshape(label_paths, [-1]).numpy()
-
-            # 安全轉字串：bytes -> str；str 原樣返回
-            def _to_str(x):
-                # x 可能是 bytes 或 str
-                if isinstance(x, (bytes, bytearray)):
-                    return x.decode("utf-8")
-                return str(x)
-
-            paths = [_to_str(p) for p in lp_np]
-
-            labels_list = []
-            for p in paths:
-                # 用 tf.io.gfile.exists 更健壯
-                if tf.io.gfile.exists(p):
-                    with tf.io.gfile.GFile(p, "r") as f:
-                        lines = [ln.strip() for ln in f if ln.strip()]
-                else:
-                    lines = []
-                arr = parse_label_lines(lines, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS)
-                labels_list.append(arr)
-
-            print(f"\nLoaded label files: {len(labels_list)}")
-            for i, arr in enumerate(labels_list):
-                print(f"  img[{i}] -> {arr.shape[0]} objects (shape={arr.shape})")
-
-        sample_one = _ensure_bhwc4(sample_imgs, imgsz=config.IMGSZ)
-        
-
-    except Exception as e:
-        print(f"\n[warn] sample inspect failed: {e}")
-        sample_one = tf.zeros([1, config.IMGSZ, config.IMGSZ, 3], tf.float32)
-    
-# =====================================================
-
-    # 放在 run_qat 裡、train_step_label 定義前先建好
+    # anchors (match student head concat order: P3->P4->P5)
     H3 = config.IMGSZ // 8
     H4 = config.IMGSZ // 16
     H5 = config.IMGSZ // 32
-
     anchors_all = tf.concat([
-        get_anchors(H3, H3, dtype=tf.float32),  # P3
-        get_anchors(H4, H4, dtype=tf.float32),  # P4
-        get_anchors(H5, H5, dtype=tf.float32),  # P5
-    ], axis=0)   # shape: (N_total, 4) = 80^2+40^2+20^2 = 8400
+        get_anchors(H3, H3, dtype=tf.float32),
+        get_anchors(H4, H4, dtype=tf.float32),
+        get_anchors(H5, H5, dtype=tf.float32),
+    ], axis=0)   # (N,4)
 
-# =====================================================
+    # CSV init
+    is_new = not os.path.exists(log_csv)
+    with open(log_csv, "a", newline="") as f:
+        w = csv.writer(f)
+        if is_new:
+            w.writerow([
+                "epoch",
+                "train_total", "train_box", "train_cls", "train_kpt",
+                "val_total", "val_box", "val_cls", "val_kpt",
+                "lr"
+            ])
 
-    # lens_perm, reorder_idx = choose_student_split_order(student, teacher, sample_one, N3, N4, N5, expected_C, 
-    #                                                     config.NUM_CLS, config.NUM_KPT, config.KPT_VALS, )
-    # lens_perm  = tuple(int(x) for x in lens_perm)
-    # reorder_idx = [int(x) for x in reorder_idx]
+    # EMA (optional)
+    ema = ModelEMA(student, decay=getattr(config, "EMA_DECAY", 0.9998))
 
-    # print(f" [TRAIN ALIGN] lens_perm={lens_perm}, reorder_idx={reorder_idx}")
+    # ------------------------------------------------------------
+    # Label supervision path (recommended for stable QAT)
+    # ------------------------------------------------------------
+    def _unpack_batch(batch):
+        if isinstance(batch, (tuple, list)):
+            imgs = batch[0]
+            labels = batch[1] if len(batch) > 1 else None
+            meta = batch[2] if len(batch) > 2 else None
+        else:
+            imgs, labels, meta = batch, None, None
+        return imgs, labels, meta
 
-    # def _reorder_N_blocks(y_BNC):
-    #     s0, s1, s2 = lens_perm   # e.g. (N3, N5, N4)
-    #     parts = tf.split(y_BNC, [s0, s1, s2], axis=1)
-    #     return tf.concat([parts[reorder_idx[0]], parts[reorder_idx[1]], parts[reorder_idx[2]]], axis=1)
 
-    def concat_scales_to_bcn(scales_list):
-        outs = []
-        for t in scales_list:  # t: (B, C, H, W)
-            B, C, H, W = t.shape
-            outs.append(tf.reshape(t, [B, C, H*W]))
-        return tf.concat(outs, axis=2)  # (B, C, N_total)
+    IMGSZ = int(config.IMGSZ)
+    D = 5 + int(config.NUM_KPT) * int(config.KPT_VALS)
+    MAX_M = int(getattr(config, "MAX_OBJS", 64))
+
+    @tf.function(
+        input_signature=[
+            tf.TensorSpec([None, IMGSZ, IMGSZ, 3], tf.float32),
+            tf.TensorSpec([None, MAX_M, D], tf.float32),
+        ],
+        reduce_retracing=True,
+    )
 
     @tf.function
-    def train_step_distill(batch_imgs):
-        # 這個函式維持你原本蒸餾的 tf.function 版本（從原 train_step 的 else branch 重用）
-        NUM_CLS, NUM_KPT, KPT_VALS = config.NUM_CLS, config.NUM_KPT, config.KPT_VALS
-        C = 4 + NUM_CLS + NUM_KPT * KPT_VALS
-        huber = tf.keras.losses.Huber(delta=1.0, reduction="sum_over_batch_size")
-        L_BOX, L_KXY, L_V, L_CLS = 5.0, 9.0, 1.0, (1.0 if NUM_CLS > 0 else 0.0)
-        L_DEPLOY = 2.0
-
-        with tf.GradientTape() as tape:
-            y_t_raw = teacher(batch_imgs, training=False)
-            y_s_out = student(batch_imgs, training=True)
-
-            kd_raw     = y_s_out[1] if isinstance(y_s_out, (list,tuple)) else y_s_out
-            deploy_raw = y_s_out[0] if isinstance(y_s_out, (list,tuple)) else y_s_out
-
-            t_BNC = ensure_BNC_static(y_t_raw, C)
-            s_BNC = ensure_BNC_static(kd_raw, C)
-            d_BNC = ensure_BNC_static(deploy_raw, C)
-
-            t_box, t_cls, t_kxy, t_v = split_BNC(t_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
-            s_box, s_cls, s_kxy, s_v = split_BNC(s_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
-            d_box, d_cls, d_kxy, d_v = split_BNC(d_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
-
-            loss_box = L_BOX * huber(s_box, t_box)
-            loss_kxy = L_KXY * huber(s_kxy, t_kxy) if (s_kxy is not None) else 0.0
-            loss_v   = L_V   * huber(s_v,   t_v  ) if (s_v   is not None) else 0.0
-            loss_cls = L_CLS * huber(s_cls, t_cls) if (NUM_CLS > 0) else 0.0
-
-            loss_box_d = L_BOX * huber(d_box, t_box)
-            loss_kxy_d = L_KXY * huber(d_kxy, t_kxy) if (s_kxy is not None) else 0.0
-            loss_v_d   = L_V   * huber(d_v,   t_v  ) if (s_v   is not None) else 0.0
-            loss_cls_d = L_CLS * huber(d_cls, t_cls) if (NUM_CLS > 0) else 0.0
-
-            loss_kd = loss_box + loss_kxy + loss_v + loss_cls
-            loss_dep = loss_box_d + loss_kxy_d + loss_v_d + loss_cls_d
-
-            loss = loss_kd + L_DEPLOY * loss_dep
-            scaled_loss = opt.get_scaled_loss(loss) if config.USE_AMP else loss
-
-        scaled_grads = tape.gradient(scaled_loss, student.trainable_variables)
-        grads = opt.get_unscaled_gradients(scaled_grads) if config.USE_AMP else scaled_grads
-        opt.apply_gradients(zip(grads, student.trainable_variables))
-
-        # return metrics (你原本使用的那組)
-        mae_box_s = tf.reduce_mean(tf.abs(s_box - t_box))
-        mae_kxy_s = tf.reduce_mean(tf.abs(s_kxy - t_kxy)) if (s_kxy is not None) else 0.0
-        mae_v_s   = tf.reduce_mean(tf.abs(s_v   - t_v  )) if (s_v   is not None) else 0.0
-        mae_cls_s = tf.reduce_mean(tf.abs(s_cls - t_cls)) if (NUM_CLS > 0) else 0.0
-        mae_all_s = (mae_box_s + mae_kxy_s + mae_v_s + mae_cls_s)
-
-        mae_box_d = tf.reduce_mean(tf.abs(d_box - t_box))
-        mae_kxy_d = tf.reduce_mean(tf.abs(d_kxy - t_kxy)) if (d_kxy is not None) else 0.0
-        mae_v_d   = tf.reduce_mean(tf.abs(d_v   - t_v  )) if (d_v   is not None) else 0.0
-        mae_cls_d = tf.reduce_mean(tf.abs(d_cls - t_cls)) if (NUM_CLS > 0) else 0.0
-        mae_all_d = (mae_box_d + mae_kxy_d + mae_v_d + mae_cls_d)
-
-        return loss, mae_all_s, mae_box_s, mae_cls_s, mae_kxy_s, mae_v_s, mae_all_d
-    
-    @tf.function(reduce_retracing=True)
     def train_step_label(batch_imgs, batch_labels):
-        NUM_CLS, NUM_KPT, KPT_VALS = config.NUM_CLS, config.NUM_KPT, config.KPT_VALS
-        C = 4 + NUM_CLS + NUM_KPT * KPT_VALS
-
-        # Build GT dict in-graph (no python list / numpy)
         batch_dict = build_batch_dict_from_padded_labels(
             batch_labels, num_kpt=NUM_KPT, kpt_vals=KPT_VALS
         )
-
         with tf.GradientTape() as tape:
             y_s_out = student(batch_imgs, training=True)
-
             kd_raw     = y_s_out[1] if isinstance(y_s_out, (list, tuple)) else y_s_out
             deploy_raw = y_s_out[0] if isinstance(y_s_out, (list, tuple)) else y_s_out
 
-            # Flatten to (B,N,C) using your existing utility
             s_BNC = ensure_BNC_static(kd_raw, C)
             d_BNC = ensure_BNC_static(deploy_raw, C)
 
-            anchors_kd  = anchors_all
-            anchors_dep = anchors_all
-
-            # Safety checks
-            tf.debugging.assert_equal(
-                tf.shape(s_BNC)[1], tf.shape(anchors_kd)[0],
-                message="[KD] N_pred != anchors_kd"
+            # loss on both branches (keep your original design; can re-weight)
+            loss_kd, *logs_kd = pose_loss_from_labels(
+                s_BNC, batch_dict, anchors_all,
+                num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS,
+                class_weights=class_weights
             )
-            tf.debugging.assert_equal(
-                tf.shape(d_BNC)[1], tf.shape(anchors_dep)[0],
-                message="[DEP] N_pred != anchors_dep"
-            )
-
-            # Compute loss (same as your original logic)
-            loss_kd, *logs_kd_tuple = pose_loss_from_labels(
-                s_BNC, batch_dict, anchors_kd,
+            loss_dep, *logs_dep = pose_loss_from_labels(
+                d_BNC, batch_dict, anchors_all,
                 num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS,
                 class_weights=class_weights
             )
 
-            loss_dep, *logs_dep_tuple = pose_loss_from_labels(
-                d_BNC, batch_dict, anchors_dep,
-                num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS,
-                class_weights=class_weights
-            )
+            total_loss = float(getattr(config, "KD_LOSS_WEIGHT", 1.0)) * loss_kd + \
+                         float(getattr(config, "DEPLOY_LOSS_WEIGHT", 1.0)) * loss_dep
 
-            total_loss = loss_kd + loss_dep
-
-            if config.USE_AMP:
+            if getattr(config, "USE_AMP", False):
                 scaled_loss = opt.get_scaled_loss(total_loss)
             else:
                 scaled_loss = total_loss
 
-        if config.USE_AMP:
+        if getattr(config, "USE_AMP", False):
             scaled_grads = tape.gradient(scaled_loss, student.trainable_variables)
             grads = opt.get_unscaled_gradients(scaled_grads)
         else:
             grads = tape.gradient(total_loss, student.trainable_variables)
 
         opt.apply_gradients(zip(grads, student.trainable_variables))
+        ema.update(student)
 
+        # deploy-side breakdown is more meaningful (matches deployment head)
         logs = {
-            "kd_loss": loss_kd,
-            "dep_loss": loss_dep,
+            "total": total_loss,
+            "box": logs_dep[0] if logs_dep else 0.0,
+            "cls": logs_dep[1] if logs_dep else 0.0,
+            "kpt": logs_dep[2] if logs_dep else 0.0,
         }
-        # Keep your deploy-side breakdown
-        if logs_dep_tuple:
-            logs["box_loss"] = logs_dep_tuple[0]
-            logs["cls_loss"] = logs_dep_tuple[1]
-            logs["kpt_loss"] = logs_dep_tuple[2]
+        return logs
 
-        return total_loss, logs
-
-    def debug_plot_step(batch_imgs, batch_labels, step_int):
-        """
-        Eager-only debug. Call occasionally (e.g. every 100 steps).
-        """
-        NUM_CLS, NUM_KPT, KPT_VALS = config.NUM_CLS, config.NUM_KPT, config.KPT_VALS
-        C = 4 + NUM_CLS + NUM_KPT * KPT_VALS
-
-        batch_dict = build_batch_dict_from_padded_labels(batch_labels, NUM_KPT, KPT_VALS)
-
+    @tf.function
+    def val_step_label(batch_imgs, batch_labels):
+        batch_dict = build_batch_dict_from_padded_labels(
+            batch_labels, num_kpt=NUM_KPT, kpt_vals=KPT_VALS
+        )
         y_s_out = student(batch_imgs, training=False)
-        kd_raw     = y_s_out[1] if isinstance(y_s_out, (list, tuple)) else y_s_out
         deploy_raw = y_s_out[0] if isinstance(y_s_out, (list, tuple)) else y_s_out
-
         d_BNC = ensure_BNC_static(deploy_raw, C)
 
-        save_gt_and_plot(
-            step=step_int,
-            batch_imgs=batch_imgs,
-            batch_dict=batch_dict,
-            num_kpt=NUM_KPT,
-            kpt_vals=KPT_VALS,
-            out_dir=output_paths['plots'],
-            max_images=1,
+        loss_dep, *logs_dep = pose_loss_from_labels(
+            d_BNC, batch_dict, anchors_all,
+            num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS,
+            class_weights=class_weights
         )
+        logs = {
+            "total": loss_dep,
+            "box": logs_dep[0] if logs_dep else 0.0,
+            "cls": logs_dep[1] if logs_dep else 0.0,
+            "kpt": logs_dep[2] if logs_dep else 0.0,
+        }
+        return logs
 
-        save_pred_and_plot(
-            step=step_int,
-            batch_imgs=batch_imgs,
-            pred_raw=d_BNC,
-            num_cls=NUM_CLS,
-            num_kpt=NUM_KPT,
-            kpt_vals=KPT_VALS,
-            anchors=anchors_all,
-            out_dir=output_paths['plots'],
-            max_images=1,
-            score_thr=0.3,
-        )
-
-
-    # 6) 評估：epoch 末計算 MAE（Student vs Teacher）與 across-N 變異數
-    def eval_epoch_metrics(x_eval):
-        NUM_CLS  = config.NUM_CLS
-        NUM_KPT  = config.NUM_KPT
-        KPT_VALS = config.KPT_VALS
-        expected_C = 4 + NUM_CLS + NUM_KPT * KPT_VALS
-
-        # Teacher 輸出
-        out_teacher = teacher(x_eval, training=False)
-        y_t_BNC = ensure_BNC_static(out_teacher, expected_C)
-        # y_t_BNC = normalize_teacher_pred(
-        #     teacher(x_eval, training=False),
-        #     expected_C=expected_C,
-        #     num_cls=NUM_CLS, num_kpt=NUM_KPT, kpt_vals=KPT_VALS,
-        #     batch_imgs=x_eval, target_domain='pixel', return_detected=False
-        # )
-        
-        t_box, t_cls, t_kxy, t_ksc = split_BNC(y_t_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
-
-        # Student KD 分支
-        out = student(x_eval, training=False)
-        kd_raw = out[1] if isinstance(out, (list, tuple)) and len(out) == 2 else out
-
-        # ★ 保證 BNC + 重排
-        kd_BNC = ensure_BNC_static(kd_raw, expected_C)
-        # kd_BNC = _reorder_N_blocks(kd_BNC)
-        s_box, s_cls, s_kxy, s_ksc = split_BNC(kd_BNC, NUM_CLS, NUM_KPT, KPT_VALS)
-        # s_box, s_cls, s_kxy, s_ksc = align_student_to_domain(
-        #     kd_BNC, NUM_CLS, NUM_KPT, KPT_VALS, batch_imgs=x_eval, target_domain_is_pixel=False
-        # )
-
-        mae_box = tf.reduce_mean(tf.abs(t_box - s_box))
-        mae_cls = tf.reduce_mean(tf.abs(t_cls - s_cls))
-        mae_kpt = tf.reduce_mean(tf.abs(t_kxy - s_kxy))
-        mae_ksc = tf.reduce_mean(tf.abs(t_ksc - s_ksc))
-
-        return mae_box, mae_cls, mae_kpt, mae_ksc
-
-    # 7) 訓練迴圈 + 每 epoch 末評估並寫 CSV
+    # ------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------
     loss_history = []
-    with open(output_paths['log_csv'], 'w', newline='') as csvfile:
-        csv_writer = csv.writer(csvfile)
-        csv_writer.writerow(['epoch', 'loss', 'learning_rate', 'mae_box', 'mae_cls', 'mae_kpt', 'mae_ksc'])
+    best_metric = float("inf")
+    global_step = 0
 
-        global_step = 0
+    # materialize val iterator once (repeat=False)
+    for e in range(int(config.EPOCHS)):
+        if getattr(config, "STOP_REQUESTED", False):
+            print("[⚠️ Interrupt] Stop requested. Stop before starting next epoch.")
+            break
 
-        best_mae_box = float("inf")
-        sample_one = None
+        train_total = tf.keras.metrics.Mean()
+        train_box   = tf.keras.metrics.Mean()
+        train_cls   = tf.keras.metrics.Mean()
+        train_kpt   = tf.keras.metrics.Mean()
 
-        # ✅ 建 EMA 前要 build weights，但用 dummy input（避免吃掉 ds）
-        # 這裡用 config.IMGSZ 產生一張假的圖 build（不影響 ds）
-        H = int(config.IMGSZ) if not isinstance(config.IMGSZ, (list, tuple)) else int(config.IMGSZ[0])
-        W = int(config.IMGSZ) if not isinstance(config.IMGSZ, (list, tuple)) else int(config.IMGSZ[1])
-        dummy = tf.zeros([1, H, W, 3], dtype=tf.float32)
-        _ = student(dummy, training=False)
-
-        ema = ModelEMA(student, decay=getattr(config, "EMA_DECAY", 0.9998))
-
-
-        for e in range(config.EPOCHS):
-            epoch_loss_agg = tf.keras.metrics.Mean()
-            it = iter(ds)
-
-            progress_bar = tqdm(range(steps_per_epoch), desc=f"Epoch {e+1}/{config.EPOCHS}", unit="step")
-            for _ in progress_bar:
-
-                if config.STOP_REQUESTED:                     # <<< 新增
-                    print("[⚠️ Interrupt] Stop requested. Leaving training loop...")   # <<< 新增
-                    break                               # <<< 新增
-
-                batch = next(it)
-                batch_meta = None
-                batch_labels = None
-                if isinstance(batch, (list, tuple)):
-                    batch_imgs = batch[0]
-                    batch_labels = batch[1] if len(batch) > 1 else None
-                    batch_meta   = batch[2] if len(batch) > 2 else None
-                else:
-                    batch_imgs, batch_labels, batch_meta = batch, None, None
-
-
-                if sample_one is None:
-                    sample_one = batch_imgs[:1]
-
-# ==================================================================
-                if config.TRAIN_SUPERVISION == 'label' and batch_labels is not None:
-
-                    # 相容舊路徑：如果第二個輸出還是 string，代表你還在用 lbl_path 模式
-                    if batch_labels.dtype == tf.string:
-                        #（你舊的讀檔流程可以留著當 fallback；但正常情況 main.py 已經 with_labels=True 不會走到這）
-                        lp_np = tf.reshape(batch_labels, [-1]).numpy()
-                        def _to_str(x):
-                            if isinstance(x, (bytes, bytearray)):
-                                return x.decode('utf-8')
-                            return str(x)
-                        paths = [_to_str(p) for p in lp_np]
-
-                        labels_list = []
-                        for p in paths:
-                            if tf.io.gfile.exists(p):
-                                with tf.io.gfile.GFile(p, "r") as f:
-                                    lines = [ln.strip() for ln in f if ln.strip()]
-                            else:
-                                lines = []
-                            arr = parse_label_lines(lines, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS)
-                            labels_list.append(arr)
-
-                    else:
-                        # ✅ 新路徑：batch_labels 已經是 [B, M, D]，且已完成 letterbox 座標映射
-                        # ✅ keep labels as Tensor, no numpy, no python list
-                        batch_labels = tf.cast(batch_labels, tf.float32)
-
-                        # (optional) debug plot outside graph
-                        DEBUG_EVERY = 100
-                        if config.PLOT_Switch and DEBUG_EVERY > 0 and (global_step % DEBUG_EVERY == 0):
-                            # 只 debug 1 張，省很多時間
-                            debug_plot_step(batch_imgs[:1], batch_labels[:1], int(global_step))
-
-
-                    loss, loss_log = train_step_label(batch_imgs, batch_labels)
-
-                    ema.update(student)
-                    global_step += 1
-                    epoch_loss_agg.update_state(loss)
-
-                    # for tqdm formatting: convert tensors to python floats
-                    loss_v = float(loss.numpy())
-                    box_v  = float(loss_log.get("box_loss", 0.0).numpy()) if "box_loss" in loss_log else 0.0
-                    cls_v  = float(loss_log.get("cls_loss", 0.0).numpy()) if "cls_loss" in loss_log else 0.0
-                    kpt_v  = float(loss_log.get("kpt_loss", 0.0).numpy()) if "kpt_loss" in loss_log else 0.0
-
-                    progress_bar.set_postfix(
-                        loss=f"{loss_v:.4f}",
-                        box=f"{box_v:.4f}",
-                        cls=f"{cls_v:.4f}",
-                        kpt=f"{kpt_v:.4f}",
-                    )
-
-                else:
-                    # distill path (fast, tf.function)
-                    loss, mae_all, mae_box, mae_cls, mae_kxy, mae_v, mae_dep_all = train_step_distill(batch_imgs)
-                    epoch_loss_agg.update_state(loss)
-                    progress_bar.set_postfix(
-                        loss=f"{loss:.4f}",
-                        MAE_ALL_s=f"{mae_all:.4f}",
-                        MAE_BOX=f"{mae_box:.4f}",
-                        MAE_CLS=f"{mae_cls:.4f}",
-                        MAE_kxy=f"{mae_kxy:.4f}",
-                        MAE_v=f"{mae_v:.4f}",
-                        MAE_depoly=f"{mae_dep_all:.4f}"
-                    )
-                    ema.update(student)
-                    global_step += 1
-
-
-# ==================================================================
-            
-
-            # 如果剛剛收到中斷，直接跳出 epoch 迴圈
-            if config.STOP_REQUESTED:
-                avg_loss = epoch_loss_agg.result().numpy().item() if epoch_loss_agg.count.numpy() > 0 else float('nan')
-                print(f"[⚠️ Interrupt] Early stop at epoch {e+1}. Avg Loss so far: {avg_loss}")
+        it = iter(ds)
+        progress = tqdm(range(int(steps_per_epoch)), desc=f"Epoch {e+1}/{int(config.EPOCHS)}", unit="step")
+        for _ in progress:
+            if getattr(config, "STOP_REQUESTED", False):
+                print("[⚠️ Interrupt] Stop requested. Leaving epoch loop...")
                 break
+            batch = next(it)
+            batch_imgs, batch_labels, _ = _unpack_batch(batch)
 
-            avg_loss = epoch_loss_agg.result().numpy().item()
-            current_lr = schedule((e + 1) * steps_per_epoch).numpy().item()
-            loss_history.append(avg_loss)
+            if config.TRAIN_SUPERVISION != 'label':
+                raise RuntimeError("This run_qat rewrite focuses on TRAIN_SUPERVISION='label'. Please set it in config.py.")
 
-            # -------- epoch end: 用 EMA 權重評估 & 存 best --------
-            if sample_one is None:
-                # 理論上不會發生，除非 steps_per_epoch=0
-                sample_one = dummy
+            if batch_labels is None:
+                raise ValueError("Label supervision requires dataset with_labels=True (batch_labels is None).")
 
-            ema.apply_to(student)
+            logs = train_step_label(batch_imgs, batch_labels)
+            train_total.update_state(logs["total"])
+            train_box.update_state(logs["box"])
+            train_cls.update_state(logs["cls"])
+            train_kpt.update_state(logs["kpt"])
+
+            lr_now = float(lr_schedule(global_step).numpy())
+            progress.set_postfix(
+                loss=f"{float(logs['total']):.4f}",
+                box=f"{float(logs['box']):.4f}",
+                cls=f"{float(logs['cls']):.4f}",
+                kpt=f"{float(logs['kpt']):.4f}",
+                lr=f"{lr_now:.2e}",
+            )
+            global_step += 1
+
+        # ----- validation -----
+        val_total = val_box = val_cls = val_kpt = 0.0
+        if ds_val is not None and int(val_steps or 0) > 0:
+            val_total_m = tf.keras.metrics.Mean()
+            val_box_m   = tf.keras.metrics.Mean()
+            val_cls_m   = tf.keras.metrics.Mean()
+            val_kpt_m   = tf.keras.metrics.Mean()
+
+            for batch in ds_val.take(int(val_steps)):
+                batch_imgs, batch_labels, _ = _unpack_batch(batch)
+                logs = val_step_label(batch_imgs, batch_labels)
+                val_total_m.update_state(logs["total"])
+                val_box_m.update_state(logs["box"])
+                val_cls_m.update_state(logs["cls"])
+                val_kpt_m.update_state(logs["kpt"])
+
+            val_total = float(val_total_m.result().numpy())
+            val_box   = float(val_box_m.result().numpy())
+            val_cls   = float(val_cls_m.result().numpy())
+            val_kpt   = float(val_kpt_m.result().numpy())
+
+        train_total_v = float(train_total.result().numpy())
+        train_box_v   = float(train_box.result().numpy())
+        train_cls_v   = float(train_cls.result().numpy())
+        train_kpt_v   = float(train_kpt.result().numpy())
+
+        lr_epoch = float(lr_schedule(global_step).numpy())
+
+        # log CSV
+        with open(log_csv, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                e + 1,
+                train_total_v, train_box_v, train_cls_v, train_kpt_v,
+                val_total, val_box, val_cls, val_kpt,
+                lr_epoch
+            ])
+
+        loss_history.append({
+            "epoch": e + 1,
+            "train_total": train_total_v,
+            "train_box": train_box_v,
+            "train_cls": train_cls_v,
+            "train_kpt": train_kpt_v,
+            "val_total": val_total,
+            "val_box": val_box,
+            "val_cls": val_cls,
+            "val_kpt": val_kpt,
+            "lr": lr_epoch,
+        })
+
+        # ----- save best -----
+        metric = val_total if (ds_val is not None and int(val_steps or 0) > 0) else train_total_v
+        if metric < best_metric:
+            best_metric = metric
+            best_path = output_paths.get("best_weights", str(output_paths["models"] / "student_best.weights.h5"))
+            student.save_weights(best_path)
+            print(f"[BEST] ✅ Saved best weights to: {best_path} (metric={best_metric:.6f})")
+
+            # also save EMA weights as best_ema if you want
             try:
-                mae_box_t, mae_cls_t, mae_kpt_t, mae_ksc_t = eval_epoch_metrics(sample_one)
-                mae_box_t = float(mae_box_t.numpy())
-                mae_cls_t = float(mae_cls_t.numpy())
-                mae_kpt_t = float(mae_kpt_t.numpy())
-                mae_ksc_t = float(mae_ksc_t.numpy())
-
-                csv_writer.writerow([e + 1, f"{avg_loss:.6f}", f"{current_lr:.8f}",
-                                    f"{mae_box_t:.6f}", f"{mae_cls_t:.6f}", f"{mae_kpt_t:.6f}", f"{mae_ksc_t:.6f}"])
-
-                print(f"[EMA] Epoch {e+1}/{config.EPOCHS} - Avg Loss: {avg_loss:.4f}, LR: {current_lr:.6f} | "
-                    f"MAE(box/cls/kpt/ksc): {mae_box_t:.4f}/{mae_cls_t:.4f}/{mae_kpt_t:.4f}/{mae_ksc_t:.4f}")
-
-                if mae_box_t < best_mae_box:
-                    best_mae_box = mae_box_t
-                    best_path = output_paths.get("best_weights", "student_best_ema.weights.h5")
-                    student.save_weights(best_path)
-                    print(f"[EMA] ✅ Saved best EMA weights to: {best_path} (best_mae_box={best_mae_box:.6f})")
-
+                ema.apply_to(student)
+                best_ema_path = output_paths.get("best_ema_weights", str(output_paths["models"] / "student_best_ema.weights.h5"))
+                student.save_weights(best_ema_path)
+                print(f"[BEST][EMA] ✅ Saved best EMA weights to: {best_ema_path}")
             finally:
                 ema.restore(student)
-            # ---------------------------------------------
 
-
-    print(f"✅ Training finished. Log saved to {output_paths['log_csv']}")
+    print(f"✅ Training finished. Log saved to {log_csv}")
     return loss_history
 

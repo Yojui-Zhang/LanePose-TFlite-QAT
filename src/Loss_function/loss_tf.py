@@ -196,7 +196,7 @@ def decode_yolo_pose_outputs(
     kpt_vals,
     box_act="sigmoid",
     cls_act="sigmoid",
-    kpt_xy_act=None,      # None: identity + clip, "sigmoid": sigmoid
+    kpt_xy_act="sigmoid",  # default: sigmoid (stable gradient, matches export/inference)
     kpt_v_act="sigmoid",  # visibility 建議 sigmoid
 ):
     """
@@ -249,20 +249,28 @@ def decode_yolo_pose_outputs(
 
     if kpt_vals == 2:
         kxy = kpt[..., :2]
-        if kpt_xy_act == "sigmoid":
+        if kpt_xy_act in ("sigmoid", "logistic", None):
             kxy = tf.sigmoid(kxy)
-        else:
+        elif kpt_xy_act == "tanh":
+            kxy = (tf.tanh(kxy) + 1.0) / 2.0
+        elif kpt_xy_act in ("identity", "clip"):
             kxy = tf.clip_by_value(kxy, 0.0, 1.0)
+        else:
+            raise ValueError(f"Unknown kpt_xy_act: {kpt_xy_act}")
         pred_kpt_flat = tf.reshape(kxy, (-1, tf.shape(y)[1], num_kpt * 2))
 
     elif kpt_vals == 3:
         kxy = kpt[..., :2]
         kv  = kpt[..., 2:3]
 
-        if kpt_xy_act == "sigmoid":
+        if kpt_xy_act in ("sigmoid", "logistic", None):
             kxy = tf.sigmoid(kxy)
-        else:
+        elif kpt_xy_act == "tanh":
+            kxy = (tf.tanh(kxy) + 1.0) / 2.0
+        elif kpt_xy_act in ("identity", "clip"):
             kxy = tf.clip_by_value(kxy, 0.0, 1.0)
+        else:
+            raise ValueError(f"Unknown kpt_xy_act: {kpt_xy_act}")
 
         if kpt_v_act == "sigmoid":
             kv = tf.sigmoid(kv)
@@ -618,3 +626,5 @@ def pose_loss_from_labels(
 
     total_loss = loss_box + loss_cls + loss_kpt
     return total_loss, loss_box, loss_cls, loss_kpt
+
+

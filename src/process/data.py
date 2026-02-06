@@ -19,6 +19,82 @@ import config
 AUTOTUNE = tf.data.AUTOTUNE
 
 @tf.function
+
+# ============================================================
+# 2026 update: deterministic train/val split helpers
+# ============================================================
+
+def list_image_files(img_glob):
+    """Return sorted unique image file paths for a glob pattern or list of patterns."""
+    all_files = []
+    patterns = [img_glob] if isinstance(img_glob, str) else list(img_glob)
+    for pattern in patterns:
+        all_files.extend(glob.glob(pattern))
+    files = sorted(list(set(all_files)))
+    if not files:
+        raise FileNotFoundError(f"No images found for patterns: {img_glob}")
+    return files
+
+def split_train_val(files, val_split=0.0, seed=42):
+    """Deterministic split by filename order (no randomness in TF graph)."""
+    files = list(files)
+    if not val_split or val_split <= 0.0:
+        return files, []
+    n = len(files)
+    n_val = max(1, int(round(n * float(val_split))))
+    # stable: last part for val
+    train_files = files[:-n_val]
+    val_files = files[-n_val:]
+    return train_files, val_files
+
+def build_dataset_from_files(files, batch=config.BATCH, shuffle=True, repeat=True, with_labels=False):
+    """Build tf.data dataset from an explicit list of file paths."""
+    files = list(files)
+    ds = tf.data.Dataset.from_tensor_slices(files)
+
+    MAX_M = int(getattr(config, "MAX_OBJS", 64))
+    D = 5 + int(config.NUM_KPT) * int(config.KPT_VALS)
+
+    if shuffle:
+        ds = ds.shuffle(len(files), reshuffle_each_iteration=True, seed=getattr(config, 'SEED', 42))
+    if with_labels:
+        ds = ds.map(tf_parse_load_with_labels, num_parallel_calls=AUTOTUNE)
+        ds = ds.padded_batch(
+            batch,
+            padded_shapes=(
+                [config.IMGSZ, config.IMGSZ, 3],   # img
+                [MAX_M, D],                        # labels: 固定 M
+                [5],                               # meta
+            ),
+            padding_values=(
+                tf.constant(0.0, tf.float32),
+                tf.constant(0.0, tf.float32),
+                tf.constant(0.0, tf.float32),
+            ),
+            drop_remainder=False
+        ).prefetch(AUTOTUNE)
+
+        opt = tf.data.Options()
+        opt.experimental_deterministic = False  # 允許非確定性提升吞吐
+        ds = ds.with_options(opt)
+
+    else:
+        ds = ds.map(tf_parse_load, num_parallel_calls=AUTOTUNE)
+        ds = ds.batch(batch).prefetch(AUTOTUNE)
+    if repeat:
+        ds = ds.repeat()
+    return ds
+
+def build_train_val_datasets(img_glob, batch=config.BATCH, val_split=0.0, shuffle=True, with_labels=False):
+    """Return (ds_train, ds_val, n_train, n_val)."""
+    files = list_image_files(img_glob)
+    train_files, val_files = split_train_val(files, val_split=val_split, seed=getattr(config, 'SEED', 42))
+    ds_train = build_dataset_from_files(train_files, batch=batch, shuffle=shuffle, repeat=True, with_labels=with_labels)
+    ds_val   = None
+    if val_files:
+        ds_val = build_dataset_from_files(val_files, batch=batch, shuffle=False, repeat=False, with_labels=with_labels)
+    return ds_train, ds_val, len(train_files), len(val_files)
+
 def img_to_label_path_tf(img_path: tf.Tensor) -> tf.Tensor:
     # 1) folder: /images/ -> /labels/
     lbl_path = tf.strings.regex_replace(img_path, r"/images/", "/labels/")
@@ -124,20 +200,26 @@ def build_dataset(img_glob, batch=config.BATCH, shuffle=True, repeat=True, with_
         ds = ds.map(tf_parse_load_with_labels, num_parallel_calls=AUTOTUNE)
 
         D = 5 + int(config.NUM_KPT) * int(config.KPT_VALS)
+        MAX_M = int(getattr(config, "MAX_OBJS", 64))
+
         ds = ds.padded_batch(
             batch,
             padded_shapes=(
-                [int(config.IMGSZ), int(config.IMGSZ), 3],  # img
-                [None, D],                                  # labels
-                [5],                                        # meta
+                [config.IMGSZ, config.IMGSZ, 3],   # img
+                [MAX_M, D],                        # labels: 固定 M
+                [5],                               # meta
             ),
             padding_values=(
                 tf.constant(0.0, tf.float32),
                 tf.constant(0.0, tf.float32),
                 tf.constant(0.0, tf.float32),
             ),
-            drop_remainder=False
+            drop_remainder=True
         ).prefetch(AUTOTUNE)
+
+        opt = tf.data.Options()
+        opt.experimental_deterministic = False  # 允許非確定性提升吞吐
+        ds = ds.with_options(opt)
 
     else:
         ds = ds.map(tf_parse_load, num_parallel_calls=AUTOTUNE)
@@ -230,3 +312,5 @@ def rep_data_gen():
             scaleup=True
         )
         yield [tf.expand_dims(img_lb, 0).numpy().astype(np.float32)]
+
+

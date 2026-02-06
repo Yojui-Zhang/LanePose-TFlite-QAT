@@ -67,3 +67,4 @@ def try_load_keras_model(export_dir):
     wrapped = SMWrapper(saved, input_name, output_key, single_out_spec)
     print(f"\n[INFO] Wrapped SavedModel signature into Keras-like model. input_name={input_name}, output_key={output_key}, single_out_shape={single_out_shape}")
     return wrapped, False
+

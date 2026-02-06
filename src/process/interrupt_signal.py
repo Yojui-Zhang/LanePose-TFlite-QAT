@@ -1,4 +1,3 @@
-
 import config
 import signal
 
@@ -15,3 +14,4 @@ def install_interrupt_handlers():
             print(f"\n\n[⚠️ Interrupt] Caught {name}. Will stop after current step and export current weights...\n")
     signal.signal(signal.SIGINT, _handler)
     signal.signal(signal.SIGTERM, _handler)
+

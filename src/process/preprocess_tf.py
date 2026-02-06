@@ -71,3 +71,5 @@ def decode_and_letterbox(img_path, new_size=config.IMGSZ, pad_value=_PAD, scaleu
     img = tf.image.convert_image_dtype(img, tf.float32)  # [0,1]
     return letterbox_tf(img, new_size=new_size, pad_value=pad_value, scaleup=scaleup)
 
+
+

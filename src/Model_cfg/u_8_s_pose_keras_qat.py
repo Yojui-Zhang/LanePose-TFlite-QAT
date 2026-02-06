@@ -414,7 +414,7 @@ def build_u8s_pose_dual(
     num_classes: int = 7,
     num_kpt: int = 15,
     kpt_vals: int = 3,
-    width_mult: float = 1.0,
+    width_mult: float = 3.0,
     depth_mult: float = 1.0,
 ):
     C = 4 + num_classes + num_kpt * kpt_vals
@@ -483,7 +483,7 @@ def build_u8s_pose_dual_distill(
     num_classes: int = 7,
     num_kpt: int = 15,
     kpt_vals: int = 3,
-    width_mult: float = 1.0,
+    width_mult: float = 3.0,
     depth_mult: float = 1.0,
 ):
     C = 4 + num_classes + num_kpt * kpt_vals
@@ -542,3 +542,4 @@ if __name__ == '__main__':
     x = tf.random.uniform([2, 640, 640, 3], 0, 1, dtype=tf.float32)
     y = m(x)
     print('Output shape:', y.shape)
+
