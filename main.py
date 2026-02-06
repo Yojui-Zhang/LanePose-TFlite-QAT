@@ -46,12 +46,15 @@ from src.process.interrupt_signal import install_interrupt_handlers
 from src.process.device import (enable_gpu_mem_growth, setup_mixed_precision)
 from src.process.Train_Model import (build_student_qat, run_qat, choose_student_split_order, 
                                      assert_kd_path_not_quantized, probe_kd_output_distribution,
-                                     _ensure_bhwc4)
+                                     _ensure_bhwc4, build_batch_dict_from_padded_labels,
+                                     get_anchors)
 
 from src.process.Export_Model import (ExportModule, run_diagnostics_once,export_only, 
                                       create_and_configure_tflite_converter)
 
 from src.process.pred_model import (ensure_BNC_static, make_ultra_infer_model)
+
+from src.process.Plot_Data import (save_gt_and_plot, save_pred_and_plot)
 
 if config.PLOT_Switch == True:
     from src.process.Plot_Data import plot_and_save_loss_curve
@@ -509,27 +512,63 @@ def main():
         print("\n[⚠️ Interrupt] KeyboardInterrupt caught. Will export current weights...\n")
     finally:
         
-# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝ ERROR ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
-        # # if config.TRAIN_SUPERVISION == 'label':
+# ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝ Draw Val ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
         
-        # student = make_ultra_infer_model(student, branch='kd')   # 或 'deploy' 視你需要
+        if (getattr(config, "PLOT_Switch", False) and ds_val is not None and val_steps > 0):
+            # 取一個 batch
+            sample = next(iter(ds_val))
+            batch_imgs, batch_labels = sample[0], sample[1]
 
-        # # 計算 C 值
-        # C = 4 + config.NUM_CLS + config.NUM_KPT * config.KPT_VALS
-        # conf_thr = 0.4
+            # GT：labels -> batch_dict（自動排除 padding）
+            batch_dict = build_batch_dict_from_padded_labels(
+                batch_labels, num_kpt=config.NUM_KPT, kpt_vals=config.KPT_VALS
+            )
 
-        # for i in range(3):
-        #     # 執行推論並儲存 .txt 檔案
-        #     sample_one, y_t_BNC, kd_BNC, dep_BNC = save_model_outputs_to_txt(
-        #         teacher, student, ds, C, output_paths
-        #     )
+            # Pred：用 student 的 deploy branch 來畫
+            y_s_out = student(batch_imgs, training=False)
+            dep_raw = y_s_out[0] if isinstance(y_s_out, (list, tuple)) else y_s_out
 
-        #     # 繪製視覺化結果並儲存 .png 檔案
-        #     save_visualization_results_to_png(
-        #         sample_one, y_t_BNC, kd_BNC, dep_BNC, output_paths, i, conf_thr
-        #     )
-        
-        
+            conf_thr = getattr(config, "VIZ_CONF_THR", 0.4)
+
+            # [FIX 2] 生成 Anchors (必須與 Train_Model.py 邏輯一致)
+            # -----------------------------------------------------------
+            # P3(stride 8), P4(stride 16), P5(stride 32)
+            H3 = config.IMGSZ // 8
+            H4 = config.IMGSZ // 16
+            H5 = config.IMGSZ // 32
+            
+            # 使用 TensorFlow 運算確保型別正確 (N, 4)
+            anchors_all = tf.concat([
+                get_anchors(H3, H3, dtype=tf.float32),
+                get_anchors(H4, H4, dtype=tf.float32),
+                get_anchors(H5, H5, dtype=tf.float32),
+            ], axis=0)
+            # -----------------------------------------------------------
+
+            save_gt_and_plot(
+                step=0,
+                batch_imgs=batch_imgs,
+                batch_dict=batch_dict,
+                num_kpt=config.NUM_KPT,
+                kpt_vals=config.KPT_VALS,
+                out_dir=str(output_paths["plots"] / "gt"),
+                max_images=3,
+            )
+
+            # 現在 anchors_all 已經定義，可以安全傳入
+            save_pred_and_plot(
+                step=0,
+                batch_imgs=batch_imgs,
+                pred_raw=dep_raw,
+                num_cls=config.NUM_CLS,
+                num_kpt=config.NUM_KPT,
+                kpt_vals=config.KPT_VALS,
+                anchors=anchors_all,  # ✅ Fixed
+                out_dir=str(output_paths["plots"] / "pred"),
+                max_images=3,
+                score_thr=conf_thr,
+            )
+
 # ＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝
         
         if not getattr(config, "EXPORT_ONLY", False):

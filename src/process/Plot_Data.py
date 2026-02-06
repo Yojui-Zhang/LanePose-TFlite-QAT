@@ -31,9 +31,6 @@ def plot_and_save_loss_curve(history, save_path, y_key="train_total"):
       1) history = [float, float, ...]
       2) history = [{"epoch":1, "train_total":..., "val_total":...}, ...]
     """
-    import os
-    import numpy as np
-    import matplotlib.pyplot as plt
 
     if history is None or len(history) == 0:
         print("[plot] history is empty, skip.")
