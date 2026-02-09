@@ -1,6 +1,11 @@
 # File: verify_install.py
-import sys
 import os
+import sys
+
+# 1. Force Legacy Keras BEFORE any imports
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+os.environ["KERAS_BACKEND"] = "tensorflow"
+
 import logging
 from pathlib import Path
 

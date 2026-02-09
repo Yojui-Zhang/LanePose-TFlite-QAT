@@ -1,9 +1,19 @@
 # Source File: main.py
-
+import os
 import sys
+import math
+import random
+
+# Force TF2 Keras mode BEFORE any imports - MUST BE FIRST
+if 'TF_USE_LEGACY_KERAS' not in os.environ:
+    os.environ['TF_USE_LEGACY_KERAS'] = '1'
+if 'KERAS_BACKEND' not in os.environ:
+    os.environ['KERAS_BACKEND'] = 'tensorflow'
+
 import logging
 from pathlib import Path
 from typing import Tuple, Optional
+import numpy as np
 
 # ==============================================================================
 # 1. Environment Setup (CRITICAL: Must be first)
@@ -32,6 +42,7 @@ def initialize_system(config: AppConfig) -> None:
     logging.info("="*60)
     
     check_tf_version()
+    set_global_reproducibility(config)
     enable_gpu_mem_growth()
     
     logging.info("[Init] Validating configuration...")
@@ -40,17 +51,51 @@ def initialize_system(config: AppConfig) -> None:
     logging.info("[Init] Validating data access...")
     validate_data_access(config)
 
+    enforce_qat_precision_policy(config)
     setup_mixed_precision(config.USE_AMP)
     logging.info("[Init] System Ready.\n")
+
+def set_global_reproducibility(config: AppConfig) -> None:
+    """Sets global RNG states and deterministic runtime switches."""
+    logging.info(f"[Init] Setting global seed to {config.SEED}")
+    random.seed(config.SEED)
+    np.random.seed(config.SEED)
+    tf.keras.utils.set_random_seed(config.SEED)
+
+    if os.environ.get("TF_DETERMINISTIC_OPS", "0") == "1":
+        logging.warning(
+            "[Init] Detected TF_DETERMINISTIC_OPS=1 in environment. "
+            "QAT FakeQuant gradients on GPU are not deterministic-safe; forcing TF_DETERMINISTIC_OPS=0."
+        )
+        os.environ["TF_DETERMINISTIC_OPS"] = "0"
+
+    if config.DETERMINISTIC:
+        logging.warning(
+            "[Init] DETERMINISTIC=True requested, but QAT FakeQuant gradients are not fully "
+            "deterministic-safe on GPU. Forcing DETERMINISTIC=False to avoid runtime UNIMPLEMENTED errors."
+        )
+        config.DETERMINISTIC = False
+        os.environ["TF_DETERMINISTIC_OPS"] = "0"
+
+def enforce_qat_precision_policy(config: AppConfig) -> None:
+    """
+    TFMOT QAT fake-quant ops require float32 inputs. Mixed-float16 causes
+    FakeQuantWithMinMaxVars type mismatch during quantize_apply.
+    """
+    if config.USE_AMP:
+        logging.warning("[Init] USE_AMP=True is incompatible with TFMOT QAT. Forcing USE_AMP=False.")
+        config.USE_AMP = False
 
 def prepare_data(config: AppConfig) -> Tuple[tf.data.Dataset, Optional[tf.data.Dataset], int, int, Optional[float]]:
     """Builds data pipeline and calculates steps."""
     logging.info("[Data] Building Pipeline...")
     pipeline = DataPipeline(config)
     
-    # Calculate Class Weights (Optional)
-    class_weights = pipeline.compute_class_weights()
-    # class_weights = None 
+    class_weights = None
+    if config.USE_CLASS_WEIGHTS:
+        class_weights = pipeline.compute_class_weights()
+    else:
+        logging.info("[Data] Class weights disabled (Ultralytics parity mode).")
 
     ds_train, ds_val, num_train, num_val = pipeline.get_train_val_datasets()
     
@@ -58,8 +103,11 @@ def prepare_data(config: AppConfig) -> Tuple[tf.data.Dataset, Optional[tf.data.D
     if config.BATCH_SIZE <= 0:
         raise ValueError(f"Batch size must be > 0. Got {config.BATCH_SIZE}")
 
-    steps_per_epoch = max(1, num_train // config.BATCH_SIZE)
-    val_steps = max(1, num_val // config.BATCH_SIZE) if num_val > 0 else 0
+    if config.TRAIN_DROP_REMAINDER:
+        steps_per_epoch = max(1, num_train // config.BATCH_SIZE)
+    else:
+        steps_per_epoch = max(1, math.ceil(num_train / config.BATCH_SIZE))
+    val_steps = max(1, math.ceil(num_val / config.BATCH_SIZE)) if num_val > 0 else 0
     
     logging.info(f"[Data] Train: {num_train} imgs ({steps_per_epoch} steps/epoch)")
     logging.info(f"[Data] Val:   {num_val} imgs ({val_steps} steps/epoch)")

@@ -2,7 +2,7 @@ import tensorflow as tf
 import numpy as np
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Generator, Tuple, List
+from typing import Dict, Optional, Generator, Tuple, List, Set
 
 from QAT_Refactored.config.config import AppConfig
 from QAT_Refactored.models.layers import RepVGGBlock
@@ -36,6 +36,14 @@ class ExportModule(tf.Module):
 class Exporter:
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
+
+    def _normalized_quant_mode(self) -> str:
+        mode = str(self.cfg.TFLITE_QUANT_MODE).lower()
+        if mode in ("float32", "fp32"):
+            return "fp32"
+        if mode == "float16":
+            return "fp16"
+        return mode
 
     @staticmethod
     def _unwrap_repvgg(layer: tf.keras.layers.Layer) -> Optional[tf.keras.layers.Layer]:
@@ -146,10 +154,11 @@ class Exporter:
         """
         對應 main.py 的第 2 步：執行量化轉換 [cite: 86-91]
         """
-        logging.info(f"[Exporter] Phase 2: Converting to TFLite ({self.cfg.TFLITE_QUANT_MODE})")
+        quant_mode = self._normalized_quant_mode()
+        logging.info(f"[Exporter] Phase 2: Converting to TFLite ({quant_mode})")
         converter = tf.lite.TFLiteConverter.from_saved_model(str(saved_model_path))
         
-        if self.cfg.TFLITE_QUANT_MODE == "int8":
+        if quant_mode == "int8":
             converter.optimizations = [tf.lite.Optimize.DEFAULT]
             if rep_dataset_gen:
                 converter.representative_dataset = rep_dataset_gen
@@ -160,14 +169,17 @@ class Exporter:
             else:
                 logging.warning("[Exporter] No representative dataset; falling back to dynamic range[cite: 89].")
 
-        elif self.cfg.TFLITE_QUANT_MODE == "fp16":
+        elif quant_mode == "fp16":
             converter.optimizations = [tf.lite.Optimize.DEFAULT]
             converter.target_spec.supported_types = [tf.float16]
+        elif quant_mode != "fp32":
+            raise ValueError(f"Unsupported TFLITE_QUANT_MODE: {self.cfg.TFLITE_QUANT_MODE}")
 
         tflite_model = converter.convert()
         with open(output_path, "wb") as f: f.write(tflite_model)
         
         logging.info(f"[Exporter] TFLite saved: {output_path} ({len(tflite_model)/1024:.1f} KB)")
+        self._validate_tflite_contract(output_path)
         self._print_cpp_config()
 
     def export(self, model: tf.keras.Model, rep_dataset: Optional[Generator] = None) -> None:
@@ -184,3 +196,70 @@ class Exporter:
         print("\n" + "="*60 + "\n [C++ INTEGRATION] Copy this to your 'config.h'\n" + "="*60)
         print(self.cfg.generate_cpp_header_snippet())
         print("="*60 + "\n")
+
+    def _validate_tflite_contract(self, model_path: Path) -> None:
+        """
+        Validate export contract required by TFlite.h:
+        - Input:  (1, H, W, 3) float32 (RGB, NHWC)
+        - Output: (1, C, N) float32 where C=4+NUM_CLASS+NUM_KPT*3 and N=NUM_BOXES
+        """
+        interpreter = tf.lite.Interpreter(model_path=str(model_path))
+        interpreter.allocate_tensors()
+
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+
+        if len(input_details) != 1 or len(output_details) != 1:
+            raise ValueError(
+                "[Exporter] TFLite contract mismatch: expected single-input single-output model "
+                f"for TFlite.h, got inputs={len(input_details)}, outputs={len(output_details)}."
+            )
+
+        in_shape = tuple(int(v) for v in input_details[0]["shape"])
+        out_shape = tuple(int(v) for v in output_details[0]["shape"])
+        in_dtype = input_details[0]["dtype"]
+        out_dtype = output_details[0]["dtype"]
+
+        expected_in = tuple(int(v) for v in self.cfg.EXPORT_INPUT_SHAPE)
+        expected_out = (
+            1,
+            int(self.cfg.total_output_channels),
+            int(self.cfg.get_total_anchors()),
+        )
+
+        if in_shape != expected_in:
+            raise ValueError(
+                "[Exporter] Input shape mismatch for TFlite.h. "
+                f"Expected {expected_in}, got {in_shape}."
+            )
+        if out_shape != expected_out:
+            raise ValueError(
+                "[Exporter] Output shape mismatch for TFlite.h parser (expects [1, C, N]). "
+                f"Expected {expected_out}, got {out_shape}."
+            )
+        if in_dtype != np.float32 or out_dtype != np.float32:
+            raise ValueError(
+                "[Exporter] DType mismatch for TFlite.h typed_tensor<float>. "
+                f"Expected float32 input/output, got input={in_dtype}, output={out_dtype}."
+            )
+
+        dummy = np.zeros(expected_in, dtype=np.float32)
+        interpreter.set_tensor(input_details[0]["index"], dummy)
+        interpreter.invoke()
+        y = interpreter.get_tensor(output_details[0]["index"])
+
+        if not np.all(np.isfinite(y)):
+            raise ValueError("[Exporter] Non-finite values detected in TFLite output.")
+
+        ymin = float(np.min(y))
+        ymax = float(np.max(y))
+        if ymin < -1e-3 or ymax > 1.0 + 1e-3:
+            raise ValueError(
+                "[Exporter] Output range is outside expected [0,1] sigmoid domain for TFlite.h parsing. "
+                f"Observed min={ymin:.6f}, max={ymax:.6f}."
+            )
+
+        logging.info(
+            "[Exporter] TFLite contract validated for TFlite.h "
+            f"(input={in_shape}, output={out_shape}, range=[{ymin:.4f}, {ymax:.4f}])."
+        )

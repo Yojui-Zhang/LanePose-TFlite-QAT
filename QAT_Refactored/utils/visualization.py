@@ -3,6 +3,7 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from pathlib import Path
+from typing import Optional
 from QAT_Refactored.utils.tensor_layout import ensure_bnc_np
 
 
@@ -39,18 +40,98 @@ class Colors:
 
 colors = Colors()
 
-def draw_on_image(img, boxes, kpts=None, class_ids=None, scores=None, conf_thres=0.25):
+def _cxcywh_to_xyxy_np(boxes: np.ndarray) -> np.ndarray:
+    """Convert normalized [cx, cy, w, h] boxes to [x1, y1, x2, y2]."""
+    b = np.asarray(boxes, dtype=np.float32)
+    if b.size == 0:
+        return b.reshape(0, 4)
+    x1 = b[:, 0] - 0.5 * b[:, 2]
+    y1 = b[:, 1] - 0.5 * b[:, 3]
+    x2 = b[:, 0] + 0.5 * b[:, 2]
+    y2 = b[:, 1] + 0.5 * b[:, 3]
+    return np.stack([x1, y1, x2, y2], axis=1)
+
+def _iou_with_one_np(one_box_xyxy: np.ndarray, boxes_xyxy: np.ndarray) -> np.ndarray:
+    """Compute IoU between one box and many boxes (xyxy format)."""
+    if boxes_xyxy.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    x1 = np.maximum(one_box_xyxy[0], boxes_xyxy[:, 0])
+    y1 = np.maximum(one_box_xyxy[1], boxes_xyxy[:, 1])
+    x2 = np.minimum(one_box_xyxy[2], boxes_xyxy[:, 2])
+    y2 = np.minimum(one_box_xyxy[3], boxes_xyxy[:, 3])
+
+    inter_w = np.maximum(0.0, x2 - x1)
+    inter_h = np.maximum(0.0, y2 - y1)
+    inter = inter_w * inter_h
+
+    area_a = np.maximum(0.0, one_box_xyxy[2] - one_box_xyxy[0]) * np.maximum(0.0, one_box_xyxy[3] - one_box_xyxy[1])
+    area_b = np.maximum(0.0, boxes_xyxy[:, 2] - boxes_xyxy[:, 0]) * np.maximum(0.0, boxes_xyxy[:, 3] - boxes_xyxy[:, 1])
+    union = area_a + area_b - inter
+    return inter / np.maximum(union, 1e-9)
+
+def tflite_style_nms_indices(
+    boxes_cxcywh: np.ndarray,
+    scores: np.ndarray,
+    class_ids: np.ndarray,
+    iou_thresh_bbox: float = 0.45,
+    iou_thresh_lane: float = 0.45,
+    lane_class_id: int = 0,
+    max_det: int = 300,
+) -> np.ndarray:
+    """
+    NMS close to TFlite.h logic:
+    - if both classes are non-lane -> use bbox threshold
+    - otherwise -> use lane threshold
+    """
+    boxes = np.asarray(boxes_cxcywh, dtype=np.float32).reshape(-1, 4)
+    scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+    class_ids = np.asarray(class_ids, dtype=np.int32).reshape(-1)
+
+    if boxes.shape[0] == 0:
+        return np.zeros((0,), dtype=np.int32)
+
+    order = np.argsort(scores)[::-1]
+    boxes_xyxy = _cxcywh_to_xyxy_np(np.clip(boxes, 0.0, 1.0))
+    keep = []
+
+    while order.size > 0 and len(keep) < max_det:
+        i = int(order[0])
+        keep.append(i)
+        if order.size == 1:
+            break
+
+        rest = order[1:]
+        ious = _iou_with_one_np(boxes_xyxy[i], boxes_xyxy[rest])
+
+        cls_i = class_ids[i]
+        cls_rest = class_ids[rest]
+        both_non_lane = np.logical_and(cls_i != lane_class_id, cls_rest != lane_class_id)
+        suppress_bbox = ious > float(iou_thresh_bbox)
+        suppress_lane = ious > float(iou_thresh_lane)
+        suppress = np.where(both_non_lane, suppress_bbox, suppress_lane)
+        order = rest[~suppress]
+
+    return np.asarray(keep, dtype=np.int32)
+
+def draw_on_image(
+    img: np.ndarray,
+    boxes: np.ndarray,
+    kpts: Optional[np.ndarray] = None,
+    class_ids: Optional[np.ndarray] = None,
+    scores: Optional[np.ndarray] = None,
+    conf_thres: float = 0.25,
+) -> np.ndarray:
     """
     在單張圖片上繪製 Box 與 Keypoints。
-    img: numpy array (H, W, 3) range [0, 255], uint8
+    img: numpy array (H, W, 3) range [0, 255], uint8, RGB
     boxes: (N, 4) [cx, cy, w, h] normalized [0, 1]
-    kpts: (N, K*V) normalized [0, 1]
+    kpts: (N, K*V) 或 (N, K, V) normalized [0, 1]
+    return: BGR image (for OpenCV drawing and later cvtColor(BGR2RGB) in matplotlib)
     """
     h, w = img.shape[:2]
-    img_draw = img.copy() # Avoid modifying original
-
-    # 確保是 contiguous array 以便 OpenCV 繪圖
-    img_draw = np.ascontiguousarray(img_draw)
+    # Batch pipeline yields RGB tensors; convert once so OpenCV draws on BGR consistently.
+    img_draw = cv2.cvtColor(np.ascontiguousarray(img.copy()), cv2.COLOR_RGB2BGR)
 
     if boxes is None or len(boxes) == 0:
         return img_draw
@@ -85,18 +166,23 @@ def draw_on_image(img, boxes, kpts=None, class_ids=None, scores=None, conf_thres
 
         # Draw Keypoints
         if kpts is not None and len(kpts) > i:
-            # Reshape flat kpts to (K, V)
-            # 假設 V=3 (x, y, v) 或 V=2 (x, y)
-            k = kpts[i]
-            num_points = len(k) // 3 # Guessing V=3
-            if len(k) % 3 != 0: 
-                num_points = len(k) // 2 # Fallback to V=2
+            # Why: 同時支援 flat 與 (K,V)；避免用 len(k)//3 猜測導致 reshape/繪製錯誤。
+            k = np.asarray(kpts[i])
+            if k.ndim == 2:
+                k2 = k
+            elif k.ndim == 1:
+                if (k.size % 3) == 0:
+                    k2 = k.reshape((-1, 3))
+                elif (k.size % 2) == 0:
+                    k2 = k.reshape((-1, 2))
+                else:
+                    continue
+            else:
+                continue
 
-            k = k.reshape((num_points, -1))
-            
-            for j in range(num_points):
-                kx, ky = k[j, 0], k[j, 1]
-                vis = k[j, 2] if k.shape[1] > 2 else 1.0
+            for j in range(k2.shape[0]):
+                kx, ky = float(k2[j, 0]), float(k2[j, 1])
+                vis = float(k2[j, 2]) if k2.shape[1] > 2 else 1.0
                 
                 if vis > 0.5 and kx != 0 and ky != 0:
                     px, py = int(kx * w), int(ky * h)
@@ -154,8 +240,24 @@ def save_gt_and_plot(batch_imgs, batch_labels, output_dir, step, prefix="val_gt"
     plt.close()
     print(f"[Vis] Saved GT plot to {save_path}")
 
-def save_pred_and_plot(batch_imgs, preds, output_dir, step, prefix="val_pred",
-                       max_imgs=4, conf_thres=0.25, num_cls=7, total_C=None):
+def save_pred_and_plot(
+    batch_imgs: tf.Tensor,
+    preds: tf.Tensor,
+    output_dir,
+    step: int,
+    prefix: str = "val_pred",
+    max_imgs: int = 4,
+    conf_thres: float = 0.25,
+    num_cls: int = 7,
+    num_kpt: int = 17,
+    kpt_vals: int = 3,
+    total_C: Optional[int] = None,
+    force_draw_topk_if_empty: int = 1,
+    nms_iou_thres_bbox: float = 0.45,
+    nms_iou_thres_lane: float = 0.45,
+    lane_class_id: int = 0,
+    max_det: int = 300,
+) -> None:
     """
     preds: Tensor (B, C, N) 或 (B, N, C)
     """
@@ -179,8 +281,10 @@ def save_pred_and_plot(batch_imgs, preds, output_dir, step, prefix="val_pred",
         img = imgs_np[i]
         p = preds_np[i]  # (N, C)
 
-        if p.shape[1] < (4 + num_cls):
-            raise ValueError(f"[Vis] invalid channel count: C={p.shape[1]} < 4+num_cls={4+num_cls}")
+        needed_c = 4 + num_cls + (num_kpt * kpt_vals)
+        if p.shape[1] < needed_c:
+            raise ValueError(f"[Vis] invalid channel count: C={p.shape[1]} < needed={needed_c}")
+ 
 
         # --- 2) decode ---
         box = p[:, :4]
@@ -194,15 +298,70 @@ def save_pred_and_plot(batch_imgs, preds, output_dir, step, prefix="val_pred",
         else:
             cls_prob = cls_raw
 
-        scores = np.max(cls_prob, axis=1)
-        class_ids = np.argmax(cls_prob, axis=1)
+        kpt_raw = p[:, 4+num_cls:4+num_cls+(num_kpt*kpt_vals)]
+        if kpt_raw.size == 0:
+            kpt = None
+        else:
+            if np.min(kpt_raw) < 0 or np.max(kpt_raw) > 1.0:
+                kpt_raw = 1 / (1 + np.exp(-kpt_raw))  # sigmoid
+            kpt = kpt_raw.reshape((-1, num_kpt, kpt_vals))  # (N,K,V)
 
-        mask = scores > conf_thres
-        valid_box = box[mask]
-        valid_scores = scores[mask]
-        valid_cls = class_ids[mask]
 
-        img_res = draw_on_image(img, valid_box, class_ids=valid_cls, scores=valid_scores, conf_thres=conf_thres)
+        scores = np.max(cls_prob, axis=1).astype(np.float32)
+        class_ids = np.argmax(cls_prob, axis=1).astype(np.int32)
+
+        candidate_idx = np.where(scores > conf_thres)[0]
+        used_topk_fallback = False
+
+        if candidate_idx.size > 0:
+            keep_local = tflite_style_nms_indices(
+                boxes_cxcywh=box[candidate_idx],
+                scores=scores[candidate_idx],
+                class_ids=class_ids[candidate_idx],
+                iou_thresh_bbox=nms_iou_thres_bbox,
+                iou_thresh_lane=nms_iou_thres_lane,
+                lane_class_id=lane_class_id,
+                max_det=max_det,
+            )
+            keep_idx = candidate_idx[keep_local]
+            valid_box = box[keep_idx]
+            valid_scores = scores[keep_idx]
+            valid_cls = class_ids[keep_idx]
+            valid_kpt = (kpt[keep_idx] if (kpt is not None) else None)
+        else:
+            valid_box = np.zeros((0, 4), dtype=np.float32)
+            valid_scores = np.zeros((0,), dtype=np.float32)
+            valid_cls = np.zeros((0,), dtype=np.int32)
+            valid_kpt = (np.zeros((0, num_kpt, kpt_vals), dtype=np.float32) if (kpt is not None) else None)
+
+        # Why: 若全數 < conf_thres，圖會「完全空白」造成誤判；至少畫出 top-k 便於判讀分數是否被壓低。
+        if valid_box.shape[0] == 0 and force_draw_topk_if_empty > 0 and box.shape[0] > 0:
+            topk = int(min(force_draw_topk_if_empty, scores.shape[0]))
+            top_idx = np.argsort(scores)[-topk:][::-1]
+            valid_box = box[top_idx]
+            valid_scores = scores[top_idx]
+            valid_cls = class_ids[top_idx]
+            valid_kpt = (kpt[top_idx] if (kpt is not None) else None)
+            used_topk_fallback = True
+
+        # console summary (debug)
+        try:
+            mx = float(np.max(scores)) if scores.size else 0.0
+            cnt = int(candidate_idx.size) if scores.size else 0
+            cnt_nms = int(valid_box.shape[0])
+            print(f"[Vis] step={step} img={i} max_score={mx:.4f} cnt>{conf_thres}={cnt} nms={cnt_nms}")
+        except Exception:
+            pass
+
+        draw_conf_thres = 0.0 if used_topk_fallback else conf_thres
+        img_res = draw_on_image(
+            img,
+            valid_box,
+            kpts=valid_kpt,
+            class_ids=valid_cls,
+            scores=valid_scores,
+            conf_thres=draw_conf_thres,
+        )
 
         axes[i].imshow(cv2.cvtColor(img_res, cv2.COLOR_BGR2RGB))
         axes[i].axis('off')

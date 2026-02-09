@@ -30,7 +30,15 @@ class DataPipeline:
         for p in patterns:
             # 支援 pathlib 物件自動轉字串
             p_str = str(p)
-            found = glob.glob(p_str)
+            if os.path.isdir(p_str):
+                found = []
+                for ext in ("jpg", "jpeg", "png", "bmp", "webp"):
+                    found.extend(glob.glob(os.path.join(p_str, "**", f"*.{ext}"), recursive=True))
+                    found.extend(glob.glob(os.path.join(p_str, "**", f"*.{ext.upper()}"), recursive=True))
+            elif os.path.exists(p_str) and os.path.isfile(p_str):
+                found = [p_str]
+            else:
+                found = glob.glob(p_str)
             if not found:
                 logging.warning(f"[Data] Pattern matched 0 files: {p_str}")
             all_files.extend(found)
@@ -108,7 +116,7 @@ class DataPipeline:
                     [5]                                  # Meta
                 ),
                 padding_values=(0.0, 0.0, 0.0),
-                drop_remainder=training # 訓練時丟棄不完整 Batch 以穩定 Batch Norm
+                drop_remainder=(training and self.cfg.TRAIN_DROP_REMAINDER)
             )
         else:
             ds = ds.map(self._parse_function_no_label, num_parallel_calls=self.autotune)
@@ -126,11 +134,18 @@ class DataPipeline:
         對外主要接口：取得 Train 與 Val Dataset
         """
         logging.info("[Data] Scanning for training files...")
-        files = self.list_files(self.cfg.TRAIN_PATTERNS)
-        logging.info(f"[Data] Found {len(files)} total images.")
-        
-        train_files, val_files = self.split_train_val(files)
-        logging.info(f"[Data] Split: {len(train_files)} Train, {len(val_files)} Val")
+        train_files = self.list_files(self.cfg.TRAIN_PATTERNS)
+        logging.info(f"[Data] Found {len(train_files)} training images.")
+
+        if self.cfg.VAL_PATTERNS:
+            val_files = self.list_files(self.cfg.VAL_PATTERNS)
+            logging.info(f"[Data] Using explicit VAL_PATTERNS with {len(val_files)} images.")
+        elif self.cfg.VAL_PATTERN:
+            val_files = self.list_files([self.cfg.VAL_PATTERN])
+            logging.info(f"[Data] Using explicit VAL_PATTERN with {len(val_files)} images.")
+        else:
+            train_files, val_files = self.split_train_val(train_files)
+            logging.info(f"[Data] Split: {len(train_files)} Train, {len(val_files)} Val")
         
         # 只要不是純推論 (Inference)，訓練時通常都需要 Label (包含 Distill 模式)
         with_labels = (self.cfg.TRAIN_SUPERVISION in ['label', 'distill'])

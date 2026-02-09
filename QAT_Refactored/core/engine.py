@@ -81,9 +81,11 @@ class Trainer:
         # Initialize EMA
         self.ema = ModelEMA(self.student, decay=0.9998)
         
-        # Initialize Loss Functions (Now Layers)
+         # Initialize Loss Functions (Now Layers)
         # [NOTE] These are instantiated as Layers, so they maintain state if needed
-        self.loss_fn_label = PoseLabelLoss(self.cfg)
+        self.loss_fn_label = PoseLabelLoss(
+            self.cfg, use_ultralytics=(str(self.cfg.LOSS_TYPE).lower() == 'ultralytics')
+        )
         self.loss_fn_distill = DistillLossPose(self.cfg) if self.teacher else None
         
         # Initialize Anchors
@@ -98,39 +100,49 @@ class Trainer:
         logging.info(f"[Trainer] Initialized. Run ID: {self.run_id}")
 
     def _setup_optimizer(self, steps_per_epoch: int) -> Tuple[tf.keras.optimizers.Optimizer, Any]:
-        total_steps = int(self.cfg.EPOCHS * steps_per_epoch)
-        
-        # Cosine Decay
-        lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+        total_steps = max(1, int(self.cfg.EPOCHS * steps_per_epoch))
+        if self.cfg.WARMUP_STEPS >= 0:
+            warmup_steps = int(self.cfg.WARMUP_STEPS)
+        else:
+            warmup_steps = int(self.cfg.WARMUP_EPOCHS * steps_per_epoch)
+        warmup_steps = max(0, min(warmup_steps, total_steps - 1))
+        cosine_steps = max(1, total_steps - warmup_steps)
+
+        cosine_schedule = tf.keras.optimizers.schedules.CosineDecay(
             initial_learning_rate=self.cfg.BASE_LR,
-            decay_steps=max(1, total_steps),
-            alpha=self.cfg.END_LR / self.cfg.BASE_LR
+            decay_steps=cosine_steps,
+            alpha=self.cfg.END_LR / self.cfg.BASE_LR,
         )
-        
-        # Custom Warmup Wrapper
-        class WarmupSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
-            def __init__(self, warmup_steps, base_schedule):
+
+        class WarmupThenCosine(tf.keras.optimizers.schedules.LearningRateSchedule):
+            def __init__(self, base_lr, warmup_steps, cosine):
                 super().__init__()
+                self.base_lr = tf.cast(base_lr, tf.float32)
                 self.warmup_steps = tf.cast(warmup_steps, tf.float32)
-                self.base_schedule = base_schedule
-            
+                self.cosine = cosine
+
             def __call__(self, step):
                 step_f = tf.cast(step, tf.float32)
-                lr = self.base_schedule(step_f)
-                warmup_factor = tf.clip_by_value(step_f / tf.maximum(self.warmup_steps, 1.0), 0.0, 1.0)
-                return lr * warmup_factor
-            
-            def get_config(self):
-                return {"warmup_steps": self.warmup_steps, "base_schedule": self.base_schedule}
+                warmup_lr = self.base_lr * (step_f / tf.maximum(self.warmup_steps, 1.0))
+                cosine_lr = self.cosine(tf.maximum(step_f - self.warmup_steps, 0.0))
+                return tf.where(step_f < self.warmup_steps, warmup_lr, cosine_lr)
 
-        final_schedule = WarmupSchedule(self.cfg.WARMUP_STEPS, lr_schedule)
-        
-        opt = tf.keras.optimizers.SGD(
-            learning_rate=final_schedule,
-            momentum=self.cfg.MOMENTUM,
-            nesterov=self.cfg.NESTEROV,
-            clipnorm=self.cfg.CLIPNORM
-        )
+            def get_config(self):
+                return {"base_lr": self.base_lr, "warmup_steps": self.warmup_steps}
+
+        final_schedule = WarmupThenCosine(self.cfg.BASE_LR, warmup_steps, cosine_schedule)
+
+        opt_kwargs = {
+            "learning_rate": final_schedule,
+            "momentum": self.cfg.MOMENTUM,
+            "nesterov": self.cfg.NESTEROV,
+        }
+        if self.cfg.WEIGHT_DECAY > 0:
+            opt_kwargs["weight_decay"] = self.cfg.WEIGHT_DECAY
+        if self.cfg.CLIPNORM is not None:
+            opt_kwargs["clipnorm"] = self.cfg.CLIPNORM
+
+        opt = tf.keras.optimizers.SGD(**opt_kwargs)
         
         # AMP Wrapper
         if self.cfg.USE_AMP:
@@ -144,11 +156,16 @@ class Trainer:
                 freeze_bn: bool = False) -> Dict[str, tf.Tensor]:
 
         batch_dict = build_batch_dict_from_padded_labels(
-            batch_labels, num_kpt=self.cfg.NUM_KPT, kpt_vals=self.cfg.KPT_VALS
+            batch_labels,
+            num_cls=self.cfg.NUM_CLS,
+            num_kpt=self.cfg.NUM_KPT,
+            kpt_vals=self.cfg.KPT_VALS,
         )
 
+        # Why: freeze_bn=True 時必須真正凍結 BN moving stats；用 training=False 最直接且不依賴脆弱的變數名稱過濾。
+        # 同時也會凍結 QAT observer range（tfmot wrapper 的 min/max），避免後期 range 漂移導致分數塌縮。
         with tf.GradientTape() as tape:
-            y_s_out = self.student(batch_imgs, training=True)
+            y_s_out = self.student(batch_imgs, training=(not freeze_bn))
 
             if isinstance(y_s_out, (list, tuple)):
                 deploy_raw = y_s_out[0]
@@ -162,7 +179,7 @@ class Trainer:
             deploy_raw = assert_layout_tf(deploy_raw, total_c, name="deploy_raw")
             kd_raw     = assert_layout_tf(kd_raw,     total_c, name="kd_raw")
 
-            loss_dep, loss_box, loss_cls, loss_kpt = self.loss_fn_label(
+            loss_dep, loss_box, loss_cls, loss_kpt, m_pos, m_gt, m_max = self.loss_fn_label(
                 deploy_raw, batch_dict, self.anchors, class_weights
             )
 
@@ -175,8 +192,8 @@ class Trainer:
 
                 y_teacher = assert_layout_tf(y_teacher, total_c, name="y_teacher")
                 loss_kd = self.loss_fn_distill(y_teacher, kd_raw)
-            else:
-                loss_kd_val, _, _, _ = self.loss_fn_label(
+            elif self.cfg.AUX_KD_HEAD_LABEL_LOSS and isinstance(y_s_out, (list, tuple)):
+                loss_kd_val, _, _, _, _, _, _ = self.loss_fn_label(
                     kd_raw, batch_dict, self.anchors, class_weights
                 )
                 loss_kd = loss_kd_val
@@ -185,7 +202,13 @@ class Trainer:
                         (self.cfg.DEPLOY_LOSS_WEIGHT * loss_dep)
 
             if self.student.losses:
-                total_loss += tf.reduce_sum(self.student.losses)
+                reg_loss = tf.reduce_sum(self.student.losses)
+                reg_loss = tf.where(
+                    tf.math.is_finite(reg_loss),
+                    reg_loss,
+                    tf.zeros_like(reg_loss),
+                )
+                total_loss += reg_loss
 
             if self.cfg.USE_AMP:
                 scaled_loss = optimizer.get_scaled_loss(total_loss)
@@ -193,9 +216,6 @@ class Trainer:
                 scaled_loss = total_loss
 
         vars = self.student.trainable_variables
-        if freeze_bn:
-            # Freeze batch normalization layers for stability in later training
-            vars = [v for v in vars if not ('batch_normalization' in v.name.lower() or 'bn' in v.name.lower())]
         
         if self.cfg.USE_AMP:
             scaled_grads = tape.gradient(scaled_loss, vars)
@@ -203,22 +223,73 @@ class Trainer:
         else:
             grads = tape.gradient(scaled_loss, vars)
 
-        optimizer.apply_gradients(zip(grads, vars))
-        self.ema.update(self.student)
+        # Why: 防禦性編碼，避免 None/non-finite grad 造成 apply_gradients 崩潰或 silent divergence。
+        safe_pairs = []
+        grad_finite_flags = []
+        for g, v in zip(grads, vars):
+            if g is None:
+                continue
+
+            if isinstance(g, tf.IndexedSlices):
+                g_vals = g.values
+                g_finite = tf.reduce_all(tf.math.is_finite(g_vals))
+                g_vals = tf.where(tf.math.is_finite(g_vals), g_vals, tf.zeros_like(g_vals))
+                g = tf.IndexedSlices(g_vals, g.indices, g.dense_shape)
+            else:
+                g_finite = tf.reduce_all(tf.math.is_finite(g))
+                g = tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))
+
+            grad_finite_flags.append(g_finite)
+            safe_pairs.append((g, v))
+
+        all_grads_finite = tf.reduce_all(tf.stack(grad_finite_flags)) if grad_finite_flags else tf.constant(True)
+        loss_is_finite = tf.math.is_finite(total_loss)
+        should_apply = tf.logical_and(loss_is_finite, all_grads_finite)
+
+        def _apply():
+            optimizer.apply_gradients(safe_pairs)
+            self.ema.update(self.student)
+            return tf.constant(True)
+
+        def _skip():
+            tf.print(
+                "[WARN] Skipping non-finite train step.",
+                "loss_dep=", loss_dep,
+                "loss_kd=", loss_kd,
+                "total_loss=", total_loss,
+                "loss_is_finite=", loss_is_finite,
+                "all_grads_finite=", all_grads_finite
+            )
+            return tf.constant(False)
+
+        step_applied = tf.cond(should_apply, _apply, _skip)
+
+        total_safe = tf.where(tf.math.is_finite(total_loss), total_loss, tf.zeros_like(total_loss))
+        box_safe = tf.where(tf.math.is_finite(loss_box), loss_box, tf.zeros_like(loss_box))
+        cls_safe = tf.where(tf.math.is_finite(loss_cls), loss_cls, tf.zeros_like(loss_cls))
+        kpt_safe = tf.where(tf.math.is_finite(loss_kpt), loss_kpt, tf.zeros_like(loss_kpt))
+        kd_safe = tf.where(tf.math.is_finite(loss_kd), loss_kd, tf.zeros_like(loss_kd))
 
         return {
-            "total": total_loss,
-            "box": loss_box,
-            "cls": loss_cls,
-            "kpt": loss_kpt,
-            "kd": loss_kd
+            "total": total_safe,
+            "box": box_safe,
+            "cls": cls_safe,
+            "kpt": kpt_safe,
+            "kd": kd_safe,
+            "pos": m_pos,
+            "gt": m_gt,
+            "max_score": m_max,
+            "step_applied": tf.cast(step_applied, tf.float32),
         }
 
 
     @tf.function
     def val_step(self, batch_imgs: tf.Tensor, batch_labels: tf.Tensor, class_weights: Optional[tf.Tensor]) -> Dict[str, tf.Tensor]:
         batch_dict = build_batch_dict_from_padded_labels(
-            batch_labels, num_kpt=self.cfg.NUM_KPT, kpt_vals=self.cfg.KPT_VALS
+            batch_labels,
+            num_cls=self.cfg.NUM_CLS,
+            num_kpt=self.cfg.NUM_KPT,
+            kpt_vals=self.cfg.KPT_VALS,
         )
 
         y_s_out = self.student(batch_imgs, training=False)
@@ -231,7 +302,7 @@ class Trainer:
         total_c = self.cfg.total_output_channels
         deploy_raw = assert_layout_tf(deploy_raw, total_c, name="val_deploy_raw")
 
-        total_loss, loss_box, loss_cls, loss_kpt = self.loss_fn_label(
+        total_loss, loss_box, loss_cls, loss_kpt, m_pos, m_gt, m_max = self.loss_fn_label(
             deploy_raw, batch_dict, self.anchors, class_weights
         )
 
@@ -239,7 +310,10 @@ class Trainer:
             "total": total_loss,
             "box": loss_box,
             "cls": loss_cls,
-            "kpt": loss_kpt
+            "kpt": loss_kpt,
+            "pos": m_pos,
+            "gt": m_gt,
+            "max_score": m_max,
         }
 
 
@@ -273,25 +347,37 @@ class Trainer:
                     batch = next(iter_ds)
                     imgs, labels = batch[0], batch[1]
                  
-                    # Determine if we should freeze BN layers (last 10% of training)
-                    freeze_bn = (self.global_step > (self.cfg.EPOCHS * 0.9) * steps_per_epoch)
+                    # Why: 顯式 step 優先；否則沿用 ratio（避免破壞既有行為）
+                    if self.cfg.FREEZE_BN_FROM_STEP >= 0:
+                        freeze_bn = (self.global_step >= self.cfg.FREEZE_BN_FROM_STEP)
+                    else:
+                        freeze_bn = (self.global_step > (self.cfg.EPOCHS * self.cfg.FREEZE_BN_RATIO) * steps_per_epoch)
                     logs = self.train_step(imgs, labels, optimizer, class_weights, freeze_bn)
                  
                     for k, v in logs.items():
+                        metrics_sum.setdefault(k, 0.0)
                         metrics_sum[k] += float(v)
                  
                     lr_curr = float(lr_schedule(self.global_step))
-                    pbar.set_postfix(loss=f"{float(logs['total']):.4f}", lr=f"{lr_curr:.1e}")
+                    pbar.set_postfix(
+                        loss=f"{float(logs['total']):.4f}",
+                        lr=f"{lr_curr:.1e}",
+                        ap=f"{float(logs.get('step_applied', 1.0)):.0f}",
+                        pos=f"{float(logs.get('pos', 0.0)):.1f}",
+                        gt=f"{float(logs.get('gt', 0.0)):.1f}",
+                        mx=f"{float(logs.get('max_score', 0.0)):.3f}",
+                    )
                     self.global_step += 1
                 except StopIteration:
                     break
             
             avg_train = {k: v / steps_per_epoch for k, v in metrics_sum.items()}
-            
-            # --- Validation Loop ---
-            # Save generic plot occasionally
-            if self.global_step % 1000 == 0: 
-                save_gt_and_plot(imgs, labels, self.plots_dir, self.global_step)
+         
+             # --- Validation Loop ---
+             # Save generic plot occasionally
+             # Use last batch from training for plotting
+            if self.global_step % 1000 == 0 and 'imgs' in locals() and 'labels' in locals():
+                 save_gt_and_plot(imgs, labels, self.plots_dir, self.global_step)
 
             avg_val = {"total": 0.0, "box": 0.0, "cls": 0.0, "kpt": 0.0}
             
@@ -310,6 +396,7 @@ class Trainer:
                         logs = self.val_step(imgs, labels, class_weights)
                         
                         for k, v in logs.items():
+                            val_metrics_sum.setdefault(k, 0.0)
                             val_metrics_sum[k] += float(v)
                     except StopIteration:
                         break
@@ -329,8 +416,17 @@ class Trainer:
                 if isinstance(y_pred_val, (list, tuple)):
                     y_pred_val = y_pred_val[0]
 
-                save_pred_and_plot(imgs, y_pred_val, self.plots_dir, self.global_step,
-                   num_cls=self.cfg.NUM_CLS, total_C=self.cfg.total_output_channels)
+                save_pred_and_plot(
+                    imgs,
+                    y_pred_val,
+                    self.plots_dir,
+                    self.global_step,
+                    num_cls=self.cfg.NUM_CLS,
+                    num_kpt=self.cfg.NUM_KPT,
+                    kpt_vals=self.cfg.KPT_VALS,
+                    total_C=self.cfg.total_output_channels,
+                    force_draw_topk_if_empty=1,
+                )
                 
                 self.ema.restore(self.student)
 

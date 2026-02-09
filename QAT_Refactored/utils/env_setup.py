@@ -11,6 +11,7 @@ def setup_environment() -> None:
     # 這必須在任何 TF import 發生前設定才有效
     os.environ["TF_USE_LEGACY_KERAS"] = "1"
     os.environ["KERAS_BACKEND"] = "tensorflow"
+    os.environ["KERAS_FORCE_REBATCH"] = "1"
     
     # 2. 設定基礎 Logging
     logging.basicConfig(
@@ -32,15 +33,7 @@ def check_tf_version() -> None:
     logging.info(f"[Env] TensorFlow Version: {tf.__version__}")
     logging.info(f"[Env] tf.keras Version: {getattr(K, '__version__', 'unknown')}")
 
-    # 若環境中存在 standalone keras，確認不是 3.x
-    try:
-        import keras as standalone_keras
-        kv = getattr(standalone_keras, "__version__", "unknown")
-        logging.info(f"[Env] keras (standalone) Version: {kv}")
-        if str(kv).startswith("3"):
-            logging.critical("[Env] CRITICAL: keras==3.x detected but this project requires Keras 2.x (TF 2.15).")
-            logging.critical("Action: uninstall keras 3 or use a clean TF2.15/Keras2 environment.")
-            sys.exit(1)
-    except Exception:
-        # 沒有 standalone keras 也 OK
-        pass
+    # Keras 3.x compatibility with TF 2.16
+    # When TF_USE_LEGACY_KERAS=1, TF uses tf.keras which is Keras 2.x compatible
+    # standalone keras 3.x is OK as long as we're using tf.keras internally
+    logging.info("[Env] Keras 3.x compatibility mode enabled via TF_USE_LEGACY_KERAS=1")

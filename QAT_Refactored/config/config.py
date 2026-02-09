@@ -35,48 +35,69 @@ class AppConfig:
     MAX_OBJS: int = 64
     
     # TFLite Export Settings
-    TFLITE_QUANT_MODE: str = "int8"   # Options: int8, fp16, fp32
+    TFLITE_QUANT_MODE: str = "fp32"   # Options: int8, fp16, fp32
     EXPORT_INPUT_SHAPE: Tuple[int, int, int, int] = field(init=False)
     
     # ===================================================
     # Training Hyperparameters
     # ===================================================
-    SEED: int = 42
-    VAL_SPLIT: float = 0.05
-    BATCH_SIZE: int = 32 # Reduced for testing
-    EPOCHS: int = 10 # Reduced for testing
+    SEED: int = 0
+    # TFMOT fake-quant gradients on GPU do not fully support deterministic kernels.
+    DETERMINISTIC: bool = False
+    VAL_SPLIT: float = 0.1
+    BATCH_SIZE: int = 128
+    EPOCHS: int = 200
     
     # Optimizer
-    BASE_LR: float = 0.001
+    BASE_LR: float = 0.01
     END_LR: float = 0.0001
     MOMENTUM: float = 0.937
+    WEIGHT_DECAY: float = 0.0005
     NESTEROV: bool = True
-    CLIPNORM: float = 1.0
-    WARMUP_STEPS: int = 100
-    
+    CLIPNORM: Optional[float] = None
+    WARMUP_EPOCHS: float = 3.0
+    # If >= 0 this value overrides WARMUP_EPOCHS.
+    WARMUP_STEPS: int = -1
+
+    # Why: QAT/小 batch 下 BN moving stats 容易漂；提供顯式 step 控制 freeze 時機。
+    # -1: 沿用舊邏輯（最後 10%）
+    FREEZE_BN_FROM_STEP: int = -1
+    FREEZE_BN_RATIO: float = 0.90
+
+
     # Loss Weights
-    W_BOX: float = 7.0
-    W_CLS: float = 1.0
+    W_BOX: float = 7.5
+    W_CLS: float = 0.5
     W_KPT_XY: float = 12.0
     W_KPT_V: float = 1.0
     KD_LOSS_WEIGHT: float = 1.0
     DEPLOY_LOSS_WEIGHT: float = 1.0
+    AUX_KD_HEAD_LABEL_LOSS: bool = False
     
     # ===================================================
-    # Paths & System
+    # Loss Function Selection
     # ===================================================
-    DATA_ROOT: Path = field(default_factory=lambda: Path("../../../Dataset/"))
+    LOSS_TYPE: str = 'ultralytics'  # 'ultralytics' for stability - QAT requires tf-nightly
+    
+     # ===================================================
+     # Paths & System
+     # ===================================================
+    DATA_ROOT: Path = field(default_factory=lambda: Path("../../../Dataset"))
     OUTPUT_DIR: Path = field(default_factory=lambda: Path("./output"))
     
     # Dynamic Paths (Resolved in __post_init__)
     TRAIN_PATTERNS: List[str] = field(default_factory=list)
+    VAL_PATTERNS: List[str] = field(default_factory=list)
     VAL_PATTERN: Optional[str] = None
     EXPORTED_TEACHER_DIR: Optional[Path] = None
     RESUME_WEIGHTS: Optional[Path] = None
 
     # Flags
+    # TFMOT FakeQuant requires float32 tensors. Keep AMP off for QAT path.
     USE_AMP: bool = False
     TRAIN_SUPERVISION: str = 'label'  # 'label' or 'distill'
+    USE_CLASS_WEIGHTS: bool = False
+    TRAIN_DROP_REMAINDER: bool = False
     LETTERBOX_PAD_VALUE: float = 114.0 / 255.0
 
     def __post_init__(self):
@@ -90,6 +111,11 @@ class AppConfig:
         if not self.TRAIN_PATTERNS:
             # Default fallback for testing
             self.TRAIN_PATTERNS = [str(self.DATA_ROOT / "acc_dataset/images/*.jpg")]
+
+        if not self.VAL_PATTERNS and not self.VAL_PATTERN and self.VAL_SPLIT <= 0.0:
+            # Ultralytics train_pose often validates on an explicit val set.
+            # If user has not configured one, default to train patterns to keep parity behavior.
+            self.VAL_PATTERNS = list(self.TRAIN_PATTERNS)
             
         logging.info(f"[Config] System initialized with IMGSZ={self.IMGSZ}")
         logging.info(f"[Config] C++ Alignment Check: Total Anchors = {self.get_total_anchors()}")
@@ -113,6 +139,12 @@ class AppConfig:
         # 3. Check Batch Size
         if self.BATCH_SIZE < 1:
             errors.append(f"BATCH_SIZE must be >= 1, got {self.BATCH_SIZE}")
+
+        if self.WEIGHT_DECAY < 0:
+            errors.append(f"WEIGHT_DECAY must be >= 0, got {self.WEIGHT_DECAY}")
+
+        if self.WARMUP_EPOCHS < 0:
+            errors.append(f"WARMUP_EPOCHS must be >= 0, got {self.WARMUP_EPOCHS}")
             
         # 4. Check Teacher Path (if needed)
         if self.TRAIN_SUPERVISION == 'distill':
@@ -120,6 +152,21 @@ class AppConfig:
                 errors.append("Distillation mode requires EXPORTED_TEACHER_DIR to be set.")
             elif not Path(self.EXPORTED_TEACHER_DIR).exists():
                 errors.append(f"Teacher model path not found: {self.EXPORTED_TEACHER_DIR}")
+
+        # 5. Check Loss Type
+        valid_loss_types = {"ultralytics", "qat"}
+        if str(self.LOSS_TYPE).lower() not in valid_loss_types:
+            errors.append(
+                f"LOSS_TYPE must be one of {sorted(valid_loss_types)}, got {self.LOSS_TYPE}"
+            )
+
+        # 6. Check Quant Mode
+        valid_quant_modes = {"int8", "fp16", "fp32", "float32", "float16"}
+        if str(self.TFLITE_QUANT_MODE).lower() not in valid_quant_modes:
+            errors.append(
+                "TFLITE_QUANT_MODE must be one of "
+                f"{sorted(valid_quant_modes)}, got {self.TFLITE_QUANT_MODE}"
+            )
 
         if errors:
             logging.critical("="*40)

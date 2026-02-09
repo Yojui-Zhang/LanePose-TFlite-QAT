@@ -19,4 +19,6 @@ def setup_mixed_precision(use_amp=False):
         tf.keras.mixed_precision.set_global_policy(policy)
         print(f"[Device] Mixed Precision Enabled: {policy.compute_dtype}")
     else:
-        print("[Device] Using Float32 Precision.")
+        policy = tf.keras.mixed_precision.Policy('float32')
+        tf.keras.mixed_precision.set_global_policy(policy)
+        print(f"[Device] Using Float32 Precision: {policy.compute_dtype}")

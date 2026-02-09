@@ -7,7 +7,12 @@ from QAT_Refactored.losses.pose_loss import PoseLabelLoss, get_anchors, build_ba
 
 @tf.function
 def f(loss_fn, y_pred, batch_labels, anchors, class_weights):
-    batch_dict = build_batch_dict_from_padded_labels(batch_labels, num_kpt=cfg.NUM_KPT, kpt_vals=cfg.KPT_VALS)
+    batch_dict = build_batch_dict_from_padded_labels(
+        batch_labels,
+        num_cls=cfg.NUM_CLS,
+        num_kpt=cfg.NUM_KPT,
+        kpt_vals=cfg.KPT_VALS,
+    )
     return loss_fn(y_pred, batch_dict, anchors, class_weights)
 
 def main():

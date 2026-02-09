@@ -21,7 +21,7 @@ def main() -> None:
     model = build_student_qat(cfg)
     _ = model(tf.random.uniform((1, cfg.IMGSZ, cfg.IMGSZ, 3)))  # build weights
 
-    trainer = Trainer(cfg=cfg, student=model, teacher=None)  # 依你的 engine 實作調整
+    trainer = Trainer(cfg=cfg, student_model=model, teacher_model=None)
     opt = tf.keras.optimizers.Adam(1e-4)
 
     B = 2
@@ -57,4 +57,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

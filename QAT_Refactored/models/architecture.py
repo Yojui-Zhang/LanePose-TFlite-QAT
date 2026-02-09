@@ -82,18 +82,7 @@ def build_yolov8_pose(
     # Heads
     # ==========================================
     
-    # 1. KD Head (Teacher Compatible)
-    # [FIX] Removed apply_sigmoid=False (Class defaults to logits)
-    head_kd = TeacherCompatHead(
-        num_cls=num_classes, 
-        num_kpt=num_kpt, 
-        kpt_vals=kpt_vals, 
-        name="kd_head"
-    )
-    kd_preds = head_kd(neck_feats)
-
-    # 2. Deploy Head
-    # [FIX] Removed apply_sigmoid=False
+    # Deploy Head
     head_dep = TeacherCompatHead(
         num_cls=num_classes, 
         num_kpt=num_kpt, 
@@ -101,5 +90,16 @@ def build_yolov8_pose(
         name="deploy_head"
     )
     deploy_preds = head_dep(neck_feats)
-    
-    return K.Model(inp, [deploy_preds, kd_preds], name='u8s_pose_keras_dual')
+
+    # Keep dual-head only for distillation; label training follows a single-head path.
+    if mode == 'distill':
+        head_kd = TeacherCompatHead(
+            num_cls=num_classes,
+            num_kpt=num_kpt,
+            kpt_vals=kpt_vals,
+            name="kd_head"
+        )
+        kd_preds = head_kd(neck_feats)
+        return K.Model(inp, [deploy_preds, kd_preds], name='u8s_pose_keras_dual')
+
+    return K.Model(inp, deploy_preds, name='u8s_pose_keras')
