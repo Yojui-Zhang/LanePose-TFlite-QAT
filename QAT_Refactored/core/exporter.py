@@ -120,7 +120,7 @@ class Exporter:
 
     def export_saved_model(self, model: tf.keras.Model, output_path: Path) -> None:
         """
-        對應 main.py 的第 1 步：包含 Pre-fusion -> Fusion -> Post-fusion -> Save [cite: 78-85]
+        對應 train_QAT.py 的第 1 步：包含 Pre-fusion -> Fusion -> Post-fusion -> Save [cite: 78-85]
         """
         logging.info("[Exporter] Phase 1: Fusion & SavedModel Export")
         
@@ -152,7 +152,7 @@ class Exporter:
     def convert_to_tflite(self, saved_model_path: Path, output_path: Path, 
                           rep_dataset_gen: Optional[Generator] = None) -> None:
         """
-        對應 main.py 的第 2 步：執行量化轉換 [cite: 86-91]
+        對應 train_QAT.py 的第 2 步：執行量化轉換 [cite: 86-91]
         """
         quant_mode = self._normalized_quant_mode()
         logging.info(f"[Exporter] Phase 2: Converting to TFLite ({quant_mode})")
@@ -183,7 +183,7 @@ class Exporter:
         self._print_cpp_config()
 
     def export(self, model: tf.keras.Model, rep_dataset: Optional[Generator] = None) -> None:
-        """舊版整合進入點，用於相容 verify_export.py [cite: 77]"""
+        """舊版整合進入點，用於相容 verify/verify_export.py [cite: 77]"""
         sm_path = self.cfg.OUTPUT_DIR / "export/saved_model"
         tf_path = self.cfg.OUTPUT_DIR / f"export/model_{self.cfg.TFLITE_QUANT_MODE}.tflite"
         sm_path.parent.mkdir(parents=True, exist_ok=True)

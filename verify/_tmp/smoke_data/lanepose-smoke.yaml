@@ -1,0 +1,6 @@
+train: /media/es912/新增磁碟區/M11313027/AI-Agent/Project/QAT/verify/_tmp/smoke_data/train.txt
+val: /media/es912/新增磁碟區/M11313027/AI-Agent/Project/QAT/verify/_tmp/smoke_data/val.txt
+kpt_shape: [15, 3]
+flip_idx: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+nc: 7
+names: ['roadlane', 'car', 'rider', 'person', 'lights', 'sign_c', 'sing_t']

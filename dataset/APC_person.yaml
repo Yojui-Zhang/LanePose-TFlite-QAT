@@ -1,0 +1,15 @@
+# dataset path
+train: 
+
+  - /home/jovyan/datasets/es912/B11013125/ultralytics-main/APC_datasets_V1/images/train
+
+val: 
+
+  - /home/jovyan/datasets/es912/B11013125/ultralytics-main/APC_datasets_V1/images/val
+
+
+# number of detection classes
+nc: 1
+# class names
+names: ['person']
+# names: ['roadlane']

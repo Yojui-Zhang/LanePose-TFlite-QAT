@@ -1,0 +1,59 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# YOLOv8 object detection model with P2-P5 outputs. For Usage examples see https://docs.ultralytics.com/tasks/detect
+
+# Parameters
+nc: 7  # number of classes
+kpt_shape: [18, 3]
+scales: # model compound scaling constants, i.e. 'model=yolov8n.yaml' will call yolov8.yaml with scale 'n'
+  # [depth, width, max_channels]
+  
+#   n: [1, 1.0, 128]
+  n: [1, 2.0, 256]
+#   n: [1, 10.0, 1280] 
+
+# YOLOv8.0 backbone
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [8, 3, 2]]                             # 0
+  
+  - [-1, 1, DWConv, [16, 3, 2]]                          # 1
+  - [-1, 1, RepVGGBlock, [16, True]]                     # 2
+#   - [-1, 1, CBAM, [16]]                                
+  
+  - [-1, 1, DWConv, [32, 3, 2]]                          # 3
+  - [-1, 1, RepVGGBlock, [32, True]]
+#   - [-1, 1, CBAM, [32]]
+  
+  - [-1, 1, DWConv, [64, 3, 2]]                          # 5
+  - [-1, 2, RepVGGBlock, [64, True]]
+  - [-1, 1, CBAM, [64]] 
+  
+  - [-1, 1, DWConv, [128, 3, 2]]                         # 8
+  - [-1, 2, RepVGGBlock, [128, True]]
+  - [-1, 1, CBAM, [128]] 
+  
+  - [-1, 1, SPPF, [128, 5]]                              # 11
+
+# YOLOv8.0-p2 head
+head:
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]           # 12
+  - [[-1, 6], 1, Concat, [1]] 
+  - [-1, 1, RepVGGBlock, [64, True]]
+  - [-1, 1, CBAM, [64]] 
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]           # 16
+  - [[-1, 4], 1, Concat, [1]] 
+  - [-1, 1, RepVGGBlock, [32, True]] 
+
+  - [-1, 1, DWConv, [64, 3, 2]]                          # 19
+  - [[-1, 14], 1, Concat, [1]] 
+  - [-1, 1, RepVGGBlock, [64, True]] 
+
+  # - [-1, 1, DWConv, [128, 3, 2]]                         # 22
+  # - [[-1, 9], 1, Concat, [1]] 
+  # - [-1, 1, RepVGGBlock, [128, True]]
+
+  - [[15, 18, 21], 1, Pose, [nc, kpt_shape]] # Pose(P3, P4, P5)
+
+

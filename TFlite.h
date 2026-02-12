@@ -41,6 +41,12 @@ public:
     std::unique_ptr<tflite::Interpreter> interpreter;
     float* input_data = nullptr;
     float* yolov8_output = nullptr;
+    int input_width_runtime = INPUT_WIDTH;
+    int input_height_runtime = INPUT_HEIGHT;
+    int output_channels_runtime = 0;
+    int output_boxes_runtime = NUM_BOXES;
+    int runtime_num_cls = NUM_CLASS;
+    int runtime_num_kpt = Keypoint_NUM;
 
     // 預處理 scale 結果
     float scale_factor;
@@ -51,6 +57,7 @@ public:
 
     // Function
     static float sigmoid(float x);
+    static float activate_if_needed(float x);
     float intersection_over_union(const cv::Rect &rect1, const cv::Rect &rect2);
     void nms(std::vector<Object> &objects, float nms_threshold_bbox, float nms_threshold_lane);
     void generate_proposals(const float *data, float prob_threshold, std::vector<Object> &objects, float scale, int top, int left);
@@ -186,19 +193,101 @@ bool PoseDetector::Set_TFlite(const char* model_path) {
         return false;
     }
 
-    int input_index = interpreter->inputs()[0];
-    input_data = interpreter->typed_tensor<float>(input_index);
+    if (interpreter->inputs().size() != 1 || interpreter->outputs().size() != 1) {
+        std::cerr << "Expected single-input single-output TFLite model, but got inputs="
+                  << interpreter->inputs().size() << " outputs=" << interpreter->outputs().size() << std::endl;
+        return false;
+    }
 
+    int input_index = interpreter->inputs()[0];
     int output_index = interpreter->outputs()[0];
-    yolov8_output = interpreter->tensor(output_index)->data.f;
+
+    TfLiteTensor* input_tensor = interpreter->tensor(input_index);
+    TfLiteTensor* output_tensor = interpreter->tensor(output_index);
+    if (!input_tensor || !output_tensor) {
+        std::cerr << "Failed to read TFLite tensors." << std::endl;
+        return false;
+    }
+
+    if (input_tensor->type != kTfLiteFloat32 || output_tensor->type != kTfLiteFloat32) {
+        std::cerr << "TFlite.h requires float32 input/output. Got input="
+                  << TfLiteTypeGetName(input_tensor->type)
+                  << " output=" << TfLiteTypeGetName(output_tensor->type) << std::endl;
+        return false;
+    }
+
+    TfLiteIntArray* input_dims = input_tensor->dims;
+    TfLiteIntArray* output_dims = output_tensor->dims;
+    if (!input_dims || input_dims->size != 4) {
+        std::cerr << "Invalid input rank. Expected rank-4 NHWC." << std::endl;
+        return false;
+    }
+    if (!output_dims || output_dims->size != 3) {
+        std::cerr << "Invalid output rank. Expected rank-3 [1, C, N]." << std::endl;
+        return false;
+    }
+
+    if (input_dims->data[0] != 1 || input_dims->data[3] != 3) {
+        std::cerr << "Unexpected input shape. Expected [1,H,W,3], got ["
+                  << input_dims->data[0] << "," << input_dims->data[1] << ","
+                  << input_dims->data[2] << "," << input_dims->data[3] << "]" << std::endl;
+        return false;
+    }
+
+    input_height_runtime = input_dims->data[1];
+    input_width_runtime = input_dims->data[2];
+
+    if (output_dims->data[0] != 1) {
+        std::cerr << "Unexpected output batch dimension. Expected 1, got "
+                  << output_dims->data[0] << std::endl;
+        return false;
+    }
+
+    output_channels_runtime = output_dims->data[1];
+    output_boxes_runtime = output_dims->data[2];
+
+    const int min_required_c = 4 + Keypoint_NUM * 3;
+    if (output_channels_runtime < min_required_c) {
+        std::cerr << "Output channels too small. Need at least " << min_required_c
+                  << " channels, got " << output_channels_runtime << std::endl;
+        return false;
+    }
+
+    runtime_num_kpt = Keypoint_NUM;
+    runtime_num_cls = output_channels_runtime - min_required_c;
+    if (runtime_num_cls <= 0) {
+        std::cerr << "Invalid runtime class count: " << runtime_num_cls
+                  << " (output channels=" << output_channels_runtime << ")" << std::endl;
+        return false;
+    }
+
+    if (runtime_num_cls != NUM_CLASS || output_boxes_runtime != NUM_BOXES ||
+        input_width_runtime != INPUT_WIDTH || input_height_runtime != INPUT_HEIGHT) {
+        std::cout << "[WARN] Model shape does not match compile-time config.h: "
+                  << "runtime [H=" << input_height_runtime
+                  << ",W=" << input_width_runtime
+                  << ",C=" << output_channels_runtime
+                  << ",N=" << output_boxes_runtime
+                  << ",CLS=" << runtime_num_cls
+                  << "] vs config [H=" << INPUT_HEIGHT
+                  << ",W=" << INPUT_WIDTH
+                  << ",C=" << (4 + NUM_CLASS + Keypoint_NUM * 3)
+                  << ",N=" << NUM_BOXES
+                  << ",CLS=" << NUM_CLASS << "]" << std::endl;
+    }
+
+    input_data = interpreter->typed_input_tensor<float>(0);
+    yolov8_output = interpreter->typed_output_tensor<float>(0);
+    if (!input_data || !yolov8_output) {
+        std::cerr << "Failed to access float input/output tensor buffers." << std::endl;
+        return false;
+    }
 
     // 顯示模型資訊（可選）
     std::cout << "Input tensor type: " << TfLiteTypeGetName(interpreter->tensor(input_index)->type) << std::endl;
-    TfLiteIntArray* input_dims = interpreter->tensor(input_index)->dims;
     for (int i = 0; i < input_dims->size; ++i)
         std::cout << "Input[" << i << "]: " << input_dims->data[i] << std::endl;
 
-    TfLiteIntArray* output_dims = interpreter->tensor(output_index)->dims;
     std::cout << "Output tensor type: " << TfLiteTypeGetName(interpreter->tensor(output_index)->type) << std::endl;
     for (int i = 0; i < output_dims->size; ++i)
         std::cout << "Output[" << i << "]: " << output_dims->data[i] << std::endl;
@@ -208,6 +297,13 @@ bool PoseDetector::Set_TFlite(const char* model_path) {
 
 float PoseDetector::sigmoid(float x) {
     return 1.0f / (1.0f + exp(-x));
+}
+
+float PoseDetector::activate_if_needed(float x) {
+    if (x >= 0.0f && x <= 1.0f) {
+        return x;
+    }
+    return sigmoid(x);
 }
 
 float PoseDetector::intersection_over_union(const cv::Rect &rect1, const cv::Rect &rect2)
@@ -264,55 +360,87 @@ void PoseDetector::nms(std::vector<Object> &objects, float nms_threshold_bbox, f
 
 void PoseDetector::generate_proposals(const float *data, float prob_threshold, std::vector<Object> &objects, float scale, int top, int left)
 {
+    if (data == nullptr) {
+        return;
+    }
 
-    const int num_keypoints = Keypoint_NUM;
+    const int num_boxes = (output_boxes_runtime > 0) ? output_boxes_runtime : NUM_BOXES;
+    const int num_classes = (runtime_num_cls > 0) ? runtime_num_cls : NUM_CLASS;
+    const int num_keypoints = (runtime_num_kpt > 0) ? runtime_num_kpt : Keypoint_NUM;
+    const int in_w = (input_width_runtime > 0) ? input_width_runtime : INPUT_WIDTH;
+    const int in_h = (input_height_runtime > 0) ? input_height_runtime : INPUT_HEIGHT;
     const int class_start_channel = 4;
-    const int kpt_start_channel = 4 + NUM_CLASS;
+    const int kpt_start_channel = 4 + num_classes;
 
-    for (int i = 0; i < NUM_BOXES; ++i)
-    {
-
-        float x = (data[0 * NUM_BOXES + i] * INPUT_WIDTH - left) * scale;
-        float y = (data[1 * NUM_BOXES + i] * INPUT_HEIGHT - top) * scale;
-        float w = (data[2 * NUM_BOXES + i]) * INPUT_WIDTH * scale;
-        float h = (data[3 * NUM_BOXES + i]) * INPUT_HEIGHT * scale;
-        float x1 = x - w / 2;
-        float y1 = y - h / 2;
-        cv::Rect rect(cv::Point(x1, y1), cv::Size(w, h));
-
-        int class_id = -1;
-        float max_prob = prob_threshold;
-        for (int j = 0; j < NUM_CLASS; ++j)
+    auto decode_with_threshold = [&](float threshold) {
+        for (int i = 0; i < num_boxes; ++i)
         {
-            float prob = data[(class_start_channel + j) * NUM_BOXES + i];
-            if (prob > max_prob)
-            {
-                class_id = j;
-                max_prob = prob;
+            float cx = activate_if_needed(data[0 * num_boxes + i]);
+            float cy = activate_if_needed(data[1 * num_boxes + i]);
+            float bw = activate_if_needed(data[2 * num_boxes + i]);
+            float bh = activate_if_needed(data[3 * num_boxes + i]);
+
+            float x = (cx * in_w - left) * scale;
+            float y = (cy * in_h - top) * scale;
+            float w = bw * in_w * scale;
+            float h = bh * in_h * scale;
+
+            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(w) || !std::isfinite(h)) {
+                continue;
             }
-        }
+            if (w <= 1e-3f || h <= 1e-3f) {
+                continue;
+            }
+            float x1 = x - w / 2;
+            float y1 = y - h / 2;
+            cv::Rect rect(cv::Point(x1, y1), cv::Size(w, h));
 
-        if (class_id >= 0)
-        {
-            Object obj;
-            obj.class_id = class_id;
-            obj.score = max_prob;
-            obj.box = rect;
-
-            obj.kpts.clear();
-            for (int k = 0; k < num_keypoints; k++)
+            int class_id = -1;
+            float max_prob = threshold;
+            for (int j = 0; j < num_classes; ++j)
             {
+                float prob = activate_if_needed(data[(class_start_channel + j) * num_boxes + i]);
+                if (prob > max_prob)
+                {
+                    class_id = j;
+                    max_prob = prob;
+                }
+            }
+
+            if (class_id >= 0)
+            {
+                Object obj;
+                obj.class_id = class_id;
+                obj.score = max_prob;
+                obj.box = rect;
+
+                obj.kpts.clear();
+                for (int k = 0; k < num_keypoints; k++)
+                {
+                    float kx = activate_if_needed(data[(kpt_start_channel + k * 3 + 0) * num_boxes + i]);
+                    float ky = activate_if_needed(data[(kpt_start_channel + k * 3 + 1) * num_boxes + i]);
+                    float kv = activate_if_needed(data[(kpt_start_channel + k * 3 + 2) * num_boxes + i]);
+                    float kpt_x = (kx * in_w - left) * scale;
+                    float kpt_y = (ky * in_h - top) * scale;
+                    float kpt_v = kv;
+
+                    obj.kpts.push_back(cv::Point3f(kpt_x, kpt_y, kpt_v));
                 
-                float kpt_x = (data[(kpt_start_channel + k*3 + 0) * NUM_BOXES + i] * INPUT_WIDTH  - left) * scale;
-                float kpt_y = (data[(kpt_start_channel + k*3 + 1) * NUM_BOXES + i] * INPUT_HEIGHT - top ) * scale;
-                float kpt_v =  data[(kpt_start_channel + k*3 + 2) * NUM_BOXES + i];
+                }
 
-                obj.kpts.push_back(cv::Point3f(kpt_x, kpt_y, kpt_v));
-            
+                objects.push_back(obj);
             }
-
-            objects.push_back(obj);
         }
+    };
+
+    const std::size_t begin_count = objects.size();
+    decode_with_threshold(prob_threshold);
+
+    // Why: some custom-trained models output very low class scores (e.g. <0.05) but still contain
+    // usable geometry. Fallback prevents a "no detections" blank frame in deployment.
+    constexpr float kFallbackThreshold = 0.01f;
+    if (objects.size() == begin_count && prob_threshold > kFallbackThreshold) {
+        decode_with_threshold(kFallbackThreshold);
     }
 
 }
@@ -556,10 +684,18 @@ void PoseDetector::draw_objects(const cv::Mat &img, const std::vector<TrackingBo
 
             // Draw class label
             if(classify_light__ == false){
-                label_txt = cv::format("%s", config.class_names[obj.class_id]);
+                if (obj.class_id >= 0 && obj.class_id < NUM_CLASS) {
+                    label_txt = cv::format("%s", config.class_names[obj.class_id]);
+                } else {
+                    label_txt = cv::format("cls_%d", obj.class_id);
+                }
             }
             else if(classify_light__ == true){
-                label_txt = cv::format("%s", config.class_name_classify[traffic_class_num]);
+                if (traffic_class_num >= 0 && traffic_class_num < classify_NUM_CLASS) {
+                    label_txt = cv::format("%s", config.class_name_classify[traffic_class_num]);
+                } else {
+                    label_txt = cv::format("cls2_%d", traffic_class_num);
+                }
             }
             
             int baseline = 0;

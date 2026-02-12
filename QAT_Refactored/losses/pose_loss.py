@@ -173,11 +173,11 @@ class PoseLabelLoss(tf.keras.layers.Layer):
         self.use_ultralytics = use_ultralytics
         
         if use_ultralytics:
-            # Ultralytics-compatible assigner
-            self.assigner = TaskAlignedAssigner(topk=13, alpha=1.0, beta=6.0, stride=[8, 16, 32])
+            # Ultralytics default TAL settings.
+            self.assigner = TaskAlignedAssigner(topk=10, alpha=0.5, beta=6.0, stride=[8, 16, 32])
         else:
-            # Original QAT assigner (for backward compatibility)
-            self.assigner = TaskAlignedAssigner(topk=10, alpha=0.5, beta=6.0)
+            # Legacy QAT assigner behavior.
+            self.assigner = TaskAlignedAssigner(topk=13, alpha=1.0, beta=6.0)
         
         # Initialize OKS Sigmas (COCO or Uniform)
         if self.cfg.NUM_KPT == 17:
@@ -202,10 +202,10 @@ class PoseLabelLoss(tf.keras.layers.Layer):
         )
 
         box = tf.sigmoid(y_pred[..., :4])
-        cls = tf.sigmoid(y_pred[..., 4: 4 + self.cfg.NUM_CLS])
+        cls_logits = y_pred[..., 4: 4 + self.cfg.NUM_CLS]
         # Why: map_fn tracing 時常丟失靜態 shape；固定最後一維能避免後續解包/reshape 再爆
         box = tf.ensure_shape(box, [None, None, 4])
-        cls = tf.ensure_shape(cls, [None, None, None])  # 先保守，下面再用 assert 鎖 NUM_CLS
+        cls_logits = tf.ensure_shape(cls_logits, [None, None, None])  # 先保守，下面再用 assert 鎖 NUM_CLS
  
 
         kpt_raw = y_pred[..., 4 + self.cfg.NUM_CLS:]
@@ -217,22 +217,13 @@ class PoseLabelLoss(tf.keras.layers.Layer):
             message="PoseLabelLoss.decode_preds: pred_box last dim must be 4"
         )
         tf.debugging.assert_equal(
-            tf.shape(cls)[-1], tf.cast(self.cfg.NUM_CLS, tf.int32),
-            message="PoseLabelLoss.decode_preds: pred_cls last dim must be NUM_CLS"
+            tf.shape(cls_logits)[-1], tf.cast(self.cfg.NUM_CLS, tf.int32),
+            message="PoseLabelLoss.decode_preds: pred_cls_logits last dim must be NUM_CLS"
         )
 
 
-        kpt = tf.reshape(kpt_raw, [B, N, self.cfg.NUM_KPT, self.cfg.KPT_VALS])
-        kxy = tf.sigmoid(kpt[..., :2])
-
-        if self.cfg.KPT_VALS >= 3:
-            kv = tf.sigmoid(kpt[..., 2:3])
-            kpt_out = tf.concat([kxy, kv], axis=-1)
-        else:
-            kpt_out = kxy
-
-        kpt_flat = tf.reshape(kpt_out, [B, N, -1])
-        return box, cls, kpt_flat
+        kpt_raw = tf.reshape(kpt_raw, [B, N, self.cfg.NUM_KPT, self.cfg.KPT_VALS])
+        return box, cls_logits, kpt_raw
 
 
     def call(
@@ -246,7 +237,8 @@ class PoseLabelLoss(tf.keras.layers.Layer):
         Calculates total loss.
         """
         # 1. Decode Predictions
-        pred_box, pred_cls, pred_kpt = self.decode_preds(y_pred)
+        pred_box, pred_cls_logits, pred_kpt_raw = self.decode_preds(y_pred)
+        pred_cls_prob = tf.sigmoid(pred_cls_logits)
         
         B = tf.shape(pred_box)[0]
         N = tf.shape(pred_box)[1] 
@@ -283,7 +275,7 @@ class PoseLabelLoss(tf.keras.layers.Layer):
         
         assigned_gt, assigned_cls, quality, pos_mask = tf.map_fn(
             assign_fn,
-            (pred_box, pred_cls, batch_dict['bboxes'], batch_dict['cls'], batch_dict['valid_mask']),
+            (pred_box, pred_cls_prob, batch_dict['bboxes'], batch_dict['cls'], batch_dict['valid_mask']),
             fn_output_signature=out_spec
         )
 
@@ -295,7 +287,7 @@ class PoseLabelLoss(tf.keras.layers.Layer):
         gt_mean = tf.reduce_mean(gt_cnt)
 
         # per-image max classification score across all anchors/classes
-        max_score_img = tf.reduce_max(pred_cls, axis=[1, 2])                              # (B,)
+        max_score_img = tf.reduce_max(pred_cls_prob, axis=[1, 2])                         # (B,)
         max_score_mean = tf.reduce_mean(max_score_img)
 
 
@@ -317,8 +309,10 @@ class PoseLabelLoss(tf.keras.layers.Layer):
 
         # 3. Compute Losses
         pos_mask_f = tf.cast(pos_mask, tf.float32)
-        weight = pos_mask_f * quality
-        den = tf.maximum(tf.reduce_sum(weight), 1.0) 
+        safe_assigned_cls = tf.maximum(assigned_cls, 0)
+        target_scores = tf.one_hot(safe_assigned_cls, self.cfg.NUM_CLS, dtype=tf.float32)
+        target_scores *= tf.where(pos_mask[..., None], quality[..., None], tf.zeros_like(target_scores))
+        target_scores_sum = tf.maximum(tf.reduce_sum(target_scores), 1.0)
         
         # Gather matched GTs
         batch_idx = tf.repeat(tf.range(B, dtype=tf.int32)[:, None], N, axis=1)
@@ -328,46 +322,28 @@ class PoseLabelLoss(tf.keras.layers.Layer):
         target_box = tf.gather_nd(batch_dict['bboxes'], gather_idx)
         target_kpt_flat = tf.gather_nd(batch_dict['keypoints'], gather_idx) # (B, N, K*V)
         
-        # --- A. Box Loss (CIoU) ---
+        # --- A. Box Loss (CIoU, Ultralytics-style weighting) ---
         ciou = bbox_ciou(pred_box, target_box) 
-        box_area = target_box[..., 2] * target_box[..., 3]
-        box_scale = 3.0 - box_area 
-        
-        l_box = tf.reduce_sum(ciou * weight * box_scale) / den
+        box_weight = tf.reduce_sum(target_scores, axis=-1)
+        l_box = tf.reduce_sum(ciou * box_weight) / target_scores_sum
         l_box *= self.cfg.W_BOX
         
-        # --- B. Class Loss (VFL-like) ---
-        t_cls = tf.one_hot(assigned_cls, self.cfg.NUM_CLS) * quality[..., None]
-        t_cls = tf.where(pos_mask[..., None], t_cls, tf.zeros_like(t_cls))
-        
-        eps = 1e-9
-        p_cls = tf.clip_by_value(pred_cls, eps, 1.0 - eps)
-
-        # Why: 負樣本數量遠大於正樣本時，若不降權，模型會收斂到「全部 p→0」且推論無框但 loss 仍下降。
-        bce = -(t_cls * tf.math.log(p_cls) + (1.0 - t_cls) * tf.math.log(1.0 - p_cls))
-
-        # Varifocal-style weighting
-        alpha = tf.constant(0.75, dtype=tf.float32)
-        gamma = tf.constant(4.0, dtype=tf.float32)
-        neg_w = alpha * tf.pow(p_cls, gamma)
-        vfl_w = tf.where(t_cls > 0.0, t_cls, neg_w)
-
-        l_cls_raw = bce * vfl_w
+        # --- B. Class Loss (Ultralytics BCE target scores) ---
+        l_cls_raw = tf.nn.sigmoid_cross_entropy_with_logits(labels=target_scores, logits=pred_cls_logits)
         
         if class_weights is not None:
              cw = tf.reshape(class_weights, [1, 1, -1])
              l_cls_raw *= cw
 
-        den_cls = tf.maximum(tf.reduce_sum(vfl_w), 1.0)
-        l_cls = self.cfg.W_CLS * (tf.reduce_sum(l_cls_raw) / den_cls)
+        l_cls = self.cfg.W_CLS * (tf.reduce_sum(l_cls_raw) / target_scores_sum)
         
         # --- C. Keypoint Loss (OKS) ---
         l_kpt = tf.constant(0.0, dtype=tf.float32)
         
         if self.cfg.NUM_KPT > 0:
             # Pred: (B, N, K, V)
-            pkpt = tf.reshape(pred_kpt, [B, N, self.cfg.NUM_KPT, self.cfg.KPT_VALS])
-            pxy = pkpt[..., :2]
+            pkpt = pred_kpt_raw
+            pxy = tf.sigmoid(pkpt[..., :2])
             
             # [CRITICAL FIX]: Reshape target to (B, N, K, V) before slicing
             # Previous code failed here because target_kpt_flat was (B, N, K*V)
@@ -389,6 +365,14 @@ class PoseLabelLoss(tf.keras.layers.Layer):
                 pxy, txy, tv_mask, area_px[..., None], self.sigmas, use_ultralytics=self.use_ultralytics
             )
             l_kpt = self.cfg.W_KPT_XY * l_kpt_xy
+
+            if self.cfg.KPT_VALS >= 3:
+                pv_logits = pkpt[..., 2:3]
+                kobj_bce = tf.nn.sigmoid_cross_entropy_with_logits(labels=tv_mask, logits=pv_logits)
+                kobj_weight = pos_mask_f[..., None, None]
+                den_kobj = tf.maximum(tf.reduce_sum(kobj_weight), 1.0)
+                l_kobj = self.cfg.W_KPT_V * (tf.reduce_sum(kobj_bce * kobj_weight) / den_kobj)
+                l_kpt += l_kobj
             
         total_loss = l_box + l_cls + l_kpt
         return total_loss, l_box, l_cls, l_kpt, pos_mean, gt_mean, max_score_mean

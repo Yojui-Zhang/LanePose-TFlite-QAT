@@ -35,7 +35,7 @@ class AppConfig:
     MAX_OBJS: int = 64
     
     # TFLite Export Settings
-    TFLITE_QUANT_MODE: str = "fp32"   # Options: int8, fp16, fp32
+    TFLITE_QUANT_MODE: str = "int8"   # Options: int8, fp16, fp32
     EXPORT_INPUT_SHAPE: Tuple[int, int, int, int] = field(init=False)
     
     # ===================================================
@@ -45,8 +45,8 @@ class AppConfig:
     # TFMOT fake-quant gradients on GPU do not fully support deterministic kernels.
     DETERMINISTIC: bool = False
     VAL_SPLIT: float = 0.1
-    BATCH_SIZE: int = 128
-    EPOCHS: int = 200
+    BATCH_SIZE: int = 64
+    EPOCHS: int = 100
     
     # Optimizer
     BASE_LR: float = 0.01
@@ -73,6 +73,18 @@ class AppConfig:
     KD_LOSS_WEIGHT: float = 1.0
     DEPLOY_LOSS_WEIGHT: float = 1.0
     AUX_KD_HEAD_LABEL_LOSS: bool = False
+    KD_BALANCE_STRATEGY: str = "grad_norm"  # grad_norm | dwa | ratio
+    KD_BALANCE_SHARED_PARAM_GROUP: str = "head"  # head | all
+    KD_BALANCE_EMA_DECAY: float = 0.95
+    KD_BALANCE_UPDATE_INTERVAL: int = 10
+    KD_BALANCE_WARMUP_STEPS: int = 0
+    KD_BALANCE_DEPLOY_RAMP_STEPS: int = 1000
+    KD_BALANCE_MIN_WEIGHT: float = 0.2
+    KD_BALANCE_MAX_WEIGHT: float = 5.0
+    KD_BALANCE_MAX_STEP_CHANGE: float = 1.2
+    KD_BALANCE_ADAPT_POWER: float = 0.5
+    KD_BALANCE_RENORM_SUM: float = 2.0
+    KD_BALANCE_EPS: float = 1e-6
     
     # ===================================================
     # Loss Function Selection
@@ -82,7 +94,7 @@ class AppConfig:
      # ===================================================
      # Paths & System
      # ===================================================
-    DATA_ROOT: Path = field(default_factory=lambda: Path("../../../Dataset"))
+    DATA_ROOT: Path = field(default_factory=lambda: Path("../../../../Dataset"))
     OUTPUT_DIR: Path = field(default_factory=lambda: Path("./output"))
     
     # Dynamic Paths (Resolved in __post_init__)
@@ -96,6 +108,43 @@ class AppConfig:
     # TFMOT FakeQuant requires float32 tensors. Keep AMP off for QAT path.
     USE_AMP: bool = False
     TRAIN_SUPERVISION: str = 'label'  # 'label' or 'distill'
+    TRAIN_ENGINE: str = "tf-legacy"  # "ultralytics" or "tf-legacy"
+    QAT_LOSS_MODE: str = "kd-deploy"  # "original" (strict Ultralytics parity) or "kd-deploy"
+    DATA_BACKEND: str = "ultralytics"  # "ultralytics" or "native"
+    DATA_YAML: Optional[Path] = field(default_factory=lambda: Path("./dataset/lanepose-carkeypoint.yaml"))
+    ULTRA_MODEL: str = "yolo11n-pose.pt"
+    ULTRA_TASK: str = "pose"
+    ULTRA_DEVICE: str = "0"
+    ULTRA_NAME: str = "train_qat"
+    ULTRA_EXIST_OK: bool = True
+    ULTRA_RESUME: bool = False
+    ULTRA_COS_LR: bool = True
+    ULTRA_AMP: bool = True
+    ULTRA_SEED: int = 0
+    ULTRA_DETERMINISTIC: bool = True
+    ULTRA_EXPORT_DATE: Optional[str] = None  # set fixed ISO datetime for bitwise-stable export metadata
+    ULTRA_EXPORT_DATA: Optional[Path] = None
+    ULTRA_EXPORT_FRACTION: float = 1.0
+    ULTRA_NMS_EXPORT: bool = False
+    ULTRA_WORKERS: int = 4
+    ULTRA_CACHE: bool = False
+    ULTRA_RECT: bool = False
+    ULTRA_FRACTION: float = 1.0
+    ULTRA_CLOSE_MOSAIC: int = 0
+    ULTRA_OPTIMIZER: Optional[str] = None
+    ULTRA_LR0: Optional[float] = None
+    ULTRA_LRF: Optional[float] = None
+    ULTRA_MOMENTUM: Optional[float] = None
+    ULTRA_WEIGHT_DECAY: Optional[float] = None
+    ULTRA_FLIPLR: float = 0.0
+    ULTRA_FLIPUD: float = 0.0
+    ULTRA_HSV_H: float = 0.015
+    ULTRA_HSV_S: float = 0.7
+    ULTRA_HSV_V: float = 0.4
+    ULTRA_MOSAIC: float = 1.0
+    ULTRA_MIXUP: float = 0.0
+    ULTRA_COPY_PASTE: float = 0.0
+    ULTRA_ERASING: float = 0.4
     USE_CLASS_WEIGHTS: bool = False
     TRAIN_DROP_REMAINDER: bool = False
     LETTERBOX_PAD_VALUE: float = 114.0 / 255.0
@@ -122,13 +171,15 @@ class AppConfig:
 
     def validate(self):
         """
-        Explicit validation method called by main.py and verify_install.py.
+        Explicit validation method called by train_QAT.py and verify/verify_install.py.
         Performs sanity checks and raises errors if config is invalid.
         """
         errors = []
+        data_backend = str(self.DATA_BACKEND).lower()
+        train_engine = str(self.TRAIN_ENGINE).lower()
         
         # 1. Check Data Root
-        if not self.DATA_ROOT.exists():
+        if not (data_backend == "ultralytics" and self.DATA_YAML is not None) and not self.DATA_ROOT.exists():
             errors.append(f"DATA_ROOT does not exist: {self.DATA_ROOT}")
             
         # 2. Check Input Size Divisibility
@@ -145,7 +196,48 @@ class AppConfig:
 
         if self.WARMUP_EPOCHS < 0:
             errors.append(f"WARMUP_EPOCHS must be >= 0, got {self.WARMUP_EPOCHS}")
-            
+        if self.KD_BALANCE_STRATEGY not in {"grad_norm", "dwa", "ratio"}:
+            errors.append(
+                f"KD_BALANCE_STRATEGY must be one of ['dwa', 'grad_norm', 'ratio'], got {self.KD_BALANCE_STRATEGY}"
+            )
+        if self.KD_BALANCE_SHARED_PARAM_GROUP not in {"head", "all"}:
+            errors.append(
+                "KD_BALANCE_SHARED_PARAM_GROUP must be 'head' or 'all', "
+                f"got {self.KD_BALANCE_SHARED_PARAM_GROUP}"
+            )
+        if not (0.0 <= self.KD_BALANCE_EMA_DECAY < 1.0):
+            errors.append(f"KD_BALANCE_EMA_DECAY must be in [0,1), got {self.KD_BALANCE_EMA_DECAY}")
+        if self.KD_BALANCE_UPDATE_INTERVAL < 1:
+            errors.append(
+                f"KD_BALANCE_UPDATE_INTERVAL must be >= 1, got {self.KD_BALANCE_UPDATE_INTERVAL}"
+            )
+        if self.KD_BALANCE_WARMUP_STEPS < 0:
+            errors.append(
+                f"KD_BALANCE_WARMUP_STEPS must be >= 0, got {self.KD_BALANCE_WARMUP_STEPS}"
+            )
+        if self.KD_BALANCE_DEPLOY_RAMP_STEPS < 0:
+            errors.append(
+                "KD_BALANCE_DEPLOY_RAMP_STEPS must be >= 0, "
+                f"got {self.KD_BALANCE_DEPLOY_RAMP_STEPS}"
+            )
+        if self.KD_BALANCE_MIN_WEIGHT <= 0.0:
+            errors.append(f"KD_BALANCE_MIN_WEIGHT must be > 0, got {self.KD_BALANCE_MIN_WEIGHT}")
+        if self.KD_BALANCE_MAX_WEIGHT < self.KD_BALANCE_MIN_WEIGHT:
+            errors.append(
+                "KD_BALANCE_MAX_WEIGHT must be >= KD_BALANCE_MIN_WEIGHT, "
+                f"got {self.KD_BALANCE_MAX_WEIGHT} < {self.KD_BALANCE_MIN_WEIGHT}"
+            )
+        if self.KD_BALANCE_MAX_STEP_CHANGE < 1.0:
+            errors.append(
+                f"KD_BALANCE_MAX_STEP_CHANGE must be >= 1, got {self.KD_BALANCE_MAX_STEP_CHANGE}"
+            )
+        if self.KD_BALANCE_ADAPT_POWER <= 0.0:
+            errors.append(f"KD_BALANCE_ADAPT_POWER must be > 0, got {self.KD_BALANCE_ADAPT_POWER}")
+        if self.KD_BALANCE_RENORM_SUM <= 0.0:
+            errors.append(f"KD_BALANCE_RENORM_SUM must be > 0, got {self.KD_BALANCE_RENORM_SUM}")
+        if self.KD_BALANCE_EPS <= 0.0:
+            errors.append(f"KD_BALANCE_EPS must be > 0, got {self.KD_BALANCE_EPS}")
+
         # 4. Check Teacher Path (if needed)
         if self.TRAIN_SUPERVISION == 'distill':
             if not self.EXPORTED_TEACHER_DIR:
@@ -153,14 +245,69 @@ class AppConfig:
             elif not Path(self.EXPORTED_TEACHER_DIR).exists():
                 errors.append(f"Teacher model path not found: {self.EXPORTED_TEACHER_DIR}")
 
-        # 5. Check Loss Type
+        # 5. Data backend validation
+        if train_engine not in {"ultralytics", "tf-legacy"}:
+            errors.append(f"TRAIN_ENGINE must be 'ultralytics' or 'tf-legacy', got {self.TRAIN_ENGINE}")
+        if str(self.QAT_LOSS_MODE).lower() not in {"original", "kd-deploy"}:
+            errors.append(
+                f"QAT_LOSS_MODE must be 'original' or 'kd-deploy', got {self.QAT_LOSS_MODE}"
+            )
+        if data_backend not in {"ultralytics", "native"}:
+            errors.append(f"DATA_BACKEND must be 'ultralytics' or 'native', got {self.DATA_BACKEND}")
+        if data_backend == "ultralytics" and self.DATA_YAML is not None and not Path(self.DATA_YAML).exists():
+            errors.append(f"DATA_YAML not found: {self.DATA_YAML}")
+        if str(self.ULTRA_TASK).lower() not in {"detect", "segment", "classify", "pose", "obb"}:
+            errors.append(
+                "ULTRA_TASK must be one of ['classify', 'detect', 'obb', 'pose', 'segment'], "
+                f"got {self.ULTRA_TASK}"
+            )
+        if self.ULTRA_EXPORT_DATA is not None and not Path(self.ULTRA_EXPORT_DATA).exists():
+            errors.append(f"ULTRA_EXPORT_DATA not found: {self.ULTRA_EXPORT_DATA}")
+        if self.ULTRA_WORKERS < 0:
+            errors.append(f"ULTRA_WORKERS must be >= 0, got {self.ULTRA_WORKERS}")
+        if self.ULTRA_SEED < 0:
+            errors.append(f"ULTRA_SEED must be >= 0, got {self.ULTRA_SEED}")
+        if not (0.0 < self.ULTRA_EXPORT_FRACTION <= 1.0):
+            errors.append(
+                f"ULTRA_EXPORT_FRACTION must be in (0,1], got {self.ULTRA_EXPORT_FRACTION}"
+            )
+        if not (0.0 < self.ULTRA_FRACTION <= 1.0):
+            errors.append(f"ULTRA_FRACTION must be in (0,1], got {self.ULTRA_FRACTION}")
+        if self.ULTRA_CLOSE_MOSAIC < 0:
+            errors.append(f"ULTRA_CLOSE_MOSAIC must be >= 0, got {self.ULTRA_CLOSE_MOSAIC}")
+        if self.ULTRA_OPTIMIZER is not None and not str(self.ULTRA_OPTIMIZER).strip():
+            errors.append("ULTRA_OPTIMIZER must be non-empty when provided")
+        if self.ULTRA_LR0 is not None and self.ULTRA_LR0 <= 0.0:
+            errors.append(f"ULTRA_LR0 must be > 0, got {self.ULTRA_LR0}")
+        if self.ULTRA_LRF is not None and self.ULTRA_LRF <= 0.0:
+            errors.append(f"ULTRA_LRF must be > 0, got {self.ULTRA_LRF}")
+        if self.ULTRA_MOMENTUM is not None and not (0.0 <= self.ULTRA_MOMENTUM <= 1.0):
+            errors.append(f"ULTRA_MOMENTUM must be in [0,1], got {self.ULTRA_MOMENTUM}")
+        if self.ULTRA_WEIGHT_DECAY is not None and self.ULTRA_WEIGHT_DECAY < 0.0:
+            errors.append(
+                f"ULTRA_WEIGHT_DECAY must be >= 0, got {self.ULTRA_WEIGHT_DECAY}"
+            )
+        if not (0.0 <= self.ULTRA_FLIPLR <= 1.0):
+            errors.append(f"ULTRA_FLIPLR must be in [0,1], got {self.ULTRA_FLIPLR}")
+        if not (0.0 <= self.ULTRA_FLIPUD <= 1.0):
+            errors.append(f"ULTRA_FLIPUD must be in [0,1], got {self.ULTRA_FLIPUD}")
+        if not (0.0 <= self.ULTRA_MOSAIC <= 1.0):
+            errors.append(f"ULTRA_MOSAIC must be in [0,1], got {self.ULTRA_MOSAIC}")
+        if not (0.0 <= self.ULTRA_MIXUP <= 1.0):
+            errors.append(f"ULTRA_MIXUP must be in [0,1], got {self.ULTRA_MIXUP}")
+        if not (0.0 <= self.ULTRA_COPY_PASTE <= 1.0):
+            errors.append(f"ULTRA_COPY_PASTE must be in [0,1], got {self.ULTRA_COPY_PASTE}")
+        if not (0.0 <= self.ULTRA_ERASING <= 1.0):
+            errors.append(f"ULTRA_ERASING must be in [0,1], got {self.ULTRA_ERASING}")
+
+        # 6. Check Loss Type
         valid_loss_types = {"ultralytics", "qat"}
         if str(self.LOSS_TYPE).lower() not in valid_loss_types:
             errors.append(
                 f"LOSS_TYPE must be one of {sorted(valid_loss_types)}, got {self.LOSS_TYPE}"
             )
 
-        # 6. Check Quant Mode
+        # 7. Check Quant Mode
         valid_quant_modes = {"int8", "fp16", "fp32", "float32", "float16"}
         if str(self.TFLITE_QUANT_MODE).lower() not in valid_quant_modes:
             errors.append(

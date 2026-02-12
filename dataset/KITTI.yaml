@@ -1,0 +1,16 @@
+# dataset path
+train: 
+
+  - /media/es912/新增磁碟區/M11313027/Dataset/KITTI_YOLO_TXT/images/train
+  # - /media/es912/新增磁碟區/M11313027/Dataset/TEST/images/
+
+val: 
+
+  - /media/es912/新增磁碟區/M11313027/Dataset/KITTI_YOLO_TXT/images/val
+  # - /media/es912/新增磁碟區/M11313027/Dataset/TEST/images/
+
+
+# number of detection classes
+nc: 3
+names: ['Car', 'Pedestrian', 'Cyclist']
+

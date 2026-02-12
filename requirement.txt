@@ -1,10 +1,29 @@
-pandas
-tensorflow-model-optimization==0.8.0
-opencv-python
+# One-click install:
+#   python -m pip install -r requirement.txt
+#
+# NOTE:
+# - onnx_graphsurgeon is distributed on NVIDIA index as well.
+# - If your environment is offline, installation will fail until network is available.
+--extra-index-url https://pypi.ngc.nvidia.com
+
+# Core
 numpy
+pandas
+opencv-python
 tqdm
 matplotlib
-tf-keras==2.15.0
-#tensorflow==2.15.0
+pyyaml
+protobuf>=5
 
-#pip install --extra-index-url https://pypi.nvidia.com "tensorflow[and-cuda]==2.15.0"
+# TensorFlow / QAT stack
+tensorflow-model-optimization==0.8.0
+tf-keras>=2.15.0
+
+# Ultralytics TFLite export stack (Route 2)
+onnx>=1.12.0,<1.18.0
+onnxruntime
+onnx2tf>=1.26.3
+onnxslim>=0.1.59
+sng4onnx>=1.0.1
+onnx_graphsurgeon>=0.3.26
+ai-edge-litert>=1.2.0,<1.4.0

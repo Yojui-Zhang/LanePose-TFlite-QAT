@@ -45,6 +45,15 @@ def validate_data_access(cfg: AppConfig) -> None:
     Ensures the DATA_ROOT and pattern matches actually exist.
     """
     logging.info("[Check] Validating Data Access...")
+
+    data_backend = str(cfg.DATA_BACKEND).lower()
+    if data_backend == "ultralytics" and cfg.DATA_YAML is not None:
+        yaml_path = Path(cfg.DATA_YAML)
+        if not yaml_path.exists():
+            logging.critical(f"[Check] DATA_YAML not found: {yaml_path.absolute()}")
+            sys.exit(1)
+        logging.info(f"[Check] Ultralytics data backend enabled. DATA_YAML={yaml_path}")
+        return
     
     # 1. Check Root Existence
     root = Path(cfg.DATA_ROOT)
