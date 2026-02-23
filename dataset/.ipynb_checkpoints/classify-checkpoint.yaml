@@ -1,0 +1,11 @@
+# dataset path
+train: 
+
+  - /home/Disk/Desktop/AI/dataset/lanepose/20220830/images
+# _Dataset/classify/dataset/enhance_rotate
+
+val: 
+
+  - /home/Disk/Desktop/AI/dataset/lanepose/20220830/images
+
+

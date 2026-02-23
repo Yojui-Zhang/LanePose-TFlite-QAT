@@ -1,0 +1,64 @@
+# dataset path
+train: 
+
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/20220830/images
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/20240321_night/images
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/acc_datasets/images
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/s3_20230803/images
+  
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/Traffic_dataset_20240720_345_k/images
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/yolov8data2_20250804/images
+  
+  
+  
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/20220830_enhance/images
+
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/acc_datasets_enhance/images
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/s3_20230803_enhance/images
+  
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/Traffic_dataset_20240720_345_k_enhance/images
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/yolov8data2_20250804_enhance/images
+
+
+# ====================================================================================================
+
+#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_box_num0/20220830/images
+#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_box_num0/20240321_night/images
+#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_box_num0/acc_datasets/images
+#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_box_num0/s3_20230803/images
+  
+#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_box_num0/20220830_enhance/images
+#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_box_num0/20240321_night_enhance/images
+#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_box_num0/acc_datasets_enhance/images
+#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_box_num0/s3_20230803_enhance/images
+
+
+val: 
+
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/20220830/images
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/20240321_night/images
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/acc_datasets/images
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/s3_20230803/images
+  
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/Traffic_dataset_20240720_345_k/images
+  - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_6class_box0/yolov8data2_20250804/images
+
+# ====================================================================================================
+
+#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_box_num0/20220830/images
+#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_box_num0/20240321_night/images
+#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_box_num0/acc_datasets/images
+#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_box_num0/s3_20230803/images
+
+  
+
+
+# Keypoints
+kpt_shape: [15, 3] # number of keypoints, number of dims (2 for x,y or 3 for x,y,visible)
+flip_idx: [0, 1,2,3,4,5,6,7,8,9,10,11,12,13,14]
+
+# number of detection classes
+nc: 7
+# class names
+names: ['roadlane','car','rider','person', 'lights', 'sign_c', 'sing_t']
+# names: ['roadlane']

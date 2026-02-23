@@ -1,0 +1,35 @@
+nc: 80
+scales:
+  n: [1.0,  0.25, 1024]
+  s: [0.33, 0.50, 1024]  
+  m: [0.67, 0.75, 768]   
+  l: [1.00, 1.00, 512]   
+  x: [1.00, 1.25, 512]
+
+# MobileNetV3_Bneck args: [oup, hidden_dim, k, s, use_se, use_hs]
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]]                                              # 0
+  - [-1, 1, DWConv, [128, 3, 2]]                                           # 1
+  - [-1, 1, MobileNetV3_Bneck, [128, 64, 3, 1, True, True]]                # 2 (hidden_dim=64)
+  - [-1, 1, DWConv, [256, 3, 2]]                                           # 3
+  - [-1, 1, MobileNetV3_Bneck, [256, 128, 3, 1, True, True]]               # 4 (hidden_dim=128)
+  - [-1, 1, DWConv, [512, 3, 2]]                                           # 5
+  - [-1, 1, MobileNetV3_Bneck, [512, 256, 3, 1, True, True]]               # 6 (hidden_dim=256)
+  - [-1, 1, DWConv, [1024, 3, 2]]                                          # 7
+  - [-1, 1, MobileNetV3_Bneck, [1024, 512, 3, 1, True, True]]              # 8 (hidden_dim=512)
+  - [-1, 1, SPPF, [1024, 5]]                                               # 9
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]                             # 10
+  - [[-1, 6], 1, Concat, [1]]                                              # 11
+  - [-1, 1, MobileNetV3_Bneck, [512, 256, 3, 1, True, True]]               # 12
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]                             # 13
+  - [[-1, 4], 1, Concat, [1]]                                              # 14
+  - [-1, 1, MobileNetV3_Bneck, [256, 128, 3, 1, True, True]]               # 15 (P3)
+  - [-1, 1, DWConv, [256, 3, 2]]                                           # 16
+  - [[-1, 12], 1, Concat, [1]]                                             # 17
+  - [-1, 1, MobileNetV3_Bneck, [512, 256, 3, 1, True, True]]               # 18 (P4)
+  - [-1, 1, DWConv, [512, 3, 2]]                                           # 19
+  - [[-1, 9], 1, Concat, [1]]                                              # 20
+  - [-1, 1, MobileNetV3_Bneck, [1024, 512, 3, 1, True, True]]              # 21 (P5)
+  - [[15, 18, 21], 1, Detect, [nc]]                                        # 22

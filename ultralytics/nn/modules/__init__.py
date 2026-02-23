@@ -62,6 +62,10 @@ from .block import (
     RepVGGBlock,
     ConformableBlock,
     ConformableInvertedResidual,
+    RepEdgeACBlock,
+    MobileNetV3_Bneck,
+    GhostBottleneckV2,
+    ShuffleNetV2Block,
 )
 from .conv import (
     CBAM,
@@ -185,4 +189,8 @@ __all__ = (
     "RepVGGBlock",
     "ConformableBlock",
     "ConformableInvertedResidual",
+    "RepEdgeACBlock",
+    "MobileNetV3_Bneck",
+    "GhostBottleneckV2",
+    "ShuffleNetV2Block",
 )

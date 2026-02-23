@@ -37,6 +37,7 @@ def _build_kd_cfg() -> KDLossConfig:
         temperature=1.0,
         aux_kd_head_label_loss=False,
         balance=_build_balance_cfg(),
+        log_interval_steps=1,
     )
 
 
@@ -71,6 +72,7 @@ def main() -> None:
     pose_total, pose_items = pose_criterion(pose_preds, pose_batch)
     assert torch.isfinite(pose_total).all(), "Pose KD total loss has NaN/Inf"
     assert torch.isfinite(pose_items).all(), "Pose deploy loss items have NaN/Inf"
+    assert pose_criterion.balancer.last_alpha_kd >= 0.0, "Pose alpha_kd must be >= 0"
 
     detect_model = KDDetectionModel(
         "ultralytics/cfg/models/11/yolo11.yaml",
@@ -94,6 +96,7 @@ def main() -> None:
     detect_total, detect_items = detect_criterion(detect_preds, detect_batch)
     assert torch.isfinite(detect_total).all(), "Detect KD total loss has NaN/Inf"
     assert torch.isfinite(detect_items).all(), "Detect deploy loss items have NaN/Inf"
+    assert detect_criterion.balancer.last_alpha_kd >= 0.0, "Detect alpha_kd must be >= 0"
 
     print(
         "verify_ultralytics_kd_loss_smoke: OK",

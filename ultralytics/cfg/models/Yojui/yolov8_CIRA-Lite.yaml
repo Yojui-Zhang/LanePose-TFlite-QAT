@@ -1,0 +1,101 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# YOLOv8 object detection model with P2-P5 outputs. For Usage examples see https://docs.ultralytics.com/tasks/detect
+
+# Parameters
+nc: 80  # number of classes
+scales: # model compound scaling constants, i.e. 'model=yolov8n.yaml' will call yolov8.yaml with scale 'n'
+  # [depth, width, max_channels]
+  
+  n: [1.0,  0.25, 1024]
+  s: [0.33, 0.50, 1024]  
+  m: [0.67, 0.75, 768]   
+  l: [1.00, 1.00, 512]   
+  x: [1.00, 1.25, 512]
+
+# YOLOv8.0 backbone
+# [from, repeats, module, args]
+
+# --------------------------------------------------------
+# ConformableInvertedResidual = [oup, k, stride, use_attention, dcn_mode, deform_enabled, force_fallback, use_mask, prior_scale]
+# 1) oup（int）
+# 輸出通道數 output channels。這個值決定此 block 的輸出 feature map 通道數，也是後續層 Concat/Detect 的通道基礎。
+
+# 2) k（int）
+# 卷積 kernel size。對應 DWConv 與 ConformableConv2d 的 kernel（通常 3）。k 越大感受野越大，但 latency 與 offset search 空間也更大。
+
+# 3) stride（int）
+# 步長（1 或 2）。stride=2 會下採樣（H,W/2）。ShuffleNetV2 的 downsample block 才用 2，其它保持 1。
+
+# 4) use_attention（0/1 或 bool）
+# 是否在 block 輸出後套用 MaxMinCBAM 注意力（通道+空間）。1=開，0=關。
+# 工業上通常只在 neck/head 開，backbone 早期可關以提升穩定與速度。
+
+# 5) dcn_mode（str）
+# DCN/TPG offset 的 ablation 模式（決定 offset 怎麼生成，影響「解釋性 vs 表現」）：
+# - "baseline"：完全不走 deform，退化成標準 conv2d（用於消融/部署保底）
+# - "prior_only"：只用 Sobel 先驗 offset_prior（可解釋性最強、最穩，但上限可能略低）
+# - "residual_only"：只用 learnable delta_offset（接近一般 DCN，但仍有 clamp/gate）
+# - "prior_residual"：offset = prior + residual（你主打的設計：可解釋 + 可學修正，通常效果最好）
+
+# 6) deform_enabled（bool）
+# 總開關。False 時直接跳過 deform（等同 baseline conv2d），但保留結構不改 YAML。
+# 用途：QAT/部署時一鍵關閉（避免 deform op 不可量化/不可導出）。
+
+# 7) force_fallback（bool）
+# 強制不用 torchvision deform kernel，直接走 F.conv2d fallback（即使環境有 deform 也不用）。
+# 用途：
+# - 你遇到某些 GPU/torchvision 組合會 segfault 或 kernel 不支援時，用它確保不崩潰。
+# - 做部署一致性測試（train 用 deform，deploy 用 fallback）時也能快速切換。
+
+# 8) use_mask（bool）
+# 是否使用 modulation mask（DCNv2 的 mask）。mask 會做每個 sampling point 的權重縮放：
+# - True：使用 mask（表達力更強，但更難量化、更可能影響早期穩定）
+# - False：不使用 mask（更像 DCNv1，較穩、較易部署）
+# 你現在預設 True，且已用 bias 讓 mask 初期接近 1，降低早期分佈漂移。
+
+# 9) prior_scale（float）
+# 拓撲先驗 offset_prior 的強度係數 β（縮放 Sobel 引導的偏移量）：
+# offset = clamp( prior_scale * offset_prior + gamma * delta_offset )
+
+# - prior_scale 太大：容易過度沿邊緣「拉扯」，造成對齊震盪/recall 掉
+# - prior_scale 太小：prior 的可解釋性變弱，退化成一般 DCN
+# 實務建議範圍：0.15 ~ 0.45（你目前用 0.25 / 0.35 屬於合理區間）
+# --------------------------------------------------------
+
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]]                                                     # 0
+
+  - [-1, 1, DWConv, [128, 3, 2]]                                                  # 1
+  - [-1, 1, ConformableInvertedResidual, [128, 3, 1, 0, "prior_only", True, False, False, 0.20]]  # 2
+
+  - [-1, 1, DWConv, [256, 3, 2]]                                                  # 3
+  - [-1, 1, ConformableInvertedResidual, [256, 3, 1, 0, "prior_only", True, False, False, 0.25]]  # 4
+
+  - [-1, 1, DWConv, [512, 3, 2]]                                                  # 5
+  - [-1, 1, ConformableInvertedResidual, [512, 3, 1, 1, "prior_residual", True, False, False, 0.30]] # 6
+
+  - [-1, 1, DWConv, [1024, 3, 2]]                                                 # 7
+  - [-1, 1, ConformableInvertedResidual, [1024, 3, 1, 1, "prior_residual", True, False, False, 0.25]] # 8
+
+  - [-1, 1, SPPF, [1024, 5]]                                                      # 9
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]                                     # 10
+  - [[-1, 6], 1, Concat, [1]]                                                      # 11
+  - [-1, 1, ConformableInvertedResidual, [512, 3, 1, 1, "prior_residual", True, False, True, 0.30]] # 12
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]                                     # 13
+  - [[-1, 4], 1, Concat, [1]]                                                      # 14
+  - [-1, 1, RepEdgeACBlock, [256, 3, 1, 1]]                                        # 15 (P3_final)
+  # - [-1, 1, ConformableInvertedResidual, [256, 3, 1, 0, "prior_residual", True, False, True, 0.30]] # 15 (P3_final)
+
+  - [-1, 1, DWConv, [256, 3, 2]]                                                   # 16
+  - [[-1, 12], 1, Concat, [1]]                                                     # 17
+  - [-1, 1, ConformableInvertedResidual, [512, 3, 1, 0, "prior_residual", True, False, True, 0.30]] # 18 (P4_large)
+
+  - [-1, 1, DWConv, [512, 3, 2]]                                                  # 19
+  - [[-1, 9], 1, Concat, [1]]                                                      # 20
+  - [-1, 1, ConformableInvertedResidual, [1024, 3, 1, 0, "residual_only", True, False, True, 0.25]] # 21 (P5_xlarge)
+
+  - [[15, 18, 21], 1, Detect, [nc]]                                                # 22
+

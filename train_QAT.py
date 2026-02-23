@@ -394,11 +394,17 @@ def _run_train_qat_ultralytics_kd(config: AppConfig) -> None:
         adapt_power=float(config.KD_BALANCE_ADAPT_POWER),
         renorm_sum=float(config.KD_BALANCE_RENORM_SUM),
         eps=float(config.KD_BALANCE_EPS),
+        fixed_kd_weight=(
+            None
+            if config.KD_BALANCE_FIXED_KD_WEIGHT is None
+            else float(config.KD_BALANCE_FIXED_KD_WEIGHT)
+        ),
     )
     kd_cfg = KDLossConfig(
         temperature=1.0,
         aux_kd_head_label_loss=bool(config.AUX_KD_HEAD_LABEL_LOSS),
         balance=balance_cfg,
+        log_interval_steps=int(config.KD_BALANCE_LOG_INTERVAL),
     )
     task = str(config.ULTRA_TASK).strip().lower()
     if task == "pose":

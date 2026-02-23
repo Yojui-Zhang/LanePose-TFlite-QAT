@@ -72,6 +72,10 @@ from ultralytics.nn.modules import (
     CBAM,
     ConformableBlock,
     ConformableInvertedResidual,
+    RepEdgeACBlock,
+    MobileNetV3_Bneck,
+    GhostBottleneckV2,
+    ShuffleNetV2Block,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1614,8 +1618,12 @@ def parse_model(d, ch, verbose=True):
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     base_modules = frozenset(
         {
+            RepEdgeACBlock,
             ConformableBlock,
             ConformableInvertedResidual,
+            MobileNetV3_Bneck,
+            GhostBottleneckV2,
+            ShuffleNetV2Block,
             Classify,
             Conv,
             ConvTranspose,

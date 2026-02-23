@@ -9,7 +9,7 @@ import torch
 
 @dataclass(frozen=True)
 class LossBalanceConfig:
-    """Dynamic balancing policy for deploy/KD losses."""
+    """Dynamic balancing policy for supervised/KD losses."""
 
     strategy: str = "grad_norm"  # grad_norm | dwa | ratio
     shared_param_group: str = "head"  # head | all
@@ -23,6 +23,7 @@ class LossBalanceConfig:
     adapt_power: float = 0.5
     renorm_sum: float = 2.0
     eps: float = 1e-6
+    fixed_kd_weight: float | None = None
 
     def validate(self) -> None:
         if self.strategy not in {"grad_norm", "dwa", "ratio"}:
@@ -37,8 +38,8 @@ class LossBalanceConfig:
             raise ValueError(f"warmup_steps must be >= 0, got {self.warmup_steps}")
         if self.deploy_ramp_steps < 0:
             raise ValueError(f"deploy_ramp_steps must be >= 0, got {self.deploy_ramp_steps}")
-        if self.min_weight <= 0.0:
-            raise ValueError(f"min_weight must be > 0, got {self.min_weight}")
+        if self.min_weight < 0.0:
+            raise ValueError(f"min_weight must be >= 0, got {self.min_weight}")
         if self.max_weight < self.min_weight:
             raise ValueError(f"max_weight must be >= min_weight, got {self.max_weight} < {self.min_weight}")
         if self.max_step_change < 1.0:
@@ -49,74 +50,86 @@ class LossBalanceConfig:
             raise ValueError(f"renorm_sum must be > 0, got {self.renorm_sum}")
         if self.eps <= 0.0:
             raise ValueError(f"eps must be > 0, got {self.eps}")
+        if self.fixed_kd_weight is not None and self.fixed_kd_weight < 0.0:
+            raise ValueError(f"fixed_kd_weight must be >= 0, got {self.fixed_kd_weight}")
 
 
 class LossBalancer:
-    """Stateful deploy/KD dynamic weight balancer."""
+    """Stateful KD-alpha balancer with fixed supervised weight = 1.0."""
 
     def __init__(self, cfg: LossBalanceConfig):
         cfg.validate()
         self.cfg = cfg
         self.step = 0
-        self.lambda_dep = 1.0
-        self.lambda_kd = 1.0
+        self.alpha_kd = 1.0
 
-        self._ema_dep: float | None = None
+        self._ema_sup: float | None = None
         self._ema_kd: float | None = None
-        self._prev_ema_dep: float | None = None
+        self._prev_ema_sup: float | None = None
         self._prev_ema_kd: float | None = None
+
+        self.last_supervised_loss: float = 0.0
+        self.last_kd_loss: float = 0.0
+        self.last_alpha_kd: float = 1.0
+        self.last_grad_norm_supervised: float | None = None
+        self.last_grad_norm_kd: float | None = None
+        self.last_grad_norm_ratio_sup_over_kd: float | None = None
 
     def build_total(
         self,
         deploy_loss: torch.Tensor,
         kd_loss: torch.Tensor,
         shared_params: Iterable[torch.nn.Parameter],
-    ) -> tuple[torch.Tensor, float, float]:
-        """Return weighted total with in-place state update."""
+    ) -> tuple[torch.Tensor, float]:
+        """Return total = supervised + alpha_kd * kd with in-place state update."""
         self.step += 1
-        dep_val = self._safe_scalar(deploy_loss)
+        sup_val = self._safe_scalar(deploy_loss)
         kd_val = self._safe_scalar(kd_loss)
-        self._update_ema(dep_val, kd_val)
+        self.last_supervised_loss = sup_val
+        self.last_kd_loss = kd_val
+        self._update_ema(sup_val, kd_val)
 
-        should_update = (
-            self.step > self.cfg.warmup_steps
-            and (self.step % self.cfg.update_interval == 0)
-            and deploy_loss.requires_grad
-            and kd_loss.requires_grad
-        )
-        if should_update:
-            if self.cfg.strategy == "grad_norm":
-                self._update_by_grad_norm(deploy_loss, kd_loss, shared_params)
-            elif self.cfg.strategy == "dwa":
-                self._update_by_dwa()
-            else:
-                self._update_by_ratio()
+        fixed_alpha = self.cfg.fixed_kd_weight
+        if fixed_alpha is None:
+            should_update = (
+                self.step > self.cfg.warmup_steps
+                and (self.step % self.cfg.update_interval == 0)
+                and deploy_loss.requires_grad
+                and kd_loss.requires_grad
+            )
+            if should_update:
+                if self.cfg.strategy == "grad_norm":
+                    self._update_by_grad_norm(deploy_loss, kd_loss, shared_params)
+                elif self.cfg.strategy == "dwa":
+                    self._update_by_dwa()
+                else:
+                    self._update_by_ratio()
+            alpha = self.current_alpha()
+        else:
+            alpha = self._bounded_alpha(float(fixed_alpha))
 
-        dep_w, kd_w = self.current_weights()
-        total = (deploy_loss * dep_w) + (kd_loss * kd_w)
-        return total, dep_w, kd_w
+        self.last_alpha_kd = alpha
+        total = deploy_loss + (kd_loss * alpha)
+        return total, alpha
 
-    def current_weights(self) -> tuple[float, float]:
-        dep = self.lambda_dep
-        kd = self.lambda_kd
+    def current_alpha(self) -> float:
+        alpha = self.alpha_kd
         if self.cfg.deploy_ramp_steps > 0 and self.step <= self.cfg.deploy_ramp_steps:
             ramp = float(self.step) / float(self.cfg.deploy_ramp_steps)
-            dep = self.cfg.min_weight + (dep - self.cfg.min_weight) * max(0.0, min(1.0, ramp))
-            kd = self.cfg.renorm_sum - dep
-            kd = min(max(kd, self.cfg.min_weight), self.cfg.max_weight)
-        return dep, kd
+            alpha = self.cfg.min_weight + (alpha - self.cfg.min_weight) * max(0.0, min(1.0, ramp))
+        return self._bounded_alpha(alpha)
 
-    def _update_ema(self, dep_val: float, kd_val: float) -> None:
-        if self._ema_dep is None or self._ema_kd is None:
-            self._ema_dep = dep_val
+    def _update_ema(self, sup_val: float, kd_val: float) -> None:
+        if self._ema_sup is None or self._ema_kd is None:
+            self._ema_sup = sup_val
             self._ema_kd = kd_val
-            self._prev_ema_dep = dep_val
+            self._prev_ema_sup = sup_val
             self._prev_ema_kd = kd_val
             return
         decay = self.cfg.ema_decay
-        self._prev_ema_dep = self._ema_dep
+        self._prev_ema_sup = self._ema_sup
         self._prev_ema_kd = self._ema_kd
-        self._ema_dep = (decay * self._ema_dep) + ((1.0 - decay) * dep_val)
+        self._ema_sup = (decay * self._ema_sup) + ((1.0 - decay) * sup_val)
         self._ema_kd = (decay * self._ema_kd) + ((1.0 - decay) * kd_val)
 
     def _update_by_grad_norm(
@@ -125,54 +138,44 @@ class LossBalancer:
         kd_loss: torch.Tensor,
         shared_params: Iterable[torch.nn.Parameter],
     ) -> None:
-        g_dep = self._grad_norm(deploy_loss, shared_params)
+        g_sup = self._grad_norm(deploy_loss, shared_params)
         g_kd = self._grad_norm(kd_loss, shared_params)
-        if not math.isfinite(g_dep) or not math.isfinite(g_kd):
+        self.last_grad_norm_supervised = g_sup
+        self.last_grad_norm_kd = g_kd
+        if not math.isfinite(g_sup) or not math.isfinite(g_kd):
             return
         eps = self.cfg.eps
         p = self.cfg.adapt_power
-        new_dep = self.lambda_dep * math.pow((g_kd + eps) / (g_dep + eps), p)
-        new_kd = self.lambda_kd * math.pow((g_dep + eps) / (g_kd + eps), p)
-        self._commit_weights(new_dep, new_kd)
+        ratio = (g_sup + eps) / (g_kd + eps)
+        if math.isfinite(ratio):
+            self.last_grad_norm_ratio_sup_over_kd = ratio
+        new_alpha = self.alpha_kd * math.pow(ratio, p)
+        self._commit_alpha(new_alpha)
 
     def _update_by_dwa(self) -> None:
-        if self._prev_ema_dep is None or self._prev_ema_kd is None or self._ema_dep is None or self._ema_kd is None:
+        if self._prev_ema_sup is None or self._prev_ema_kd is None or self._ema_sup is None or self._ema_kd is None:
             return
         eps = self.cfg.eps
         p = self.cfg.adapt_power
-        r_dep = self._ema_dep / (self._prev_ema_dep + eps)
+        r_sup = self._ema_sup / (self._prev_ema_sup + eps)
         r_kd = self._ema_kd / (self._prev_ema_kd + eps)
-        new_dep = self.lambda_dep * math.pow((r_dep + eps) / (r_kd + eps), p)
-        new_kd = self.lambda_kd * math.pow((r_kd + eps) / (r_dep + eps), p)
-        self._commit_weights(new_dep, new_kd)
+        new_alpha = self.alpha_kd * math.pow((r_kd + eps) / (r_sup + eps), p)
+        self._commit_alpha(new_alpha)
 
     def _update_by_ratio(self) -> None:
-        if self._ema_dep is None or self._ema_kd is None:
+        if self._ema_sup is None or self._ema_kd is None:
             return
         eps = self.cfg.eps
         p = self.cfg.adapt_power
-        new_dep = self.lambda_dep * math.pow((self._ema_kd + eps) / (self._ema_dep + eps), p)
-        new_kd = self.lambda_kd * math.pow((self._ema_dep + eps) / (self._ema_kd + eps), p)
-        self._commit_weights(new_dep, new_kd)
+        new_alpha = self.alpha_kd * math.pow((self._ema_sup + eps) / (self._ema_kd + eps), p)
+        self._commit_alpha(new_alpha)
 
-    def _commit_weights(self, new_dep: float, new_kd: float) -> None:
-        dep = self._bounded_step(self.lambda_dep, new_dep)
-        kd = self._bounded_step(self.lambda_kd, new_kd)
-        dep = min(max(dep, self.cfg.min_weight), self.cfg.max_weight)
-        kd = min(max(kd, self.cfg.min_weight), self.cfg.max_weight)
-        total = dep + kd
-        if total <= self.cfg.eps:
-            dep = kd = self.cfg.renorm_sum * 0.5
-        else:
-            scale = self.cfg.renorm_sum / total
-            dep *= scale
-            kd *= scale
-        dep = min(max(dep, self.cfg.min_weight), self.cfg.max_weight)
-        kd = min(max(kd, self.cfg.min_weight), self.cfg.max_weight)
-        if not (math.isfinite(dep) and math.isfinite(kd)):
+    def _commit_alpha(self, new_alpha: float) -> None:
+        alpha = self._bounded_step(self.alpha_kd, new_alpha)
+        alpha = self._bounded_alpha(alpha)
+        if not math.isfinite(alpha):
             return
-        self.lambda_dep = dep
-        self.lambda_kd = kd
+        self.alpha_kd = alpha
 
     def _bounded_step(self, old: float, new: float) -> float:
         if not math.isfinite(new):
@@ -181,6 +184,9 @@ class LossBalancer:
         lo = old / max_ratio
         hi = old * max_ratio
         return min(max(new, lo), hi)
+
+    def _bounded_alpha(self, alpha: float) -> float:
+        return min(max(alpha, self.cfg.min_weight), self.cfg.max_weight)
 
     def _grad_norm(self, loss: torch.Tensor, shared_params: Iterable[torch.nn.Parameter]) -> float:
         params = [p for p in shared_params if p.requires_grad]

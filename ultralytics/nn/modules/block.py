@@ -1,13 +1,18 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Block modules."""
 from __future__ import annotations
-from typing import List, Optional, Tuple, Union, Sequence, Dict, Any
+from typing import List, Optional, Tuple, Union, Sequence, Dict, Any, Callable, Final
+from dataclasses import dataclass, field
+from collections import Counter
+
 import numpy as np
 import math
 import inspect
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import os
 
 try:
     # torchvision >= 0.13 通常提供
@@ -63,7 +68,148 @@ __all__ = (
     "RepVGGBlock",
     "ConformableBlock",
     "ConformableInvertedResidual",
+    "RepEdgeACBlock",
+    "MobileNetV3_Bneck",
+    "GhostBottleneckV2",
+    "ShuffleNetV2Block",
 )
+
+
+# ============================================================
+# MobileNetV3 Units
+# ============================================================
+class SEModule_v3(nn.Module):
+    """Squeeze-and-Excitation block specifically for MobileNetV3 using Hardsigmoid."""
+    def __init__(self, c, reduction=4):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(c, max(8, c // reduction), bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(max(8, c // reduction), c, bias=False),
+            nn.Hardsigmoid(inplace=True)
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+class MobileNetV3_Bneck(nn.Module):
+    """MobileNetV3 Inverted Residual Bottleneck."""
+    def __init__(self, c1, c2, c3, k=3, s=1, use_se=False, use_hs=False):
+        super().__init__()
+        self.use_res_connect = (s == 1 and c1 == c2)
+        act = nn.Hardswish if use_hs else nn.ReLU
+
+        layers = []
+        if c3 != c1:
+            layers.append(Conv(c1, c3, 1, 1, act=act()))  # pw
+        layers.append(DWConv(c3, c3, k, s, act=act()))    # dw
+        if use_se:
+            layers.append(SEModule_v3(c3))
+        layers.append(Conv(c3, c2, 1, 1, act=False))      # pw-linear
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return x + self.conv(x) if self.use_res_connect else self.conv(x)
+
+
+# ============================================================
+# GhostNetV2 Units
+# ============================================================
+class GhostModuleV2(nn.Module):
+    """GhostModuleV2 with DFC Attention."""
+    def __init__(self, c1, c2, k=1, ratio=2, dw_size=3, s=1, relu=True):
+        super().__init__()
+        self.oup = c2
+        init_channels = math.ceil(c2 / ratio)
+        new_channels = init_channels * (ratio - 1)
+
+        self.primary_conv = nn.Sequential(
+            nn.Conv2d(c1, init_channels, k, s, k // 2, bias=False),
+            nn.BatchNorm2d(init_channels),
+            nn.ReLU(inplace=True) if relu else nn.Identity(),
+        )
+        self.cheap_operation = nn.Sequential(
+            nn.Conv2d(init_channels, new_channels, dw_size, 1, dw_size // 2, groups=init_channels, bias=False),
+            nn.BatchNorm2d(new_channels),
+            nn.ReLU(inplace=True) if relu else nn.Identity(),
+        )
+        # DFC Attention Branch (Simplified for YOLO backbone integration)
+        self.short_conv = nn.Sequential(
+            nn.Conv2d(c1, c2, k, s, k // 2, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.Conv2d(c2, c2, 1, 1, 0, groups=c2, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.ReLU(inplace=True) if relu else nn.Identity(),
+        )
+
+    def forward(self, x):
+        res = self.short_conv(x)
+        x1 = self.primary_conv(x)
+        x2 = self.cheap_operation(x1)
+        out = torch.cat([x1, x2], dim=1)
+        return out * torch.sigmoid(res)
+
+class GhostBottleneckV2(nn.Module):
+    """GhostNetV2 Bottleneck."""
+    def __init__(self, c1, c2, c3, k=3, s=1):
+        super().__init__()
+        self.use_res_connect = (s == 1 and c1 == c2)
+        self.conv = nn.Sequential(
+            GhostModuleV2(c1, c3, relu=True),
+            DWConv(c3, c3, k, s, act=False) if s == 2 else nn.Identity(),
+            GhostModuleV2(c3, c2, relu=False)
+        )
+        if not self.use_res_connect:
+            self.shortcut = nn.Sequential(
+                DWConv(c1, c1, k, s, act=False),
+                Conv(c1, c2, 1, 1, act=False)
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        return self.conv(x) + self.shortcut(x)
+
+
+# ============================================================
+# ShuffleNetV2 Units
+# ============================================================
+class ShuffleNetV2Block(nn.Module):
+    """ShuffleNetV2 Inverted Residual Block."""
+    def __init__(self, c1, c2, stride=1):
+        super().__init__()
+        self.stride = stride
+        assert c2 % 2 == 0, "Output channels must be even"
+        c_ = c2 // 2
+        self.use_split = (stride == 1 and c1 == c2)
+
+        if not self.use_split:
+            self.branch1 = nn.Sequential(
+                DWConv(c1, c1, 3, stride, act=False),
+                Conv(c1, c_, 1, 1, act=True)
+            )
+        else:
+            self.branch1 = nn.Identity()
+
+        in_channels = c_ if self.use_split else c1
+        self.branch2 = nn.Sequential(
+            Conv(in_channels, c_, 1, 1, act=True),
+            DWConv(c_, c_, 3, stride, act=False),
+            Conv(c_, c_, 1, 1, act=True)
+        )
+
+    def forward(self, x):
+        if self.use_split:
+            x1, x2 = x.chunk(2, dim=1)
+            out = torch.cat((x1, self.branch2(x2)), dim=1)
+        else:
+            out = torch.cat((self.branch1(x), self.branch2(x)), dim=1)
+        # channel_shuffle 取自您代碼中現有的函數
+        return channel_shuffle(out, 2)
 
 # ===================================================================================================================
 def conv_bn(in_channels, out_channels, kernel_size, stride, padding, groups=1):
@@ -196,96 +342,781 @@ class RepVGGBlock(nn.Module):
 
 
 # ===================================================================================================================
+# ============================================================
+# RepEdgeACBlock
+# ============================================================
 
+@dataclass(frozen=True)
+class _FuseResult:
+    kernel: torch.Tensor
+    bias: torch.Tensor
+
+
+class RepEdgeACBlock(nn.Module):
+    """
+    RepVGG-like block with additional anisotropic depthwise branches (1x3, 3x1).
+    Train-time: multi-branch -> sum -> activation.
+    Deploy-time: single 3x3 conv (bias=True) after fusing all branches.
+
+    Design constraints:
+    - Pure conv/BN/activation.
+    - DW branches enabled only when representable under a single dense 3x3 conv (groups=1 and c1==c2).
+    """
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        k: int = 3,
+        s: int = 1,
+        p: Optional[int] = None,
+        g: int = 1,
+        act: bool = True,
+        deploy: bool = False,
+        use_dw_branches: bool = True,
+    ) -> None:
+        super().__init__()
+
+        if c1 <= 0 or c2 <= 0:
+            raise ValueError(f"Invalid channels: c1={c1}, c2={c2}")
+        if k != 3:
+            raise ValueError("RepEdgeACBlock only supports k=3 for deterministic fusion.")
+        if s not in (1, 2):
+            raise ValueError(f"Unsupported stride: s={s} (expected 1 or 2)")
+        if g <= 0:
+            raise ValueError(f"Invalid groups: g={g}")
+
+        self.in_channels: int = c1
+        self.out_channels: int = c2
+        self.kernel_size: int = k
+        self.stride: int = s
+        self.groups: int = g
+        self.padding: int = (k // 2) if p is None else p
+        self.deploy: bool = deploy
+
+        self.act: nn.Module = nn.SiLU(inplace=True) if act else nn.Identity()
+
+        # Why: DW anisotropic branches are only safe to collapse into a single dense conv when:
+        # - groups==1 (target deploy conv is dense) and
+        # - c1==c2 (DW branch maps channel i->i; summation requires aligned channel semantics).
+        self._dw_enabled: bool = bool(use_dw_branches and (g == 1) and (c1 == c2))
+
+        if deploy:
+            self.rbr_reparam: nn.Conv2d = nn.Conv2d(
+                c1, c2, k, s, self.padding, groups=g, bias=True
+            )
+            self.rbr_dense = None
+            self.rbr_1x1 = None
+            self.rbr_identity = None
+            self.rbr_dw_1x3 = None
+            self.rbr_dw_3x1 = None
+            return
+
+        self.rbr_reparam = None
+
+        self.rbr_dense: nn.Sequential = conv_bn(
+            c1, c2, kernel_size=3, stride=s, padding=self.padding, groups=g
+        )
+        self.rbr_1x1: nn.Sequential = conv_bn(
+            c1, c2, kernel_size=1, stride=s, padding=0, groups=g
+        )
+
+        self.rbr_identity: Optional[nn.BatchNorm2d] = None
+        if c1 == c2 and s == 1:
+            # Why: identity branch stabilizes early optimization without adding conv parameters.
+            self.rbr_identity = nn.BatchNorm2d(c1)
+
+        self.rbr_dw_1x3: Optional[nn.Sequential] = None
+        self.rbr_dw_3x1: Optional[nn.Sequential] = None
+        if self._dw_enabled:
+            # Why: anisotropic DW adds directional bias at negligible parameter cost.
+            self.rbr_dw_1x3 = nn.Sequential(
+                nn.Conv2d(c1, c1, (1, 3), s, (0, 1), groups=c1, bias=False),
+                nn.BatchNorm2d(c1),
+            )
+            self.rbr_dw_3x1 = nn.Sequential(
+                nn.Conv2d(c1, c1, (3, 1), s, (1, 0), groups=c1, bias=False),
+                nn.BatchNorm2d(c1),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 4:
+            raise ValueError(f"Expected NCHW tensor, got shape={tuple(x.shape)}")
+
+        if self.deploy:
+            assert self.rbr_reparam is not None
+            return self.act(self.rbr_reparam(x))
+
+        out = self.rbr_dense(x) + self.rbr_1x1(x)
+
+        if self.rbr_identity is not None:
+            out = out + self.rbr_identity(x)
+
+        if self._dw_enabled:
+            assert self.rbr_dw_1x3 is not None and self.rbr_dw_3x1 is not None
+            out = out + self.rbr_dw_1x3(x) + self.rbr_dw_3x1(x)
+
+        return self.act(out)
+
+    @staticmethod
+    def _fuse_conv_bn_branch(branch: nn.Sequential) -> _FuseResult:
+        if not isinstance(branch, nn.Sequential) or len(branch) != 2:
+            raise TypeError("Branch must be nn.Sequential(conv, bn).")
+        conv, bn = branch[0], branch[1]
+        # if not _is_conv(conv) or not _is_bn(bn):
+        if not isinstance(conv, nn.Conv2d) or not isinstance(bn, nn.BatchNorm2d):
+            raise TypeError("Branch must be nn.Sequential(conv, bn).")
+
+        w = conv.weight
+        if conv.bias is None:
+            b = torch.zeros(w.size(0), device=w.device, dtype=w.dtype)
+        else:
+            b = conv.bias
+
+        gamma = bn.weight
+        beta = bn.bias
+        mean = bn.running_mean
+        var = bn.running_var
+        eps = bn.eps
+
+        std = torch.sqrt(var + eps)
+        scale = (gamma / std).reshape(-1, 1, 1, 1)
+
+        fused_w = w * scale
+        fused_b = beta + (b - mean) * (gamma / std)
+
+        return _FuseResult(kernel=fused_w, bias=fused_b)
+
+    @staticmethod
+    def _fuse_identity_bn(
+        bn: nn.BatchNorm2d,
+        channels: int,
+        groups: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> _FuseResult:
+        if groups != 1:
+            raise ValueError("Identity fusion is only defined for groups=1 in this implementation.")
+        if channels <= 0:
+            raise ValueError(f"Invalid channels: {channels}")
+
+        gamma = bn.weight
+        beta = bn.bias
+        mean = bn.running_mean
+        var = bn.running_var
+        eps = bn.eps
+
+        std = torch.sqrt(var + eps)
+
+        # identity 3x3 kernel: diag at center
+        kernel = torch.zeros((channels, channels, 3, 3), device=device, dtype=dtype)
+        idx = torch.arange(channels, device=device)
+        kernel[idx, idx, 1, 1] = 1.0
+
+        scale = (gamma / std).reshape(-1, 1, 1, 1)
+        fused_w = kernel * scale
+        fused_b = beta - mean * (gamma / std)
+
+        return _FuseResult(kernel=fused_w, bias=fused_b)
+
+    @staticmethod
+    def _pad_1x1_to_3x3(k1: torch.Tensor) -> torch.Tensor:
+        if k1.dim() != 4 or k1.size(-1) != 1 or k1.size(-2) != 1:
+            raise ValueError(f"Expected 1x1 kernel, got shape={tuple(k1.shape)}")
+        return F.pad(k1, [1, 1, 1, 1])
+
+    @staticmethod
+    def _embed_dw_to_dense_3x3(
+        dw_kernel: torch.Tensor,
+        out_channels: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        kind: str,
+    ) -> torch.Tensor:
+        """
+        Convert depthwise (C,1,1,3) or (C,1,3,1) into dense (C,C,3,3) diagonal kernel.
+        """
+        if out_channels <= 0:
+            raise ValueError(f"Invalid out_channels: {out_channels}")
+        if dw_kernel.dim() != 4 or dw_kernel.size(0) != out_channels:
+            raise ValueError(f"Invalid dw_kernel shape={tuple(dw_kernel.shape)} for out_channels={out_channels}")
+
+        dense = torch.zeros((out_channels, out_channels, 3, 3), device=device, dtype=dtype)
+        idx = torch.arange(out_channels, device=device)
+
+        if kind == "1x3":
+            if dw_kernel.size(2) != 1 or dw_kernel.size(3) != 3:
+                raise ValueError(f"Expected (C,1,1,3), got {tuple(dw_kernel.shape)}")
+            dense[idx, idx, 1, 0:3] = dw_kernel[:, 0, 0, :]
+        elif kind == "3x1":
+            if dw_kernel.size(2) != 3 or dw_kernel.size(3) != 1:
+                raise ValueError(f"Expected (C,1,3,1), got {tuple(dw_kernel.shape)}")
+            dense[idx, idx, 0:3, 1] = dw_kernel[:, 0, :, 0]
+        else:
+            raise ValueError(f"Unknown kind: {kind}")
+
+        return dense
+
+    def get_equivalent_kernel_bias(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.deploy:
+            assert self.rbr_reparam is not None
+            return self.rbr_reparam.weight, self.rbr_reparam.bias
+
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+
+        k_sum = torch.zeros(
+            (self.out_channels, self.in_channels, 3, 3),
+            device=device,
+            dtype=dtype,
+        )
+        b_sum = torch.zeros((self.out_channels,), device=device, dtype=dtype)
+
+        # 3x3 branch
+        r = self._fuse_conv_bn_branch(self.rbr_dense)
+        k_sum += r.kernel
+        b_sum += r.bias
+
+        # 1x1 branch (pad to 3x3)
+        r = self._fuse_conv_bn_branch(self.rbr_1x1)
+        k_sum += self._pad_1x1_to_3x3(r.kernel)
+        b_sum += r.bias
+
+        # identity BN branch
+        if self.rbr_identity is not None:
+            r = self._fuse_identity_bn(
+                self.rbr_identity,
+                channels=self.in_channels,
+                groups=self.groups,
+                device=device,
+                dtype=dtype,
+            )
+            k_sum += r.kernel
+            b_sum += r.bias
+
+        # anisotropic DW branches
+        if self._dw_enabled:
+            assert self.rbr_dw_1x3 is not None and self.rbr_dw_3x1 is not None
+
+            r13 = self._fuse_conv_bn_branch(self.rbr_dw_1x3)
+            r31 = self._fuse_conv_bn_branch(self.rbr_dw_3x1)
+
+            # represent DW as diagonal dense kernel
+            k_sum += self._embed_dw_to_dense_3x3(r13.kernel, self.out_channels, device, dtype, kind="1x3")
+            b_sum += r13.bias
+
+            k_sum += self._embed_dw_to_dense_3x3(r31.kernel, self.out_channels, device, dtype, kind="3x1")
+            b_sum += r31.bias
+
+        return k_sum, b_sum
+
+    @torch.no_grad()
+    def switch_to_deploy(self) -> None:
+        if self.deploy:
+            return
+
+        k, b = self.get_equivalent_kernel_bias()
+
+        self.rbr_reparam = nn.Conv2d(
+            self.in_channels,
+            self.out_channels,
+            kernel_size=3,
+            stride=self.stride,
+            padding=self.padding,
+            groups=self.groups,
+            bias=True,
+        )
+
+        self.rbr_reparam.weight.data.copy_(k)
+        self.rbr_reparam.bias.data.copy_(b)
+
+        # Why: remove training branches to avoid accidental parameter updates / state drift.
+        if hasattr(self, "rbr_dense"):
+            del self.rbr_dense
+        if hasattr(self, "rbr_1x1"):
+            del self.rbr_1x1
+        if hasattr(self, "rbr_identity"):
+            del self.rbr_identity
+        if hasattr(self, "rbr_dw_1x3"):
+            del self.rbr_dw_1x3
+        if hasattr(self, "rbr_dw_3x1"):
+            del self.rbr_dw_3x1
+
+        self.deploy = True
+
+# ===================================================================================================================
 
 # ============================================================
 # DeformConv2d Safe Wrapper (AMP/bf16 stable + optional fallback)
 # ============================================================
 
-_SUPPORTED_DEFORM_KWARGS: frozenset[str] = frozenset()
-if _tv_deform_conv2d is not None:
-    try:
-        _SUPPORTED_DEFORM_KWARGS = frozenset(inspect.signature(_tv_deform_conv2d).parameters.keys())
-    except Exception:
-        _SUPPORTED_DEFORM_KWARGS = frozenset()
+IntOrPair = Union[int, Tuple[int, int]]
 
-
-def _to_2tuple(v: Any) -> Tuple[int, int]:
-    if isinstance(v, (tuple, list)) and len(v) == 2:
+def _to_2tuple(v: IntOrPair) -> Tuple[int, int]:
+    if isinstance(v, tuple):
+        if len(v) != 2:
+            raise ValueError(f"expected 2-tuple, got {v}")
         return int(v[0]), int(v[1])
     return int(v), int(v)
 
 
-def safe_deform_conv2d(
-    x: torch.Tensor,
-    offset: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    stride: int | Tuple[int, int] = 1,
-    padding: int | Tuple[int, int] = 0,
-    dilation: int | Tuple[int, int] = 1,
-    mask: Optional[torch.Tensor] = None,
-    groups: int = 1,
-    deformable_groups: int = 1,
-    force_fp32: bool = True,
-    allow_fallback: bool = True,
-    force_fallback: bool = False,
-) -> torch.Tensor:
-    """
-    Why:
-      - bf16/fp16 deform kernels in some builds may crash; fp32 path is most stable.
-      - signature differences (groups/deformable_groups) exist across implementations.
-      - industrial requirement: never crash -> fallback to conv2d when needed.
-    """
-    if x.dim() != 4 or offset.dim() != 4 or weight.dim() != 4:
-        raise ValueError("safe_deform_conv2d: x/offset/weight 必須為 4D NCHW")
-    if groups <= 0 or deformable_groups <= 0:
-        raise ValueError("safe_deform_conv2d: groups/deformable_groups 必須為正整數")
+@dataclass
+class DeformStatsLogger:
+    log_every: int = 5000
+    max_topk: int = 3
+    _calls: int = 0
+    _deform: int = 0
+    _fallback: int = 0
+    _reason: Counter = field(default_factory=Counter)
+    _exc: Counter = field(default_factory=Counter)
+    _printed_reasons: set[str] = field(default_factory=set)
+    _last_backend: str = "unknown"
 
-    if force_fallback or (_tv_deform_conv2d is None):
-        if not allow_fallback:
-            raise RuntimeError("deform_conv2d 不可用/被禁用，且 allow_fallback=False")
-        return F.conv2d(x, weight, bias, stride=stride, padding=padding, dilation=dilation, groups=groups)
+    def on_deform(self, backend: str) -> None:
+        self._calls += 1
+        self._deform += 1
+        self._last_backend = backend
+        self._maybe_flush()
 
-    if groups != 1 and ("groups" not in _SUPPORTED_DEFORM_KWARGS):
-        if not allow_fallback:
-            raise RuntimeError("當前 deform_conv2d 不支援 groups，但 groups!=1 且 allow_fallback=False")
-        return F.conv2d(x, weight, bias, stride=stride, padding=padding, dilation=dilation, groups=groups)
+    def on_fallback(self, reason: str, backend: str, exc: Optional[BaseException] = None) -> None:
+        self._calls += 1
+        self._fallback += 1
+        self._reason[reason] += 1
+        self._last_backend = backend
+        if exc is not None:
+            self._exc[type(exc).__name__] += 1
 
-    compute_dtype = torch.float32 if (force_fp32 and x.dtype in (torch.float16, torch.bfloat16)) else x.dtype
-    x_in = x.contiguous()
-    off = offset.contiguous()
-    msk = mask.contiguous() if mask is not None else None
+        if reason not in self._printed_reasons:
+            self._printed_reasons.add(reason)
+            # Why: 讓訓練 log 第一時間可見「為何在 fallback」，但不打斷訓練。
+            print(f"[DEFORM_FALLBACK] reason={reason} backend={backend}", flush=True)
 
-    if x_in.dtype != compute_dtype:
-        x_in = x_in.to(dtype=compute_dtype)
-        off = off.to(dtype=compute_dtype)
-        if msk is not None:
-            msk = msk.to(dtype=compute_dtype)
+        self._maybe_flush()
 
-    w = weight if weight.dtype == compute_dtype else weight.to(dtype=compute_dtype)
-    b = None if bias is None else (bias if bias.dtype == compute_dtype else bias.to(dtype=compute_dtype))
+    def _maybe_flush(self) -> None:
+        if self.log_every <= 0:
+            return
+        if (self._calls % self.log_every) != 0:
+            return
 
-    kwargs: Dict[str, Any] = {
-        "stride": _to_2tuple(stride),
-        "padding": _to_2tuple(padding),
-        "dilation": _to_2tuple(dilation),
-        "mask": msk,
-    }
-    if "groups" in _SUPPORTED_DEFORM_KWARGS:
-        kwargs["groups"] = int(groups)
-    if "deformable_groups" in _SUPPORTED_DEFORM_KWARGS:
-        kwargs["deformable_groups"] = int(deformable_groups)
+        top_reason = self._reason.most_common(self.max_topk)
+        top_exc = self._exc.most_common(self.max_topk)
+        print(
+            f"[DEFORM_STATS] calls={self._calls} deform={self._deform} fallback={self._fallback} "
+            f"top_reason={top_reason} top_exc={top_exc} last_backend={self._last_backend}",
+            flush=True,
+        )
+
+
+_DEFAULT_DEFORM_LOGGER = DeformStatsLogger(log_every=5000, max_topk=3)
+
+
+@dataclass(frozen=True)
+class _TorchvisionDeformCaps:
+    available: bool
+    supports_groups: bool
+    supports_mask: bool
+    supports_deformable_groups: bool
+
+
+_TV_DEFORM_CAPS: Optional[_TorchvisionDeformCaps] = None
+_TV_DEFORM_FN: Optional[Callable[..., torch.Tensor]] = None
+
+
+def _get_torchvision_deform_caps() -> _TorchvisionDeformCaps:
+    global _TV_DEFORM_CAPS, _TV_DEFORM_FN
+    if _TV_DEFORM_CAPS is not None:
+        return _TV_DEFORM_CAPS
 
     try:
-        with torch.cuda.amp.autocast(enabled=False):
-            y = _tv_deform_conv2d(x_in, off, w, b, **kwargs)
+        from torchvision.ops import deform_conv2d as tv_deform_conv2d  # type: ignore
+        _TV_DEFORM_FN = tv_deform_conv2d
     except Exception:
-        if not allow_fallback:
-            raise
-        y = F.conv2d(x_in, w, b, stride=stride, padding=padding, dilation=dilation, groups=groups)
+        _TV_DEFORM_FN = None
+        _TV_DEFORM_CAPS = _TorchvisionDeformCaps(
+            available=False,
+            supports_groups=False,
+            supports_mask=False,
+            supports_deformable_groups=False,
+        )
+        return _TV_DEFORM_CAPS
 
-    return y.to(dtype=x.dtype) if y.dtype != x.dtype else y
+    sig = inspect.signature(_TV_DEFORM_FN)
+    params = sig.parameters
+    supports_groups = "groups" in params
+    supports_mask = "mask" in params
+    supports_dg = ("deformable_groups" in params) or ("offset_groups" in params)
+    _TV_DEFORM_CAPS = _TorchvisionDeformCaps(
+        available=True,
+        supports_groups=supports_groups,
+        supports_mask=supports_mask,
+        supports_deformable_groups=supports_dg,
+    )
+    return _TV_DEFORM_CAPS
+
+
+def _grid_sample_normalize(x: torch.Tensor, denom: int) -> torch.Tensor:
+    # Why: 避免 W/H=1 時除以 0，並穩定 grid_sample 的 normalizing。
+    if denom <= 0:
+        return torch.zeros_like(x)
+    return (2.0 * x / float(denom)) - 1.0
+
+
+def _depthwise_deform_conv2d_pytorch(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    offset: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    stride: Tuple[int, int],
+    padding: Tuple[int, int],
+    dilation: Tuple[int, int],
+    deformable_groups: int,
+) -> torch.Tensor:
+    if x.dim() != 4:
+        raise ValueError(f"x must be NCHW, got {tuple(x.shape)}")
+    if weight.dim() != 4:
+        raise ValueError(f"weight must be OIHW, got {tuple(weight.shape)}")
+
+    n, c, hin, win = x.shape
+    oc, ic_per_group, kh, kw = weight.shape
+
+    if oc != c:
+        raise ValueError(f"depthwise requires out_channels==in_channels, got oc={oc}, c={c}")
+    if ic_per_group != 1:
+        raise ValueError(f"depthwise requires weight.shape[1]==1, got {ic_per_group}")
+    if deformable_groups <= 0:
+        raise ValueError(f"deformable_groups must be >0, got {deformable_groups}")
+    if c % deformable_groups != 0:
+        raise ValueError(f"channels must be divisible by deformable_groups, got c={c}, dg={deformable_groups}")
+
+    h_out, w_out = int(offset.shape[2]), int(offset.shape[3])
+    p = kh * kw
+
+    expected_off_ch = 2 * p * deformable_groups
+    if offset.shape[1] != expected_off_ch:
+        raise ValueError(f"offset channels mismatch: got {offset.shape[1]}, expected {expected_off_ch}")
+
+    if mask is not None:
+        expected_mask_ch = p * deformable_groups
+        if mask.shape[1] != expected_mask_ch:
+            raise ValueError(f"mask channels mismatch: got {mask.shape[1]}, expected {expected_mask_ch}")
+
+    sx, sy = stride[1], stride[0]
+    px, py = padding[1], padding[0]
+    dx, dy = dilation[1], dilation[0]
+
+    device = x.device
+    dtype_out = x.dtype
+
+    x_f = x.float()
+    offset_f = offset.float()
+    mask_f = mask.float() if mask is not None else None
+
+    oy = torch.arange(h_out, device=device, dtype=torch.float32)
+    ox = torch.arange(w_out, device=device, dtype=torch.float32)
+    yy, xx = torch.meshgrid(oy, ox, indexing="ij")  # (Hout, Wout)
+    base_y0 = yy * float(sy) - float(py)
+    base_x0 = xx * float(sx) - float(px)
+
+    denom_x = max(win - 1, 1)
+    denom_y = max(hin - 1, 1)
+
+    c_per_dg = c // deformable_groups
+    out = torch.empty((n, c, h_out, w_out), device=device, dtype=torch.float32)
+
+    w_dw = weight[:, 0, :, :].reshape(c, p).float()  # (C, P)
+
+    output_parts = []
+
+    for dg in range(deformable_groups):
+        c0 = dg * c_per_dg
+        c1 = c0 + c_per_dg
+
+        x_g = x_f[:, c0:c1, :, :]  # (N, Cg, Hin, Win)
+        w_g = w_dw[c0:c1, :]       # (Cg, P)
+
+        off_g = offset_f[:, dg * (2 * p):(dg + 1) * (2 * p), :, :]  # (N, 2P, Hout, Wout)
+        if mask_f is None:
+            m_g = None
+        else:
+            m_g = mask_f[:, dg * p:(dg + 1) * p, :, :]  # (N, P, Hout, Wout)
+
+        samples: list[torch.Tensor] = []
+        idx = 0
+        for ky in range(kh):
+            for kx in range(kw):
+                off_y = off_g[:, idx * 2 + 0, :, :]  # (N, Hout, Wout)
+                off_x = off_g[:, idx * 2 + 1, :, :]  # (N, Hout, Wout)
+
+                yy_s = base_y0 + float(ky * dy) + off_y
+                xx_s = base_x0 + float(kx * dx) + off_x
+
+                grid_x = _grid_sample_normalize(xx_s, denom_x)
+                grid_y = _grid_sample_normalize(yy_s, denom_y)
+                grid = torch.stack((grid_x, grid_y), dim=-1)  # (N, Hout, Wout, 2)
+
+                v = F.grid_sample(
+                    x_g,
+                    grid,
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=True,
+                )  # (N, Cg, Hout, Wout)
+
+                if m_g is not None:
+                    v = v * m_g[:, idx, :, :].unsqueeze(1)
+
+                samples.append(v)
+                idx += 1
+
+        col = torch.stack(samples, dim=2)  # (N, Cg, P, Hout, Wout)
+        y_g = torch.einsum("n c p h w, c p -> n c h w", col, w_g)
+        # out[:, c0:c1, :, :] = y_g
+        output_parts.append(y_g)
+
+    out = torch.cat(output_parts, dim=1)
+
+    if bias is not None:
+        if bias.numel() != c:
+            raise ValueError(f"bias numel mismatch: got {bias.numel()}, expected {c}")
+        out = out + bias.reshape(1, c, 1, 1).float()
+
+    return out.to(dtype_out)
+
+def _is_rank0() -> bool:
+    # Why: DDP/多卡時避免重複刷屏；單卡時永遠 True。
+    for k in ("RANK", "LOCAL_RANK", "SLURM_PROCID"):
+        v = os.environ.get(k)
+        if v is not None:
+            try:
+                return int(v) == 0
+            except Exception:
+                return True
+    return True
+
+
+@dataclass
+class DeformHubLogger:
+    log_every: int = 5000
+    max_topk: int = 3
+    enable_rank0_only: bool = True
+
+    _by_tag: Dict[str, "DeformStatsLogger"] = field(default_factory=dict)
+
+    def _get(self, tag: str) -> "DeformStatsLogger":
+        t = tag if tag else "unknown"
+        lg = self._by_tag.get(t)
+        if lg is None:
+            lg = DeformStatsLogger(log_every=self.log_every, max_topk=self.max_topk)
+            self._by_tag[t] = lg
+        return lg
+
+    def on_deform(self, backend: str, tag: str = "unknown") -> None:
+        if self.enable_rank0_only and not _is_rank0():
+            return
+        self._get(tag).on_deform(backend)
+
+    def on_fallback(self, reason: str, backend: str, tag: str = "unknown", exc: Optional[BaseException] = None) -> None:
+        if self.enable_rank0_only and not _is_rank0():
+            return
+        # Why: 讓每個 tag 的 reason 更可讀（tag 前綴由 safe_deform_conv2d 統一）。
+        self._get(tag).on_fallback(reason=reason, backend=backend, exc=exc)
+
+    def flush_all(self) -> None:
+        if self.enable_rank0_only and not _is_rank0():
+            return
+        for tag, lg in sorted(self._by_tag.items(), key=lambda kv: kv[0]):
+            # Why: 每個 epoch 結束可手動 dump 一次「各 stage 使用率」。
+            print(
+                f"[DEFORM_TAG] tag={tag} calls={lg._calls} deform={lg._deform} fallback={lg._fallback} "
+                f"top_reason={lg._reason.most_common(self.max_topk)} top_exc={lg._exc.most_common(self.max_topk)}",
+                flush=True,
+            )
+
+def _log_deform(logger: Any, *, backend: str, tag: str) -> None:
+    # Why: 相容舊 logger（只吃 backend）與新 hub logger（吃 backend+tag）。
+    try:
+        logger.on_deform(backend=backend, tag=tag)
+    except TypeError:
+        logger.on_deform(backend)
+
+
+def _log_fallback(logger: Any, *, reason: str, backend: str, tag: str, exc: Optional[BaseException]) -> None:
+    # Why: 相容舊 logger（reason/backend/exc）與新 hub logger（多 tag）。
+    try:
+        logger.on_fallback(reason=reason, backend=backend, tag=tag, exc=exc)
+    except TypeError:
+        logger.on_fallback(reason=reason, backend=backend, exc=exc)
+
+def _build_tv_deform_kwargs(
+    caps: _TorchvisionDeformCaps,
+    *,
+    stride: Tuple[int, int],
+    padding: Tuple[int, int],
+    dilation: Tuple[int, int],
+    mask: Optional[torch.Tensor],
+    groups: int,
+    deformable_groups: int,
+) -> Tuple[dict[str, Any], Optional[str]]:
+    """
+    回傳: (kwargs, not_supported_reason)
+    not_supported_reason != None 表示組合無法由當前 torchvision deform_conv2d 表達。
+    """
+    kwargs: dict[str, Any] = {"stride": stride, "padding": padding, "dilation": dilation}
+
+    if mask is not None:
+        if not caps.supports_mask:
+            return kwargs, "mask_unsupported"
+        kwargs["mask"] = mask
+
+    if groups != 1:
+        if not caps.supports_groups:
+            return kwargs, "groups_unsupported"
+        kwargs["groups"] = int(groups)
+
+    if deformable_groups != 1:
+        # torchvision 版本差異：有些叫 deformable_groups，有些叫 offset_groups
+        if not caps.supports_deformable_groups:
+            return kwargs, "deformable_groups_unsupported"
+        if "deformable_groups" in inspect.signature(_TV_DEFORM_FN).parameters:  # type: ignore[arg-type]
+            kwargs["deformable_groups"] = int(deformable_groups)
+        else:
+            kwargs["offset_groups"] = int(deformable_groups)
+
+    return kwargs, None
+
+
+
+def safe_deform_conv2d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    offset: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    stride=1,
+    padding=0,
+    dilation=1,
+    groups: int = 1,
+    deformable_groups: int = 1,
+    *,
+    logger=None,
+    tag: str = "deform",
+) -> torch.Tensor:
+    lg = logger if logger is not None else _DEFAULT_DEFORM_LOGGER
+    t = str(tag) if tag else "unknown"
+
+    try:
+        s = _to_2tuple(stride)
+        p = _to_2tuple(padding)
+        d = _to_2tuple(dilation)
+    except Exception as e:
+        # 如果連參數都解不出來，ONNX 導出也沒救了，直接走 fallback
+        if not torch.onnx.is_in_onnx_export():
+             _log_fallback(lg, reason=f"{t}:bad_hyperparam", backend="fallback_conv2d", tag=t, exc=e)
+        return F.conv2d(x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, groups=groups)
+
+    # ==============================================================================
+    # [ONNX Export Block] 新增區塊：導出時強制走標準路徑
+    # ==============================================================================
+    if torch.onnx.is_in_onnx_export():
+        # Why: export 時不可用「try/except 探測」避免 tracer 生成不一致圖；改用 caps 決策。
+        caps = _get_torchvision_deform_caps()
+        is_depthwise = (groups == x.shape[1] and weight.shape[0] == x.shape[1] and weight.shape[1] == 1)
+
+        if caps.available and _TV_DEFORM_FN is not None:
+            kwargs, why_not = _build_tv_deform_kwargs(
+                caps,
+                stride=s, padding=p, dilation=d,
+                mask=mask,
+                groups=groups,
+                deformable_groups=deformable_groups,
+            )
+            if why_not is None:
+                return _TV_DEFORM_FN(x, offset, weight, bias=bias, **kwargs)  # type: ignore[misc]
+
+        # torchvision 不可表達：只允許 depthwise 走自家實作；其餘直接退回 conv2d（導出穩定優先）
+        if is_depthwise:
+            return _depthwise_deform_conv2d_pytorch(
+                x=x,
+                weight=weight,
+                bias=bias,
+                offset=offset,
+                mask=mask,
+                stride=s,
+                padding=p,
+                dilation=d,
+                deformable_groups=deformable_groups,
+            )
+        return F.conv2d(x, weight, bias=bias, stride=s, padding=p, dilation=d, groups=groups)
+    # ==============================================================================
+
+    if x is None or weight is None or offset is None:
+        _log_fallback(lg, reason=f"{t}:param_none", backend="fallback_conv2d", tag=t, exc=None)
+        return F.conv2d(x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, groups=groups)
+
+
+    if x.dim() != 4 or weight.dim() != 4 or offset.dim() != 4:
+        _log_fallback(lg, reason=f"{t}:bad_dim", backend="fallback_conv2d", tag=t, exc=None)
+        return F.conv2d(x, weight, bias=bias, stride=s, padding=p, dilation=d, groups=groups)
+
+    n, c, _, _ = x.shape
+    oc, _, kh, kw = weight.shape
+    if c <= 0 or oc <= 0 or kh <= 0 or kw <= 0:
+        _log_fallback(lg, reason=f"{t}:bad_shape", backend="fallback_conv2d", tag=t, exc=None)
+        return F.conv2d(x, weight, bias=bias, stride=s, padding=p, dilation=d, groups=groups)
+
+    caps = _get_torchvision_deform_caps()
+
+    # 優先走 torchvision：只要它能表達 (mask/groups/dg) 組合
+    if caps.available and _TV_DEFORM_FN is not None:
+        kwargs, why_not = _build_tv_deform_kwargs(
+            caps,
+            stride=s, padding=p, dilation=d,
+            mask=mask,
+            groups=groups,
+            deformable_groups=deformable_groups,
+        )
+        if why_not is None:
+            try:
+                y = _TV_DEFORM_FN(x, offset, weight, bias=bias, **kwargs)
+                _log_deform(lg, backend="torchvision", tag=t)
+                return y
+            except Exception as e:
+                _log_fallback(lg, reason=f"{t}:torchvision_exc", backend="fallback_conv2d", tag=t, exc=e)
+                return F.conv2d(x, weight, bias=bias, stride=s, padding=p, dilation=d, groups=groups)
+        else:
+            _log_fallback(lg, reason=f"{t}:tv_{why_not}", backend="fallback_conv2d", tag=t, exc=None)
+ 
+
+    is_depthwise = (groups == c and oc == c and weight.shape[1] == 1)
+    if is_depthwise:
+        try:
+            y = _depthwise_deform_conv2d_pytorch(
+                x=x,
+                weight=weight,
+                bias=bias,
+                offset=offset,
+                mask=mask,
+                stride=s,
+                padding=p,
+                dilation=d,
+                deformable_groups=deformable_groups,
+            )
+            _log_deform(lg, backend="pytorch_depthwise", tag=t)
+            return y
+        except Exception as e:
+            _log_fallback(lg, reason=f"{t}:depthwise_deform_exc", backend="fallback_conv2d", tag=t, exc=e)
+            return F.conv2d(x, weight, bias=bias, stride=s, padding=p, dilation=d, groups=groups)
+
+    # 非 depthwise 且 torchvision 無法表達的 groups 情況：明確 fallback（避免 silent baseline）
+    if groups != 1:
+        return F.conv2d(x, weight, bias=bias, stride=s, padding=p, dilation=d, groups=groups)
+ 
+
+    _log_fallback(lg, reason=f"{t}:torchvision_unavailable", backend="fallback_conv2d", tag=t, exc=None)
+    return F.conv2d(x, weight, bias=bias, stride=s, padding=p, dilation=d, groups=groups)
+
 
 
 # ============================================================
@@ -299,7 +1130,7 @@ class MaxMinChannelAttention(nn.Module):
         self.mlp = nn.Sequential(
             nn.Flatten(),
             nn.Linear(in_planes, hidden_planes),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Linear(hidden_planes, in_planes),
         )
         self.sigmoid = nn.Sigmoid()
@@ -355,7 +1186,7 @@ class OptimizedTPG(nn.Module):
         self.attention = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(in_channels, reduced_channels, 1),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(reduced_channels, in_channels, 1),
             nn.Sigmoid(),
         )
@@ -396,7 +1227,7 @@ class StabilizedTPG(nn.Module):
         self.attention = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(in_channels, reduced_channels, 1),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(reduced_channels, in_channels, 1),
             nn.Sigmoid(),
         )
@@ -522,8 +1353,14 @@ class ConformableConv2d(nn.Module):
         deform_enabled: bool = True,
         force_fallback: bool = False,
         allow_fallback: bool = True,
+         tag: str = "cira", 
+         deform_logger=None,
     ):
         super().__init__()
+
+        self._tag = tag
+        self._deform_logger = deform_logger  # 可傳 DeformHubLogger
+
 
         if mode not in self._VALID_MODES:
             raise ValueError(f"ConformableConv2d: mode 必須為 {self._VALID_MODES} 之一")
@@ -540,6 +1377,17 @@ class ConformableConv2d(nn.Module):
         self.g = int(g)
         self.d = int(d)
         self.dg = int(deformable_groups)
+
+        # --- compat aliases (Ultralytics / wrappers 可能讀取這些名稱) ---
+        self.stride = self.s
+        self.padding = self.p
+        self.dilation = self.d
+        self.groups = self.g
+        self.deformable_groups = self.dg
+
+        # --- optional logger/tag (不存在也不該讓 forward 爆掉) ---
+        self._tag = getattr(self, "_tag", "cira")
+        self._deform_logger = getattr(self, "_deform_logger", None)
 
         self.mode = mode
         self.use_mask = bool(use_mask)
@@ -620,19 +1468,19 @@ class ConformableConv2d(nn.Module):
 
         return safe_deform_conv2d(
             x=x,
-            offset=offset,
             weight=self.weight,
             bias=self.bias,
-            stride=self.s,
-            padding=self.p,
-            dilation=self.d,
+            offset=offset,
             mask=mask,
-            groups=self.g,
-            deformable_groups=self.dg,
-            force_fp32=True,
-            allow_fallback=self.allow_fallback,
-            force_fallback=self.force_fallback,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+            deformable_groups=self.deformable_groups,
+            logger=getattr(self, "_deform_logger", None),
+            tag=getattr(self, "_tag", "cira"),
         )
+
 
 
 class RobustConformableConv2d(ConformableConv2d):
@@ -767,7 +1615,7 @@ class ConformableInvertedResidual(nn.Module):
                 nn.BatchNorm2d(inp),
                 nn.Conv2d(inp, branch_features, 1, 1, 0, bias=False),
                 nn.BatchNorm2d(branch_features),
-                nn.ReLU(inplace=True),
+                nn.SiLU(inplace=True),
             )
         else:
             self.branch1 = nn.Identity()
@@ -778,7 +1626,7 @@ class ConformableInvertedResidual(nn.Module):
         self.branch2 = nn.Sequential(
             nn.Conv2d(input_channels, branch_features, 1, 1, 0, bias=False),
             nn.BatchNorm2d(branch_features),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
 
             # 只在 stride=1/2 的 depthwise 位置用（保持 ShuffleNetV2 輕量特性）
             ConformableConv2d(
@@ -803,7 +1651,7 @@ class ConformableInvertedResidual(nn.Module):
 
             nn.Conv2d(branch_features, branch_features, 1, 1, 0, bias=False),
             nn.BatchNorm2d(branch_features),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
         )
 
         self.use_attention = bool(use_attention)

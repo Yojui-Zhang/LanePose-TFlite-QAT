@@ -85,6 +85,8 @@ class AppConfig:
     KD_BALANCE_ADAPT_POWER: float = 0.5
     KD_BALANCE_RENORM_SUM: float = 2.0
     KD_BALANCE_EPS: float = 1e-6
+    KD_BALANCE_FIXED_KD_WEIGHT: Optional[float] = None
+    KD_BALANCE_LOG_INTERVAL: int = 50
     
     # ===================================================
     # Loss Function Selection
@@ -220,8 +222,8 @@ class AppConfig:
                 "KD_BALANCE_DEPLOY_RAMP_STEPS must be >= 0, "
                 f"got {self.KD_BALANCE_DEPLOY_RAMP_STEPS}"
             )
-        if self.KD_BALANCE_MIN_WEIGHT <= 0.0:
-            errors.append(f"KD_BALANCE_MIN_WEIGHT must be > 0, got {self.KD_BALANCE_MIN_WEIGHT}")
+        if self.KD_BALANCE_MIN_WEIGHT < 0.0:
+            errors.append(f"KD_BALANCE_MIN_WEIGHT must be >= 0, got {self.KD_BALANCE_MIN_WEIGHT}")
         if self.KD_BALANCE_MAX_WEIGHT < self.KD_BALANCE_MIN_WEIGHT:
             errors.append(
                 "KD_BALANCE_MAX_WEIGHT must be >= KD_BALANCE_MIN_WEIGHT, "
@@ -237,6 +239,13 @@ class AppConfig:
             errors.append(f"KD_BALANCE_RENORM_SUM must be > 0, got {self.KD_BALANCE_RENORM_SUM}")
         if self.KD_BALANCE_EPS <= 0.0:
             errors.append(f"KD_BALANCE_EPS must be > 0, got {self.KD_BALANCE_EPS}")
+        if self.KD_BALANCE_FIXED_KD_WEIGHT is not None and self.KD_BALANCE_FIXED_KD_WEIGHT < 0.0:
+            errors.append(
+                "KD_BALANCE_FIXED_KD_WEIGHT must be >= 0 when set, "
+                f"got {self.KD_BALANCE_FIXED_KD_WEIGHT}"
+            )
+        if self.KD_BALANCE_LOG_INTERVAL < 1:
+            errors.append(f"KD_BALANCE_LOG_INTERVAL must be >= 1, got {self.KD_BALANCE_LOG_INTERVAL}")
 
         # 4. Check Teacher Path (if needed)
         if self.TRAIN_SUPERVISION == 'distill':

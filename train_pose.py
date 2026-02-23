@@ -144,8 +144,8 @@ def _build_kd_deploy_overrides(args: argparse.Namespace, imgsz: tuple[int, int])
 
     balance_min = float(args.qat_balance_min)
     balance_max = float(args.qat_balance_max)
-    if balance_min <= 0.0:
-        raise ValueError(f"qat-balance-min must be > 0, got {balance_min}")
+    if balance_min < 0.0:
+        raise ValueError(f"qat-balance-min must be >= 0, got {balance_min}")
     if balance_max < balance_min:
         raise ValueError(f"qat-balance-max must be >= qat-balance-min, got {balance_max} < {balance_min}")
 
@@ -166,6 +166,18 @@ def _build_kd_deploy_overrides(args: argparse.Namespace, imgsz: tuple[int, int])
     balance_eps = float(args.qat_balance_eps)
     if balance_eps <= 0.0:
         raise ValueError(f"qat-balance-eps must be > 0, got {balance_eps}")
+
+    kd_weight: float | None = None
+    if args.qat_kd_weight is not None:
+        kd_weight = float(args.qat_kd_weight)
+        if kd_weight < 0.0:
+            raise ValueError(f"qat-kd-weight must be >= 0, got {kd_weight}")
+
+    balance_log_interval = int(args.qat_balance_log_interval)
+    if balance_log_interval < 1:
+        raise ValueError(
+            f"qat-balance-log-interval must be >= 1, got {balance_log_interval}"
+        )
 
     teacher_dir: Path | None = None
     if args.qat_teacher_exported_dir:
@@ -281,6 +293,8 @@ def _build_kd_deploy_overrides(args: argparse.Namespace, imgsz: tuple[int, int])
         "KD_BALANCE_ADAPT_POWER": balance_adapt_power,
         "KD_BALANCE_RENORM_SUM": balance_renorm_sum,
         "KD_BALANCE_EPS": balance_eps,
+        "KD_BALANCE_FIXED_KD_WEIGHT": kd_weight,
+        "KD_BALANCE_LOG_INTERVAL": balance_log_interval,
         "OUTPUT_DIR": (Path(args.project) / f"{args.name}_qat"),
         "TFLITE_QUANT_MODE": quant_mode,
         "USE_AMP": False,
@@ -304,6 +318,8 @@ def _build_kd_deploy_overrides(args: argparse.Namespace, imgsz: tuple[int, int])
         "deploy_ramp_steps": balance_deploy_ramp_steps,
         "min_weight": balance_min,
         "max_weight": balance_max,
+        "fixed_kd_weight": kd_weight,
+        "log_interval": balance_log_interval,
     }
     return overrides, balance_info
 
@@ -478,13 +494,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--qat-balance-min",
         type=float,
         default=0.2,
-        help="Lower bound for dynamic deploy/KD weights.",
+        help="Lower bound for alpha_kd.",
     )
     parser.add_argument(
         "--qat-balance-max",
         type=float,
         default=5.0,
-        help="Upper bound for dynamic deploy/KD weights.",
+        help="Upper bound for alpha_kd.",
     )
     parser.add_argument(
         "--qat-balance-max-step-change",
@@ -502,13 +518,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--qat-balance-renorm-sum",
         type=float,
         default=2.0,
-        help="Target sum for deploy/KD weights after each update.",
+        help="Compatibility knob from legacy two-weight balancer (alpha-only mode keeps this for compatibility).",
     )
     parser.add_argument(
         "--qat-balance-eps",
         type=float,
         default=1e-6,
         help="Numerical epsilon for dynamic balancing.",
+    )
+    parser.add_argument(
+        "--qat-kd-weight",
+        type=float,
+        default=None,
+        help="Optional fixed KD weight alpha. When set, dynamic balancing updates are bypassed.",
+    )
+    parser.add_argument(
+        "--qat-balance-log-interval",
+        type=int,
+        default=50,
+        help="Logging interval (steps) for supervised_loss, kd_loss, alpha_kd scalars.",
     )
     parser.add_argument(
         "--qat-teacher-exported-dir",
@@ -547,6 +575,8 @@ def main() -> None:
             f"deploy_ramp_steps={balance['deploy_ramp_steps']}",
             f"min={balance['min_weight']}",
             f"max={balance['max_weight']}",
+            f"fixed_kd_weight={balance['fixed_kd_weight']}",
+            f"log_interval={balance['log_interval']}",
         )
         print(f"[Route2] quant_mode: {out['quant_mode']}")
         print(f"[Route2] output_dir: {out['output_dir']}")

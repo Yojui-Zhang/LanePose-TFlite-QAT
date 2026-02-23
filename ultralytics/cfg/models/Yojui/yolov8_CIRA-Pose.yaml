@@ -7,7 +7,7 @@ kpt_shape: [18, 3]
 scales: # model compound scaling constants, i.e. 'model=yolov8n.yaml' will call yolov8.yaml with scale 'n'
   # [depth, width, max_channels]
   
-  n: [1,    0.32,  1024]
+  n: [1,    0.3,  1024]
   s: [0.33, 0.50, 1024]  
   m: [0.67, 0.75, 768]   
   l: [1.00, 1.00, 512]   
@@ -64,46 +64,53 @@ scales: # model compound scaling constants, i.e. 'model=yolov8n.yaml' will call 
 # --------------------------------------------------------
 
 backbone:
-  - [-1, 1, Conv, [64, 3, 2]]                                                                         # 0-P1/2
+  - [-1, 1, Conv, [64, 3, 2]]                                                     # 0
 
-  - [-1, 1, DWConv, [128, 3, 2]]                                                                      # 1-P2/4
-  - [-1, 1, ConformableInvertedResidual, [128, 3, 1, 0, "prior_only", True, False, True, 0.25]]       # 2
+  - [-1, 1, DWConv, [128, 3, 2]]                                                  # 1
+  - [-1, 1, ConformableInvertedResidual, [128, 3, 1, 0, "prior_only", True, False, False, 0.20]]  # 2
 
-  - [-1, 1, DWConv, [256, 3, 2]]                                                                      # 3-P3/8
-  - [-1, 1, ConformableInvertedResidual, [256, 3, 1, 0, "prior_residual", True, False, True, 0.25]]   # 4
-  - [-1, 1, ConformableInvertedResidual, [256, 3, 1, 1, "prior_residual", True, False, True, 0.25]]   # 5
+  - [-1, 1, DWConv, [256, 3, 2]]                                                  # 3
+  - [-1, 1, ConformableInvertedResidual, [256, 3, 1, 0, "prior_only", True, False, False, 0.25]]  # 4
 
-  - [-1, 1, ConformableBlock, [512, 3, 2]]                                                            # 6-P4/16
-  - [-1, 1, ConformableInvertedResidual, [512, 3, 1, 0, "prior_residual", True, False, True, 0.35]]   # 7
-  - [-1, 1, ConformableInvertedResidual, [512, 3, 1, 1, "prior_residual", True, False, True, 0.35]]   # 8
+  - [-1, 1, DWConv, [512, 3, 2]]                                                  # 5
+  - [-1, 1, ConformableInvertedResidual, [512, 3, 1, 0, "prior_residual", True, False, False, 0.30]] # 6
+  - [-1, 1, ConformableInvertedResidual, [512, 3, 1, 1, "prior_residual", True, False, False, 0.30]] # 7
 
-  - [-1, 1, ConformableBlock, [1024, 3, 2]]                                                           # 9-P5/32
-  - [-1, 1, ConformableInvertedResidual, [1024, 3, 1, 0, "prior_residual", True, False, True, 0.35]]  # 10
-  - [-1, 1, ConformableInvertedResidual, [1024, 3, 1, 1, "prior_residual", True, False, True, 0.35]]  # 11
+  - [-1, 1, DWConv, [1024, 3, 2]]                                                 # 8
+  - [-1, 1, ConformableInvertedResidual, [1024, 3, 1, 0, "prior_residual", True, False, False, 0.25]] # 9
 
-  - [-1, 1, SPPF, [1024, 5]]                                                                          # 12
+  # [LITE] 砍掉原本的 model.10：P5 只留一個 IR，直接進 SPPF
+  - [-1, 1, SPPF, [1024, 5]]                                                      # 10
 
 head:
-  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]                                                        # 13
-  - [[-1, 8], 1, Concat, [1]]                                                                         # 14
-  - [-1, 1, Conv, [512, 1, 1]]                                                                        # 15 align
-  - [-1, 1, ConformableInvertedResidual, [512, 3, 1, 0, "prior_residual", True, False, True, 0.35]]   # 16
-  - [-1, 1, ConformableInvertedResidual, [512, 3, 1, 1, "prior_residual", True, False, True, 0.35]]   # 17
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]                                     # 11
+  - [[-1, 7], 1, Concat, [1]]                                                      # 12
+  - [-1, 1, Conv, [512, 1, 1]]                                                     # 13
+  - [-1, 1, ConformableInvertedResidual, [512, 3, 1, 0, "prior_residual", True, False, False, 0.30]] # 14
+  - [-1, 1, ConformableInvertedResidual, [512, 3, 1, 1, "prior_residual", True, False, False, 0.30]] # 15  (P4_td)
 
-  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]                                                        # 18
-  - [[-1, 5], 1, Concat, [1]]                                                                         # 19
-  - [-1, 1, Conv, [256, 1, 1]]                                                                        # 20 align
-  - [-1, 1, ConformableInvertedResidual, [256, 3, 1, 1, "prior_residual", True, False, True, 0.35]]   # 21
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]                                     # 16
+  - [[-1, 4], 1, Concat, [1]]                                                      # 17
+  - [-1, 1, Conv, [384, 1, 1]]                                                     # 18
 
-  - [-1, 1, DWConv, [256, 3, 2]]                                                                      # 22
-  - [[-1, 17], 1, Concat, [1]]                                                                        # 23
-  - [-1, 1, Conv, [512, 1, 1]]                                                                        # 24 align
-  - [-1, 1, ConformableInvertedResidual, [512, 3, 1, 0, "prior_residual", True, False, True, 0.35]]   # 25
+  - [-1, 1, ConformableInvertedResidual, [384, 3, 1, 1, "prior_only", True, False, True, 0.20]]     # 19 (P3_td_wide)
+  - [-1, 1, ConformableInvertedResidual, [384, 3, 1, 1, "residual_only", True, False, True, 0.15]]  # 20 (P3_td_deeper)
 
-  - [-1, 1, DWConv, [512, 3, 2]]                                                                      # 26
-  - [[-1, 12], 1, Concat, [1]]                                                                        # 27
-  - [-1, 1, Conv, [1024, 1, 1]]                                                                       # 28 align
-  - [-1, 1, ConformableInvertedResidual, [1024, 3, 1, 0, "prior_residual", True, False, True, 0.35]]  # 29
-                                                             # 30
+  - [2, 1, DWConv, [384, 3, 2]]                                                    # 21 (P2->P3 inj)
+  - [[-1, 20], 1, Concat, [1]]                                                     # 22
+  - [-1, 1, Conv, [384, 1, 1]]                                                     # 23
+
+  - [-1, 2, RepEdgeACBlock, [384, 3, 1, 1]]                                           # 24 (P3_final)
+
+  - [-1, 1, DWConv, [512, 3, 2]]                                                   # 25
+  - [[-1, 15], 1, Concat, [1]]                                                     # 26
+  - [-1, 1, Conv, [512, 1, 1]]                                                     # 27
+  - [-1, 1, ConformableInvertedResidual, [512, 3, 1, 0, "prior_residual", True, False, False, 0.30]] # 28 (P4_large)
+
+  - [-1, 1, DWConv, [1024, 3, 2]]                                                  # 29
+  - [[-1, 10], 1, Concat, [1]]                                                     # 30  (cat SPPF)
+  - [-1, 1, Conv, [1024, 1, 1]]                                                    # 31
+  - [-1, 1, ConformableInvertedResidual, [1024, 3, 1, 0, "residual_only", True, False, False, 0.25]] # 32 (P5_xlarge)
+
   # Detect / Pose
-  - [[21, 25, 29], 1, Pose, [nc, kpt_shape]]      # 22
+  - [[24, 28, 32], 1, Pose, [nc, kpt_shape]]      # 22

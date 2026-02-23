@@ -2,7 +2,7 @@
 
 本專案目標是讓 `train_QAT.py` 與 Ultralytics 官方訓練/匯出流程高度對齊，並保留 `KD + deploy` 雙輸出頭與組合 loss：
 
-- `total_loss = lambda_kd * L_kd + lambda_dep * L_deploy`（`lambda` 由動態平衡器更新）
+- `total_loss = L_supervised + alpha_kd * L_kd`（`L_supervised` 固定權重 1.0）
 - `QAT_LOSS_MODE=original`：走官方 Ultralytics API（對齊模式）
 - `QAT_LOSS_MODE=kd-deploy`：走自訂 KD+deploy 訓練器（保留蒸餾能力）
 
@@ -66,7 +66,7 @@ QAT/
   - 直接使用 Ultralytics 官方 `YOLO(...).train()` + export。
 - `--qat-loss-mode kd-deploy`：
   - 轉交給 `train_QAT.run_train_qat(...)`。
-  - 保留 KD+deploy 雙頭與動態平衡 loss（`lambda_kd * L_kd + lambda_dep * L_deploy`）。
+  - 保留 KD+deploy 雙頭與動態平衡 loss（`L_supervised + alpha_kd * L_kd`）。
 
 ## 3.2 `train_QAT.py`
 
@@ -74,7 +74,7 @@ QAT/
 
 - `TRAIN_ENGINE=ultralytics`（預設推薦）
   - `QAT_LOSS_MODE=original`：官方 API 對齊模式。
-  - `QAT_LOSS_MODE=kd-deploy`：KDPoseTrainer 模式。
+  - `QAT_LOSS_MODE=kd-deploy`：KD Trainer 模式（`pose` 走 `KDPoseTrainer`，`detect` 走 `KDDetectTrainer`）。
 - `TRAIN_ENGINE=tf-legacy`
   - 走舊有 TensorFlow QAT pipeline（保留相容）。
 
@@ -89,6 +89,23 @@ python -m pip install -r requirement.txt
 ---
 
 ## 5. 常用指令
+
+## 5.0 快速使用教學（建議順序）
+
+1. 先跑 `original` 當 baseline，確認資料與訓練流程正常。
+2. 再跑 `kd-deploy`（動態 `alpha_kd`）觀察是否有加分。
+3. 若 `kd-deploy` 仍不穩，改用固定 `--qat-kd-weight`（例如 `0.2~0.5`）縮小搜尋空間。
+
+`kd-deploy` 目前 loss 公式固定為：
+
+```text
+total = supervised + alpha_kd * kd
+```
+
+- `supervised` 權重永遠為 `1.0`
+- 動態平衡僅更新 `alpha_kd`
+- 可用 `--qat-kd-weight` 指定固定 `alpha_kd`
+- 可用 `--qat-balance-log-interval` 週期性輸出 `supervised_loss/kd_loss/alpha_kd`
 
 ## 5.1 用 Ultralytics 官方路線訓練（建議）
 
@@ -239,13 +256,15 @@ python train_QAT.py
 | `--qat-balance-ema-decay` | `0.95` | loss 統計 EMA 平滑係數。 |
 | `--qat-balance-update-interval` | `10` | 每幾個 step 更新一次動態權重。 |
 | `--qat-balance-warmup-steps` | `0` | 前幾個 step 固定權重不更新。 |
-| `--qat-balance-deploy-ramp-steps` | `1000` | deploy 權重漸進拉升步數。 |
-| `--qat-balance-min` | `0.2` | `lambda_dep/lambda_kd` 下界，防止某項被壓到 0。 |
-| `--qat-balance-max` | `5.0` | `lambda_dep/lambda_kd` 上界，防止單項暴衝。 |
+| `--qat-balance-deploy-ramp-steps` | `1000` | `alpha_kd` 漸進拉升步數。 |
+| `--qat-balance-min` | `0.2` | `alpha_kd` 下界。 |
+| `--qat-balance-max` | `5.0` | `alpha_kd` 上界。 |
 | `--qat-balance-max-step-change` | `1.2` | 單次更新最大倍率變化，抑制震盪。 |
 | `--qat-balance-adapt-power` | `0.5` | 權重更新強度指數。 |
-| `--qat-balance-renorm-sum` | `2.0` | 每次更新後 `lambda_dep + lambda_kd` 目標總和。 |
+| `--qat-balance-renorm-sum` | `2.0` | 保留相容參數（alpha-only 模式下不影響主公式）。 |
 | `--qat-balance-eps` | `1e-6` | 數值穩定用 epsilon。 |
+| `--qat-kd-weight` | `None` | 固定 `alpha_kd`（設定後略過動態更新）。 |
+| `--qat-balance-log-interval` | `50` | 每隔 N steps 輸出 `supervised_loss/kd_loss/alpha_kd`，並寫入 TensorBoard scalar。 |
 
 ---
 
@@ -345,6 +364,65 @@ python train_pose.py \
   --export-fraction 0.25
 ```
 
+### E. 固定 KD 權重（讓 KD 先當「加分項」）
+
+用途：先避免動態權重過強干擾，常用於 `deploy-only` 明顯優於 `kd-deploy` 的初期修正。
+
+```bash
+python train_pose.py \
+  --model yolo11n.pt \
+  --data ./dataset/KITTI.yaml \
+  --task detect \
+  --epochs 50 \
+  --batch 64 \
+  --imgsz 640 640 \
+  --device 0 \
+  --qat-loss-mode kd-deploy \
+  --qat-kd-weight 0.3 \
+  --qat-balance-log-interval 20 \
+  --export-tflite \
+  --export-int8
+```
+
+## 5.7 `run_paper_experiments.py`（論文比較）使用教學
+
+### B 組：`deploy-only` vs `kd-deploy`（動態 alpha）
+
+```bash
+python run_paper_experiments.py \
+  --datasets kitti \
+  --studies B \
+  --seeds 0,1,2 \
+  --device-kitti 0 \
+  --qat-balance-log-interval 20
+  
+python run_paper_experiments.py     --datasets acc     --studies A,B     --seeds 0,1,2     --epochs 200     --batch 64     --close-mosaic 10     --optimizer AdamW     --lr0 0.001     --lrf 0.01     --momentum 0.937     --weight-decay 0.0005     --device-acc 0     --export-fraction 0.25     --data-root ../Paper-Data/Data_acc     --skip-existing     --qat-balance-log-interval 20
+```
+
+### B 組：`deploy-only` vs `kd-deploy`（固定 alpha）
+
+```bash
+python run_paper_experiments.py \
+  --datasets kitti \
+  --studies B \
+  --seeds 0,1,2 \
+  --device-kitti 0 \
+  --qat-kd-weight 0.3 \
+  --qat-balance-log-interval 20
+```
+
+### 如何看 KD 是否「有在工作」
+
+1. 訓練 log 會固定輸出：
+   - `supervised_loss`
+   - `kd_loss`
+   - `alpha_kd`
+2. TensorBoard 會有對應 scalar：
+   - `train/supervised_loss`
+   - `train/kd_loss`
+   - `train/alpha_kd`
+3. 若 `kd_loss` 長期接近 0 或 `alpha_kd` 長期貼邊界，建議先用固定 `--qat-kd-weight` 做對照。
+
 ---
 
 ## 6. 匯出與檔名
@@ -433,7 +511,7 @@ python verify/verify_tflite_contract.py --model <your_model.tflite>
 
 ### Q1. `train_pose.py` 的 `original` 與 `kd-deploy` 結果會不同嗎？
 
-會。`original` 使用官方 loss；`kd-deploy` 使用組合 loss（`lambda_kd * L_kd + lambda_dep * L_deploy`，且 `lambda` 為動態更新），目標函數不同，權重與指標通常不同。
+會。`original` 使用官方 loss；`kd-deploy` 使用組合 loss（`L_supervised + alpha_kd * L_kd`），目標函數不同，權重與指標通常不同。
 
 ### Q2. `train_QAT` 與官方 Ultralytics 輸出是否一致？
 

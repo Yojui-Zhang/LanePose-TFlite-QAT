@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import logging
 import os
 from dataclasses import dataclass, field
@@ -26,6 +27,7 @@ class KDLossConfig:
     temperature: float = 1.0
     aux_kd_head_label_loss: bool = False
     balance: LossBalanceConfig = field(default_factory=LossBalanceConfig)
+    log_interval_steps: int = 50
 
 
 def _is_oom_error(exc: BaseException) -> bool:
@@ -135,8 +137,32 @@ def _compute_feature_kd_loss(
     return kd_dfl + kd_cls
 
 
+def _write_kd_scalars_to_tensorboard(
+    *,
+    step: int,
+    supervised_loss: float,
+    kd_loss: float,
+    alpha_kd: float,
+    grad_norm_ratio_sup_over_kd: Optional[float],
+) -> None:
+    try:
+        from ultralytics.utils.callbacks import tensorboard as tb_callbacks
+    except Exception:
+        return
+
+    writer = getattr(tb_callbacks, "WRITER", None)
+    if writer is None:
+        return
+
+    writer.add_scalar("train/supervised_loss", supervised_loss, step)
+    writer.add_scalar("train/kd_loss", kd_loss, step)
+    writer.add_scalar("train/alpha_kd", alpha_kd, step)
+    if grad_norm_ratio_sup_over_kd is not None and math.isfinite(float(grad_norm_ratio_sup_over_kd)):
+        writer.add_scalar("train/grad_norm_ratio_sup_over_kd", float(grad_norm_ratio_sup_over_kd), step)
+
+
 class KDPoseLoss(v8PoseLoss):
-    """Ultralytics pose loss + optional KD term with dynamic deploy/KD balancing."""
+    """Ultralytics pose loss + optional KD term with dynamic KD alpha balancing."""
 
     def __init__(self, model: PoseModel):
         super().__init__(model)
@@ -152,13 +178,15 @@ class KDPoseLoss(v8PoseLoss):
         self.teacher = teacher
         self.balancer = LossBalancer(cfg.balance)
         self._shared_params = self._select_shared_params(model)
-        self._log_interval = max(50, int(cfg.balance.update_interval) * 5)
+        self._log_interval = max(1, int(cfg.log_interval_steps))
         self._teacher_device = _as_torch_device(self.device)
         self._teacher_dtype: Optional[torch.dtype] = None
+        fixed_alpha = cfg.balance.fixed_kd_weight
         logging.info(
-            "[KD] Dynamic balance enabled: strategy=%s shared=%s params=%d",
+            "[KD] Balance enabled: strategy=%s shared=%s fixed_alpha=%s params=%d",
             cfg.balance.strategy,
             cfg.balance.shared_param_group,
+            "None" if fixed_alpha is None else f"{float(fixed_alpha):.6f}",
             len(self._shared_params),
         )
         if self.teacher is not None:
@@ -263,23 +291,40 @@ class KDPoseLoss(v8PoseLoss):
             # Fallback keeps KD branch effective even when teacher is not available.
             kd_total = deploy_total
 
-        total, lambda_dep, lambda_kd = self.balancer.build_total(
+        total, alpha_kd = self.balancer.build_total(
             deploy_loss=deploy_total,
             kd_loss=kd_total,
             shared_params=self._shared_params,
         )
-        if self.balancer.step % self._log_interval == 0:
+        step = self.balancer.step
+        if step % self._log_interval == 0:
+            sup_loss = float(self.balancer.last_supervised_loss)
+            kd_loss = float(self.balancer.last_kd_loss)
+            grad_ratio = self.balancer.last_grad_norm_ratio_sup_over_kd
+            _write_kd_scalars_to_tensorboard(
+                step=step,
+                supervised_loss=sup_loss,
+                kd_loss=kd_loss,
+                alpha_kd=float(alpha_kd),
+                grad_norm_ratio_sup_over_kd=grad_ratio,
+            )
             logging.info(
-                "[KD] step=%d lambda_dep=%.6f lambda_kd=%.6f",
-                self.balancer.step,
-                lambda_dep,
-                lambda_kd,
+                "[KD] step=%d supervised_loss=%.6f kd_loss=%.6f alpha_kd=%.6f grad_ratio_sup_over_kd=%s",
+                step,
+                sup_loss,
+                kd_loss,
+                float(alpha_kd),
+                (
+                    "None"
+                    if grad_ratio is None or not math.isfinite(float(grad_ratio))
+                    else f"{float(grad_ratio):.6f}"
+                ),
             )
         return total, deploy_items
 
 
 class KDDetectLoss(v8DetectionLoss):
-    """Ultralytics detect loss + optional KD term with dynamic deploy/KD balancing."""
+    """Ultralytics detect loss + optional KD term with dynamic KD alpha balancing."""
 
     def __init__(self, model: DetectionModel):
         super().__init__(model)
@@ -295,13 +340,15 @@ class KDDetectLoss(v8DetectionLoss):
         self.teacher = teacher
         self.balancer = LossBalancer(cfg.balance)
         self._shared_params = self._select_shared_params(model)
-        self._log_interval = max(50, int(cfg.balance.update_interval) * 5)
+        self._log_interval = max(1, int(cfg.log_interval_steps))
         self._teacher_device = _as_torch_device(self.device)
         self._teacher_dtype: Optional[torch.dtype] = None
+        fixed_alpha = cfg.balance.fixed_kd_weight
         logging.info(
-            "[KD] Dynamic balance enabled: strategy=%s shared=%s params=%d",
+            "[KD] Balance enabled: strategy=%s shared=%s fixed_alpha=%s params=%d",
             cfg.balance.strategy,
             cfg.balance.shared_param_group,
+            "None" if fixed_alpha is None else f"{float(fixed_alpha):.6f}",
             len(self._shared_params),
         )
         if self.teacher is not None:
@@ -401,17 +448,34 @@ class KDDetectLoss(v8DetectionLoss):
             # Fallback keeps KD branch effective even when teacher is not available.
             kd_total = deploy_total
 
-        total, lambda_dep, lambda_kd = self.balancer.build_total(
+        total, alpha_kd = self.balancer.build_total(
             deploy_loss=deploy_total,
             kd_loss=kd_total,
             shared_params=self._shared_params,
         )
-        if self.balancer.step % self._log_interval == 0:
+        step = self.balancer.step
+        if step % self._log_interval == 0:
+            sup_loss = float(self.balancer.last_supervised_loss)
+            kd_loss = float(self.balancer.last_kd_loss)
+            grad_ratio = self.balancer.last_grad_norm_ratio_sup_over_kd
+            _write_kd_scalars_to_tensorboard(
+                step=step,
+                supervised_loss=sup_loss,
+                kd_loss=kd_loss,
+                alpha_kd=float(alpha_kd),
+                grad_norm_ratio_sup_over_kd=grad_ratio,
+            )
             logging.info(
-                "[KD] step=%d lambda_dep=%.6f lambda_kd=%.6f",
-                self.balancer.step,
-                lambda_dep,
-                lambda_kd,
+                "[KD] step=%d supervised_loss=%.6f kd_loss=%.6f alpha_kd=%.6f grad_ratio_sup_over_kd=%s",
+                step,
+                sup_loss,
+                kd_loss,
+                float(alpha_kd),
+                (
+                    "None"
+                    if grad_ratio is None or not math.isfinite(float(grad_ratio))
+                    else f"{float(grad_ratio):.6f}"
+                ),
             )
         return total, deploy_items
 

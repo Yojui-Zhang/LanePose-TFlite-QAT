@@ -18,11 +18,14 @@ if __name__ == "__main__":
     # 1. 先看原本的 YOLOv8n (作為基準)
     print("--- Baseline YOLOv8n ---")
     try:
-        count_parameters('./ultralytics/cfg/models/v8/yolov8-pose.yaml') 
+        count_parameters('./ultralytics/cfg/models/v8/yolov8.yaml') 
     except:
         print("Standard yolov8n.yaml not found, skipping baseline.")
 
     # 2. 看您的 CIRA 模型
     print("\n--- CIRA Proposed ---")
     # 請將此處換成您的 yaml 檔名
-    count_parameters('./ultralytics/cfg/models/Yojui/yolov8_CIRA-Pose.yaml')
+    count_parameters('./ultralytics/cfg/models/Yojui/yolov8_CIRA-Lite.yaml')
+    count_parameters('./ultralytics/cfg/models/Yojui/yolov8_ShuffleNetV2-Lite.yaml')
+    count_parameters('./ultralytics/cfg/models/Yojui/yolov8_GhostNetV2-Lite.yaml')
+    count_parameters('./ultralytics/cfg/models/Yojui/yolov8_MobileNetV3-Lite.yaml')

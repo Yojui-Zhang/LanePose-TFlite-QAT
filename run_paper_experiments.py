@@ -7,6 +7,8 @@ import os
 import subprocess
 import sys
 import time
+import shutil
+from datetime import datetime
 
 import torch
 
@@ -57,6 +59,17 @@ class TrainSpec:
     momentum: float
     weight_decay: float
     export_fraction: float
+    qat_kd_weight: Optional[float]
+    qat_balance_log_interval: int
+    qat_balance_min: Optional[float]
+    qat_balance_max: Optional[float]
+    qat_balance_warmup_steps: Optional[int]
+    qat_balance_max_step_change: Optional[float]
+    qat_balance_adapt_power: Optional[float]
+    qat_balance_strategy: Optional[str]
+    qat_balance_shared_group: Optional[str]
+    qat_balance_deploy_ramp_steps: Optional[int]
+    qat_balance_update_interval: Optional[int]
     project: Path
     name: str
     teacher_dir: Optional[Path] = None
@@ -249,6 +262,30 @@ def _build_train_cmd(spec: TrainSpec, batch: int, workers: int) -> list[str]:
     ]
     if spec.mode == "kd-deploy" and spec.teacher_dir is not None:
         cmd.extend(["--qat-teacher-exported-dir", str(spec.teacher_dir)])
+    if spec.mode == "kd-deploy":
+        cmd.extend(["--qat-balance-log-interval", str(spec.qat_balance_log_interval)])
+        if spec.qat_kd_weight is not None:
+            cmd.extend(["--qat-kd-weight", str(spec.qat_kd_weight)])
+        if spec.qat_balance_min is not None:
+            cmd.extend(["--qat-balance-min", str(spec.qat_balance_min)])
+        if spec.qat_balance_max is not None:
+            cmd.extend(["--qat-balance-max", str(spec.qat_balance_max)])
+        if spec.qat_balance_warmup_steps is not None:
+            cmd.extend(["--qat-balance-warmup-steps", str(spec.qat_balance_warmup_steps)])
+        if spec.qat_balance_max_step_change is not None:
+            cmd.extend(["--qat-balance-max-step-change", str(spec.qat_balance_max_step_change)])
+        if spec.qat_balance_adapt_power is not None:
+            cmd.extend(["--qat-balance-adapt-power", str(spec.qat_balance_adapt_power)])
+        if spec.qat_balance_strategy is not None:
+            cmd.extend(["--qat-balance-strategy", str(spec.qat_balance_strategy)])
+        if spec.qat_balance_shared_group is not None:
+            cmd.extend(["--qat-balance-shared-group", str(spec.qat_balance_shared_group)])
+        if spec.qat_balance_deploy_ramp_steps is not None:
+            cmd.extend(["--qat-balance-deploy-ramp-steps", str(spec.qat_balance_deploy_ramp_steps)])
+        if spec.qat_balance_update_interval is not None:
+            cmd.extend(["--qat-balance-update-interval", str(spec.qat_balance_update_interval)])
+
+
     return cmd
 
 
@@ -426,32 +463,85 @@ def _prepare_input(input_details: dict[str, Any], src: np.ndarray) -> np.ndarray
     dtype = input_details["dtype"]
     if dtype == np.float32:
         return src.astype(np.float32)
+
     scale, zero = input_details["quantization"]
-    if scale == 0:
-        raise ValueError("Invalid quantization scale=0 for non-float input")
-    q = np.round(src / float(scale) + float(zero))
     qmin = np.iinfo(dtype).min
     qmax = np.iinfo(dtype).max
+
+    # Why: 部分匯出器會產生 scale=0 的非 float input（量測 latency/contract 不應因此整段變 NaN）。
+    if scale == 0:
+        q = np.round(src)
+        return np.clip(q, qmin, qmax).astype(dtype)
+
+    q = np.round(src / float(scale) + float(zero))
     return np.clip(q, qmin, qmax).astype(dtype)
 
 
-def _tflite_latency_ms(model_path: Path, *, warmup: int = 8, runs: int = 40, seed: int = 0) -> float:
-    import tensorflow as tf
+def _new_tflite_interpreter(model_path: Path, *, num_threads: int | None = None):
+    """
+    Why: 量測/驗證不應綁死 TensorFlow；若環境只有 tflite_runtime 也能跑，避免整段回報 NaN。
+    """
+    kwargs: dict[str, Any] = {"model_path": str(model_path)}
+    if num_threads is not None:
+        kwargs["num_threads"] = int(num_threads)
+    try:
+        import tensorflow as tf
+        return tf.lite.Interpreter(**kwargs)
+    except ModuleNotFoundError:
+        try:
+            from tflite_runtime.interpreter import Interpreter  # type: ignore
+            return Interpreter(**kwargs)
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "Missing TensorFlow and tflite_runtime; cannot run TFLite contract/latency measures."
+            ) from exc
+        
+def _sanitize_tflite_shape(shape: Any) -> list[int]:
+    out: list[int] = []
+    for v in list(shape):
+        iv = int(v)
+        out.append(iv if iv > 0 else 1)
+    return out
 
-    interpreter = tf.lite.Interpreter(model_path=str(model_path), num_threads=1)
-    interpreter.allocate_tensors()
-    inp = interpreter.get_input_details()[0]
-    shape = [int(v) if int(v) > 0 else 1 for v in inp["shape"]]
+def _set_all_inputs_zero(interpreter, input_details: list[dict[str, Any]]) -> None:
+    if not input_details:
+        raise ValueError("TFLite model has no inputs.")
+    for inp in input_details:
+        shape = _sanitize_tflite_shape(inp["shape"])
+        x = np.zeros(shape, dtype=np.float32)
+        interpreter.set_tensor(inp["index"], _prepare_input(inp, x))
+
+def _set_inputs_for_latency(interpreter, input_details: list[dict[str, Any]], *, seed: int) -> None:
+    if not input_details:
+        raise ValueError("TFLite model has no inputs.")
     rng = np.random.default_rng(seed)
-    x = rng.random(shape, dtype=np.float32)
+    for i, inp in enumerate(input_details):
+        shape = _sanitize_tflite_shape(inp["shape"])
+        x = rng.random(shape, dtype=np.float32) if i == 0 else np.zeros(shape, dtype=np.float32)
+        interpreter.set_tensor(inp["index"], _prepare_input(inp, x))
+
+def _read_all_outputs_fp(interpreter, output_details: list[dict[str, Any]]) -> list[np.ndarray]:
+    if not output_details:
+        raise ValueError("TFLite model has no outputs.")
+    outs: list[np.ndarray] = []
+    for out in output_details:
+        raw = interpreter.get_tensor(out["index"])
+        outs.append(_dequantize_output(raw, out["quantization"]))
+    return outs
+
+
+def _tflite_latency_ms(model_path: Path, *, warmup: int = 8, runs: int = 40, seed: int = 0) -> float:
+    interpreter = _new_tflite_interpreter(model_path, num_threads=1)
+    interpreter.allocate_tensors()
+    ins = interpreter.get_input_details()
 
     for _ in range(max(1, warmup)):
-        interpreter.set_tensor(inp["index"], _prepare_input(inp, x))
+        _set_inputs_for_latency(interpreter, ins, seed=seed)
         interpreter.invoke()
 
     elapsed_ms: list[float] = []
     for _ in range(max(1, runs)):
-        interpreter.set_tensor(inp["index"], _prepare_input(inp, x))
+        _set_inputs_for_latency(interpreter, ins, seed=seed)
         t0 = time.perf_counter()
         interpreter.invoke()
         t1 = time.perf_counter()
@@ -460,58 +550,70 @@ def _tflite_latency_ms(model_path: Path, *, warmup: int = 8, runs: int = 40, see
 
 
 def _contract_check(model_path: Path) -> None:
-    import tensorflow as tf
-
-    interpreter = tf.lite.Interpreter(model_path=str(model_path))
+    interpreter = _new_tflite_interpreter(model_path)
     interpreter.allocate_tensors()
     ins = interpreter.get_input_details()
     outs = interpreter.get_output_details()
-    if len(ins) != 1 or len(outs) != 1:
-        raise ValueError(
-            f"Expected 1 input/1 output, got in={len(ins)} out={len(outs)} for {model_path}"
-        )
-    shape = [int(v) if int(v) > 0 else 1 for v in ins[0]["shape"]]
-    x = np.zeros(shape, dtype=np.float32)
-    interpreter.set_tensor(ins[0]["index"], _prepare_input(ins[0], x))
-    interpreter.invoke()
-    out = interpreter.get_tensor(outs[0]["index"])
-    out_fp = _dequantize_output(out, outs[0]["quantization"])
-    if not np.all(np.isfinite(out_fp)):
-        raise ValueError(f"Non-finite output detected in {model_path}")
 
+    if not ins:
+        raise ValueError(f"No input tensors found for {model_path}")
+    if not outs:
+        raise ValueError(f"No output tensors found for {model_path}")
+    
+    _set_all_inputs_zero(interpreter, ins)
+    interpreter.invoke()
+
+    out_fps = _read_all_outputs_fp(interpreter, outs)
+    for idx, out_fp in enumerate(out_fps):
+        if not np.all(np.isfinite(out_fp)):
+            raise ValueError(f"Non-finite output detected in {model_path} (out#{idx})")
+ 
 
 def _contract_jitter(fp32_model: Path, int8_model: Path, *, samples: int = 16, seed: int = 0) -> float:
-    import tensorflow as tf
-
-    fp32_itp = tf.lite.Interpreter(model_path=str(fp32_model))
-    int8_itp = tf.lite.Interpreter(model_path=str(int8_model))
+    fp32_itp = _new_tflite_interpreter(fp32_model)
+    int8_itp = _new_tflite_interpreter(int8_model)
     fp32_itp.allocate_tensors()
     int8_itp.allocate_tensors()
 
-    fp32_in = fp32_itp.get_input_details()[0]
-    int8_in = int8_itp.get_input_details()[0]
-    fp32_out = fp32_itp.get_output_details()[0]
-    int8_out = int8_itp.get_output_details()[0]
-    shape = [int(v) if int(v) > 0 else 1 for v in fp32_in["shape"]]
+    fp32_ins = fp32_itp.get_input_details()
+    int8_ins = int8_itp.get_input_details()
+    fp32_outs = fp32_itp.get_output_details()
+    int8_outs = int8_itp.get_output_details()
+
+    if not fp32_ins or not int8_ins:
+        raise ValueError("Missing input tensors for contract jitter.")
+    if not fp32_outs or not int8_outs:
+        raise ValueError("Missing output tensors for contract jitter.")
+    if len(fp32_outs) != len(int8_outs):
+        raise ValueError(
+            f"Output count mismatch: fp32={len(fp32_outs)} int8={len(int8_outs)}"
+        )
 
     rng = np.random.default_rng(seed)
     diffs: list[float] = []
     for _ in range(max(1, samples)):
-        x = rng.random(shape, dtype=np.float32)
-        fp32_itp.set_tensor(fp32_in["index"], _prepare_input(fp32_in, x))
-        int8_itp.set_tensor(int8_in["index"], _prepare_input(int8_in, x))
+        # Why: 用同一組輸入比較 fp32/int8 輸出差異，避免 input 隨機性污染 jitter 指標。
+        for i, (fp_in, int8_in) in enumerate(zip(fp32_ins, int8_ins, strict=False)):
+            shape = _sanitize_tflite_shape(fp_in["shape"])
+            x = rng.random(shape, dtype=np.float32) if i == 0 else np.zeros(shape, dtype=np.float32)
+            fp32_itp.set_tensor(fp_in["index"], _prepare_input(fp_in, x))
+            int8_itp.set_tensor(int8_in["index"], _prepare_input(int8_in, x))
+
         fp32_itp.invoke()
         int8_itp.invoke()
 
-        y_fp32 = _dequantize_output(
-            fp32_itp.get_tensor(fp32_out["index"]),
-            fp32_out["quantization"],
-        )
-        y_int8 = _dequantize_output(
-            int8_itp.get_tensor(int8_out["index"]),
-            int8_out["quantization"],
-        )
-        diffs.append(float(np.mean(np.abs(y_fp32 - y_int8))))
+        y_fp32_list = _read_all_outputs_fp(fp32_itp, fp32_outs)
+        y_int8_list = _read_all_outputs_fp(int8_itp, int8_outs)
+        total = 0.0
+        denom = 0
+        for y_fp32, y_int8 in zip(y_fp32_list, y_int8_list, strict=True):
+            if y_fp32.shape != y_int8.shape:
+                raise ValueError(f"Output shape mismatch: fp32={y_fp32.shape} int8={y_int8.shape}")
+            w = int(y_fp32.size)
+            total += float(np.mean(np.abs(y_fp32 - y_int8))) * w
+            denom += w
+        diffs.append(total / max(1, denom))
+
     return float(np.mean(diffs))
 
 
@@ -541,16 +643,162 @@ def _read_map_metric(run_dir: Path, task: str) -> float:
     return float("nan")
 
 
+def _now_ts() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _stable_field_order(fieldnames: set[str]) -> list[str]:
+    base = [
+        "run_ts",
+        "run_id",
+        "study",
+        "dataset",
+        "variant",
+        "mode",
+        "seed",
+        "run_dir",
+        "best_pt",
+        "fp32_tflite",
+        "int8_tflite",
+        "artifact_dir",
+        "artifact_best_pt",
+        "artifact_fp32_tflite",
+        "artifact_int8_tflite",
+        "artifact_err",
+        "map50_95",
+        "lat_fp32_ms",
+        "lat_int8_ms",
+        "contract_jitter",
+        "export_ok",
+        "contract_ok",
+        "latency_ok",
+        "export_err",
+        "contract_err",
+        "latency_err",
+    ]
+    ordered: list[str] = [k for k in base if k in fieldnames]
+    tail = sorted(k for k in fieldnames if k not in set(base))
+    ordered.extend(tail)
+    return ordered
+
+
 def _write_csv(rows: list[dict[str, Any]], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         out_path.write_text("", encoding="utf-8")
         return
-    fieldnames = list(rows[0].keys())
+
+    fields: set[str] = set()
+    for r in rows:
+        fields.update(r.keys())
+    fieldnames = _stable_field_order(fields)
+
     with out_path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
         writer.writeheader()
-        writer.writerows(rows)
+        for r in rows:
+            writer.writerow(r)
+
+
+def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        return [dict(row) for row in reader]
+
+
+def _append_csv(rows: list[dict[str, Any]], out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return
+
+    # Why: history CSV 欄位若隨版本增加，直接 append 會造成欄位錯位；採用「讀舊 + 合併 + 重寫」保證一致。
+    existing_rows = _read_csv_rows(out_path) if out_path.exists() else []
+    merged = existing_rows + rows
+    _write_csv(merged, out_path)
+def _row_key(row: dict[str, Any]) -> tuple[str, str, str, str, int]:
+    study = str(row.get("study", ""))
+    dataset = str(row.get("dataset", ""))
+    variant = str(row.get("variant", ""))
+    mode = str(row.get("mode", ""))
+    try:
+        seed = int(row.get("seed", 0))
+    except Exception:
+        seed = 0
+    return (study, dataset, variant, mode, seed)
+
+
+def _select_newer_row(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+    # Why: 以 run_ts 決定最新；若缺失則一律以 new 覆蓋，避免舊資料壓回去。
+    old_ts = str(old.get("run_ts", ""))
+    new_ts = str(new.get("run_ts", ""))
+    if not old_ts:
+        return new
+    if not new_ts:
+        return old
+    return new if new_ts >= old_ts else old
+
+
+def _upsert_latest(existing: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    index: dict[tuple[str, str, str, str, int], dict[str, Any]] = {}
+    # preserve old first
+    for r in existing:
+        index[_row_key(r)] = r
+    for r in incoming:
+        k = _row_key(r)
+        if k in index:
+            index[k] = _select_newer_row(index[k], r)
+        else:
+            index[k] = r
+    # stable ordering for determinism
+    out = list(index.values())
+    out.sort(key=lambda r: (
+        str(r.get("study","")),
+        str(r.get("dataset","")),
+        str(r.get("variant","")),
+        str(r.get("mode","")),
+        int(r.get("seed",0) or 0),
+    ))
+    return out
+
+
+def _make_run_id(spec: TrainSpec, run_ts: str) -> str:
+    safe = run_ts.replace(":", "").replace("-", "").replace("+", "").replace("T", "_")
+    return f"{spec.name}_{safe}"
+
+
+def _snapshot_artifacts(
+    *,
+    report_root: Path,
+    spec: TrainSpec,
+    run_id: str,
+    best_pt: Path,
+    fp32_tflite: Optional[Path],
+    int8_tflite: Optional[Path],
+) -> dict[str, str]:
+    # Why: 避免搬移資料後 run_dir 路徑失效；保留論文可追溯 artifacts。
+    artifacts_root = report_root / "artifacts"
+    dst_dir = artifacts_root / spec.study / spec.dataset / spec.variant / spec.mode / f"seed{spec.seed}" / run_id
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    out: dict[str, str] = {"artifact_dir": str(dst_dir.relative_to(report_root))}
+
+    dst_best = dst_dir / "best.pt"
+    shutil.copy2(best_pt, dst_best)
+    out["artifact_best_pt"] = str(dst_best.relative_to(report_root))
+
+    if fp32_tflite is not None and fp32_tflite.exists():
+        dst_fp32 = dst_dir / "model_fp32.tflite"
+        shutil.copy2(fp32_tflite, dst_fp32)
+        out["artifact_fp32_tflite"] = str(dst_fp32.relative_to(report_root))
+
+    if int8_tflite is not None and int8_tflite.exists():
+        dst_int8 = dst_dir / "model_int8.tflite"
+        shutil.copy2(int8_tflite, dst_int8)
+        out["artifact_int8_tflite"] = str(dst_int8.relative_to(report_root))
+
+    return out
 
 
 def _compute_deltas(rows: list[dict[str, Any]], study: str) -> list[dict[str, Any]]:
@@ -563,7 +811,27 @@ def _compute_deltas(rows: list[dict[str, Any]], study: str) -> list[dict[str, An
 
     out: list[dict[str, Any]] = []
     if study == "A":
-        left, right = "cira", "yolo"
+        baseline = "yolo"
+        for (dataset, seed), variants in sorted(grouped.items()):
+            if baseline not in variants:
+                continue
+            rhs = variants[baseline]
+            for lhs_name, lhs in sorted(variants.items()):
+                if lhs_name == baseline:
+                    continue
+                out.append(
+                    {
+                        "study": study,
+                        "dataset": dataset,
+                        "seed": seed,
+                        "lhs": lhs_name,
+                        "rhs": baseline,
+                        "delta_map50_95": float(lhs["map50_95"]) - float(rhs["map50_95"]),
+                        "delta_int8_latency_ms": float(lhs["lat_int8_ms"]) - float(rhs["lat_int8_ms"]),
+                        "delta_contract_jitter": float(lhs["contract_jitter"]) - float(rhs["contract_jitter"]),
+                    }
+                )
+        return out
     elif study == "B":
         left, right = "kd_deploy", "deploy_only"
     else:
@@ -614,6 +882,21 @@ def _build_specs(
     kitti_teacher: Path,
     kitti_student_model: Path,
     acc_student_model: Path,
+    kitti_mobilenetv3_model: Optional[Path],
+    kitti_ghostnetv2_model: Optional[Path],
+    kitti_shufflenetv2_model: Optional[Path],
+    kitti_cira_lite_model: Optional[Path],
+    qat_kd_weight: Optional[float],
+    qat_balance_log_interval: int,
+    qat_balance_min: Optional[float],
+    qat_balance_max: Optional[float],
+    qat_balance_warmup_steps: Optional[int],
+    qat_balance_max_step_change: Optional[float],
+    qat_balance_adapt_power: Optional[float],
+    qat_balance_strategy: Optional[str],
+    qat_balance_shared_group: Optional[str],
+    qat_balance_deploy_ramp_steps: Optional[int],
+    qat_balance_update_interval: Optional[int],
 ) -> list[TrainSpec]:
     specs: list[TrainSpec] = []
     model_cfg = {
@@ -630,6 +913,26 @@ def _build_specs(
             "device": device_kitti,
             "yolo": QAT_ROOT / "ultralytics/cfg/models/v8/yolov8.yaml",
             "cira": QAT_ROOT / "ultralytics/cfg/models/Yojui/yolov8_CIRA-Detect.yaml",
+             **(
+                 {"cira-lite": kitti_cira_lite_model}
+                 if kitti_cira_lite_model is not None
+                 else {}
+             ),
+             **(
+                 {"mobilenetv3": kitti_mobilenetv3_model}
+                 if kitti_mobilenetv3_model is not None
+                 else {}
+             ),
+             **(
+                 {"ghostnetv2": kitti_ghostnetv2_model}
+                 if kitti_ghostnetv2_model is not None
+                 else {}
+             ),
+             **(
+                 {"shufflenetv2": kitti_shufflenetv2_model}
+                 if kitti_shufflenetv2_model is not None
+                 else {}
+             ),
         },
     }
 
@@ -653,16 +956,44 @@ def _build_specs(
                 momentum=float(momentum),
                 weight_decay=float(weight_decay),
                 export_fraction=float(export_fraction),
+                qat_kd_weight=qat_kd_weight,
+                qat_balance_log_interval=int(qat_balance_log_interval),
+                qat_balance_min=qat_balance_min,
+                qat_balance_max=qat_balance_max,
+                qat_balance_warmup_steps=qat_balance_warmup_steps,
+                qat_balance_max_step_change=qat_balance_max_step_change,
+                qat_balance_adapt_power=qat_balance_adapt_power,
+                qat_balance_strategy=qat_balance_strategy,
+                qat_balance_shared_group=qat_balance_shared_group,
+                qat_balance_deploy_ramp_steps=qat_balance_deploy_ramp_steps,
+                qat_balance_update_interval=qat_balance_update_interval,
             )
 
             if "A" in studies:
-                for variant_key in ("yolo", "cira"):
+                # Study A：以 yolo 為 baseline，其他有提供模型路徑的 variant 會自動加入
+                if dataset == "kitti":
+                    variant_keys = [
+                        k
+                        for k in (
+                            "yolo",
+                            "cira",
+                            "cira-lite",
+                            "mobilenetv3",
+                            "ghostnetv2",
+                            "shufflenetv2",
+                        )
+                        if k in cfg
+                    ]
+                else:
+                    variant_keys = [k for k in ("yolo", "cira") if k in cfg]
+
+                for variant_key in variant_keys:
                     specs.append(
                         TrainSpec(
                             study="A",
                             variant=variant_key,
                             mode="original",
-                            model=Path(cfg[variant_key]),
+                            model=Path(cfg[variant_key]).resolve(),
                             project=data_root / "paper_runs" / dataset / "A_model_compare",
                             name=f"A_{dataset}_{variant_key}_seed{seed}",
                             teacher_dir=None,
@@ -722,6 +1053,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--momentum", type=float, default=0.937)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--export-fraction", type=float, default=0.25)
+    parser.add_argument(
+        "--qat-kd-weight",
+        type=float,
+        default=None,
+        help="Optional fixed alpha_kd passed to kd-deploy runs.",
+    )
+    parser.add_argument(
+        "--qat-balance-log-interval",
+        type=int,
+        default=50,
+        help="Step interval for KD scalars logging in kd-deploy runs.",
+    )
+    parser.add_argument("--qat-balance-min", type=float, default=None)
+    parser.add_argument("--qat-balance-max", type=float, default=None)
+    parser.add_argument("--qat-balance-warmup-steps", type=int, default=None)
+    parser.add_argument("--qat-balance-max-step-change", type=float, default=None)
+    parser.add_argument("--qat-balance-adapt-power", type=float, default=None)
+    parser.add_argument("--qat-balance-strategy", type=str, default=None, help="Strategy: e.g. grad_norm")
+    parser.add_argument("--qat-balance-shared-group", type=str, default=None, help="Shared group: e.g. head")
+    parser.add_argument("--qat-balance-deploy-ramp-steps", type=int, default=None, help="Ramp up steps for deployment loss")
+    parser.add_argument("--qat-balance-update-interval", type=int, default=None, help="Interval for balance updates")
     parser.add_argument("--device-acc", type=str, default="0")
     parser.add_argument("--device-kitti", type=str, default="1")
     parser.add_argument("--seeds", type=str, default="0,1,2")
@@ -756,6 +1108,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=str(QAT_ROOT / "ultralytics/cfg/models/v8/yolov8.yaml"),
     )
+    parser.add_argument(
+        "--kitti-cira-lite-model",
+        type=str,
+        default=str(QAT_ROOT / "ultralytics/cfg/models/Yojui/yolov8_CIRA-Lite.yaml"),
+    )
+    # Study A additional baselines (optional; if empty, will not be included)
+    parser.add_argument("--kitti-mobilenetv3-model", type=str, default="")
+    parser.add_argument("--kitti-ghostnetv2-model", type=str, default="")
+    parser.add_argument("--kitti-shufflenetv2-model", type=str, default="")
+
+
     return parser
 
 
@@ -764,8 +1127,43 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
+    if args.qat_kd_weight is not None and float(args.qat_kd_weight) < 0.0:
+        raise ValueError(f"--qat-kd-weight must be >= 0, got {args.qat_kd_weight}")
+    if int(args.qat_balance_log_interval) < 1:
+        raise ValueError(
+            f"--qat-balance-log-interval must be >= 1, got {args.qat_balance_log_interval}"
+        )
+
+    if args.qat_balance_min is not None and float(args.qat_balance_min) < 0.0:
+        raise ValueError(f"--qat-balance-min must be >= 0, got {args.qat_balance_min}")
+    if args.qat_balance_max is not None and float(args.qat_balance_max) < 0.0:
+        raise ValueError(f"--qat-balance-max must be >= 0, got {args.qat_balance_max}")
+    if (
+        args.qat_balance_min is not None
+        and args.qat_balance_max is not None
+        and float(args.qat_balance_min) > float(args.qat_balance_max)
+    ):
+        raise ValueError(
+            f"--qat-balance-min must be <= --qat-balance-max, got {args.qat_balance_min} > {args.qat_balance_max}"
+        )
+    if args.qat_balance_warmup_steps is not None and int(args.qat_balance_warmup_steps) < 0:
+        raise ValueError(
+            f"--qat-balance-warmup-steps must be >= 0, got {args.qat_balance_warmup_steps}"
+        )
+    if args.qat_balance_max_step_change is not None and float(args.qat_balance_max_step_change) < 1.0:
+        raise ValueError(
+            f"--qat-balance-max-step-change must be >= 1.0, got {args.qat_balance_max_step_change}"
+        )
+    if args.qat_balance_adapt_power is not None and float(args.qat_balance_adapt_power) <= 0.0:
+        raise ValueError(
+            f"--qat-balance-adapt-power must be > 0, got {args.qat_balance_adapt_power}"
+        )
+
     data_root = Path(args.data_root).resolve()
     data_root.mkdir(parents=True, exist_ok=True)
+
+    report_root = data_root / "paper_reports"
+    report_root.mkdir(parents=True, exist_ok=True)
 
     datasets = _parse_csv_list(args.datasets)
     studies = _parse_csv_list(args.studies)
@@ -787,6 +1185,16 @@ def main() -> None:
 
     acc_yaml = QAT_ROOT / "dataset/lanepose-carkeypoint.yaml"
     kitti_yaml = QAT_ROOT / "dataset/KITTI.yaml"
+    optional_a_models: list[Path] = []
+    if str(args.kitti_mobilenetv3_model).strip():
+        optional_a_models.append(Path(args.kitti_mobilenetv3_model))
+    if str(args.kitti_ghostnetv2_model).strip():
+        optional_a_models.append(Path(args.kitti_ghostnetv2_model))
+    if str(args.kitti_shufflenetv2_model).strip():
+        optional_a_models.append(Path(args.kitti_shufflenetv2_model))
+    if str(args.kitti_cira_lite_model).strip():
+        optional_a_models.append(Path(args.kitti_cira_lite_model))
+
     _require_paths(
         [
             QAT_ROOT / "train_pose.py",
@@ -797,6 +1205,7 @@ def main() -> None:
             Path(args.acc_student_model),
             Path(args.kitti_student_model),
         ]
+        + optional_a_models
     )
 
     if args.smoke:
@@ -839,6 +1248,8 @@ def main() -> None:
             momentum=float(args.momentum),
             weight_decay=float(args.weight_decay),
             export_fraction=float(args.export_fraction),
+            qat_kd_weight=None,
+            qat_balance_log_interval=int(args.qat_balance_log_interval),
             project=data_root / "paper_runs" / "kitti" / "teacher",
             name=f"B_kitti_teacher_seed{seeds[0]}",
             teacher_dir=None,
@@ -882,6 +1293,40 @@ def main() -> None:
         kitti_teacher=(kitti_teacher or Path(args.acc_teacher).resolve()),
         kitti_student_model=Path(args.kitti_student_model).resolve(),
         acc_student_model=Path(args.acc_student_model).resolve(),
+        kitti_mobilenetv3_model=(
+            None
+            if not str(args.kitti_mobilenetv3_model).strip()
+            else Path(args.kitti_mobilenetv3_model).resolve()
+        ),
+        kitti_ghostnetv2_model=(
+            None
+            if not str(args.kitti_ghostnetv2_model).strip()
+            else Path(args.kitti_ghostnetv2_model).resolve()
+        ),
+        kitti_shufflenetv2_model=(
+            None
+            if not str(args.kitti_shufflenetv2_model).strip()
+            else Path(args.kitti_shufflenetv2_model).resolve()
+        ),
+        kitti_cira_lite_model=(
+            None
+            if not str(args.kitti_cira_lite_model).strip()
+            else Path(args.kitti_cira_lite_model).resolve()
+        ),
+        qat_kd_weight=(
+            None if args.qat_kd_weight is None else float(args.qat_kd_weight)
+        ),
+        qat_balance_log_interval=int(args.qat_balance_log_interval),
+        qat_balance_min=(None if args.qat_balance_min is None else float(args.qat_balance_min)),
+        qat_balance_max=(None if args.qat_balance_max is None else float(args.qat_balance_max)),
+        qat_balance_warmup_steps=(None if args.qat_balance_warmup_steps is None else int(args.qat_balance_warmup_steps)),
+        qat_balance_max_step_change=(None if args.qat_balance_max_step_change is None else float(args.qat_balance_max_step_change)),
+        qat_balance_adapt_power=(None if args.qat_balance_adapt_power is None else float(args.qat_balance_adapt_power)),
+        qat_balance_strategy=args.qat_balance_strategy,
+        qat_balance_shared_group=args.qat_balance_shared_group,
+        qat_balance_deploy_ramp_steps=(None if args.qat_balance_deploy_ramp_steps is None else int(args.qat_balance_deploy_ramp_steps)),
+        qat_balance_update_interval=(None if args.qat_balance_update_interval is None else int(args.qat_balance_update_interval)),
+
     )
 
     rows: list[dict[str, Any]] = []
@@ -916,14 +1361,27 @@ def main() -> None:
         exports_dir = run_dir / "exports"
         exports_dir.mkdir(parents=True, exist_ok=True)
 
+        run_ts = _now_ts()
+        run_id = _make_run_id(spec, run_ts)
+
         # --- Logic: Fault-tolerant Export Block ---
         # Initialize metrics with NaN to handle failures gracefully
         fp32_copy = None
         int8_copy = None
-        lat_fp32 = float("nan")
-        lat_int8 = float("nan")
-        jitter = float("nan")
-        export_success = False
+        lat_fp32_ms = float("nan")
+        lat_int8_ms = float("nan")
+        contract_jitter = float("nan")
+        export_ok = False
+        contract_ok = False
+        latency_ok = False
+        export_err = ""
+        contract_err = ""
+        latency_err = ""
+        artifact_dir = ""
+        artifact_best_pt = ""
+        artifact_fp32_tflite = ""
+        artifact_int8_tflite = ""
+        artifact_err = ""
 
         try:
             fp32_export = _export_with_retry(
@@ -948,22 +1406,54 @@ def main() -> None:
             fp32_copy.write_bytes(fp32_export.read_bytes())
             int8_copy.write_bytes(int8_export.read_bytes())
 
-            _contract_check(fp32_copy)
-            _contract_check(int8_copy)
-            lat_fp32 = _tflite_latency_ms(fp32_copy, seed=spec.seed)
-            lat_int8 = _tflite_latency_ms(int8_copy, seed=spec.seed)
-            jitter = _contract_jitter(fp32_copy, int8_copy, seed=spec.seed)
-            export_success = True
+            export_ok = True
+            # latency：不應被 contract 失敗牽連
+            try:
+                lat_fp32_ms = _tflite_latency_ms(fp32_copy)
+                lat_int8_ms = _tflite_latency_ms(int8_copy)
+                latency_ok = True
+            except Exception as e:
+                latency_err = repr(e)
+                logging.error(f"[Latency Failed] {spec.name}@{spec.imgsz}: {e}")
+            # contract + jitter：多輸出相容
+            try:
+                _contract_check(fp32_copy)
+                _contract_check(int8_copy)
+                contract_jitter = _contract_jitter(fp32_copy, int8_copy)
+                contract_ok = True
+            except Exception as e:
+                contract_err = repr(e)
+                logging.error(f"[Contract Failed] {spec.name}@{spec.imgsz}: {e}")
+ 
 
         except Exception as e:
             # Capture specific export failures (e.g., CIRA ONNX issues) without stopping the whole script
-            logging.error(f"[Export Failed] Model: {spec.name} | Error: {e}")
+            export_err = repr(e)
+            logging.error(f"[Export Failed] {spec.name}@{spec.imgsz}: {e}")
             logging.warning(f"[Export Failed] Skipping latency measure for {spec.name}, recording as NaN.")
+        try:
+            snap = _snapshot_artifacts(
+                report_root=report_root,
+                spec=spec,
+                run_id=run_id,
+                best_pt=best_pt,
+                fp32_tflite=(fp32_copy if export_ok else None),
+                int8_tflite=(int8_copy if export_ok else None),
+            )
+            artifact_dir = snap.get("artifact_dir", "")
+            artifact_best_pt = snap.get("artifact_best_pt", "")
+            artifact_fp32_tflite = snap.get("artifact_fp32_tflite", "")
+            artifact_int8_tflite = snap.get("artifact_int8_tflite", "")
+        except Exception as e:
+            artifact_err = repr(e)
+            logging.error(f"[Snapshot Failed] {spec.name}: {e}")
 
         map50_95 = _read_map_metric(run_dir, task=spec.task)
 
         rows.append(
             {
+                "run_ts": run_ts,
+                "run_id": run_id,
                 "study": spec.study,
                 "dataset": spec.dataset,
                 "variant": spec.variant,
@@ -971,22 +1461,35 @@ def main() -> None:
                 "seed": spec.seed,
                 "run_dir": str(run_dir),
                 "best_pt": str(best_pt),
-                "fp32_tflite": str(fp32_copy) if export_success else "EXPORT_FAILED",
-                "int8_tflite": str(int8_copy) if export_success else "EXPORT_FAILED",
+                "fp32_tflite": str(fp32_copy) if export_ok else "EXPORT_FAILED",
+                "int8_tflite": str(int8_copy) if export_ok else "EXPORT_FAILED",
+                "artifact_dir": artifact_dir,
+                "artifact_best_pt": artifact_best_pt,
+                "artifact_fp32_tflite": artifact_fp32_tflite,
+                "artifact_int8_tflite": artifact_int8_tflite,
+                "artifact_err": artifact_err,
                 "map50_95": map50_95,
-                "lat_fp32_ms": lat_fp32,
-                "lat_int8_ms": lat_int8,
-                "contract_jitter": jitter,
+                "lat_fp32_ms": lat_fp32_ms,
+                "lat_int8_ms": lat_int8_ms,
+                "contract_jitter": contract_jitter,
+                "export_ok": export_ok,
+                "contract_ok": contract_ok,
+                "latency_ok": latency_ok,
+                "export_err": export_err,
+                "contract_err": contract_err,
+                "latency_err": latency_err,
             }
         )
 
-    report_root = data_root / "paper_reports"
-    report_root.mkdir(parents=True, exist_ok=True)
-    all_runs_csv = report_root / "all_runs.csv"
-    _write_csv(rows, all_runs_csv)
+    history_csv = report_root / "all_runs_history.csv"
+    _append_csv(rows, history_csv)
 
-    delta_a = _compute_deltas(rows, "A")
-    delta_b = _compute_deltas(rows, "B")
+    all_runs_csv = report_root / "all_runs.csv"
+    merged_rows = _upsert_latest(_read_csv_rows(all_runs_csv), rows)
+    _write_csv(merged_rows, all_runs_csv)
+
+    delta_a = _compute_deltas(merged_rows, "A")
+    delta_b = _compute_deltas(merged_rows, "B")
     _write_csv(delta_a, report_root / "delta_A.csv")
     _write_csv(delta_b, report_root / "delta_B.csv")
 
@@ -995,14 +1498,16 @@ def main() -> None:
         "# Paper Experiment Summary",
         "",
         f"- Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"- Total executed runs: {len(rows)}",
+        f"- Total executed runs (this invocation): {len(rows)}",
+        f"- Total latest keys (all_runs.csv): {len(merged_rows)}",
         f"- all_runs.csv: {all_runs_csv}",
+        f"- all_runs_history.csv: {history_csv}",
         "",
-        "## Delta A (CIRA - YOLO)",
+        "## Delta A (Variant - YOLO)",
     ]
     for row in delta_a:
         report_lines.append(
-            f"- {row['dataset']} seed={row['seed']}: "
+            f"- {row['dataset']} seed={row['seed']} lhs={row['lhs']}: "
             f"delta_map50_95={row['delta_map50_95']:.6f}, "
             f"delta_int8_latency_ms={row['delta_int8_latency_ms']:.6f}, "
             f"delta_contract_jitter={row['delta_contract_jitter']:.6f}"
