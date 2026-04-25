@@ -11,6 +11,13 @@ import tensorflow as tf
 
 from QAT_Refactored.config.config import AppConfig
 
+try:
+    import torch
+    import torch.nn.functional as torch_f
+except Exception:  # pragma: no cover - runtime optional dependency
+    torch = None
+    torch_f = None
+
 
 # Keep Ultralytics local settings writable inside workspace.
 os.environ.setdefault("YOLO_CONFIG_DIR", str((Path.cwd() / ".ultralytics").resolve()))
@@ -48,6 +55,8 @@ class _TorchLoaderToTFAdapter:
 
 def _to_numpy(value: Any) -> np.ndarray:
     """Convert torch/tensor-like values to numpy arrays without assuming a specific backend."""
+    if isinstance(value, np.ndarray):
+        return value
     if hasattr(value, "detach"):
         value = value.detach()
     if hasattr(value, "cpu"):
@@ -57,8 +66,50 @@ def _to_numpy(value: Any) -> np.ndarray:
     return np.asarray(value)
 
 
+def _prepare_images_torch_fast(batch: Dict[str, Any], cfg: AppConfig) -> Optional[np.ndarray]:
+    """
+    Fast path for Ultralytics torch batches:
+    keep resize/transpose in torch, then perform one CPU materialization.
+    """
+    if torch is None:
+        return None
+
+    imgs_t = batch.get("img", None)
+    if imgs_t is None or not torch.is_tensor(imgs_t):
+        return None
+    if imgs_t.ndim != 4:
+        raise ValueError(f"Ultralytics batch['img'] must be rank-4, got shape={tuple(imgs_t.shape)}")
+
+    # Ultralytics dataloader commonly emits BCHW.
+    if imgs_t.shape[1] != 3 and imgs_t.shape[-1] == 3:
+        imgs_t = imgs_t.permute(0, 3, 1, 2)
+    if imgs_t.shape[1] != 3:
+        raise ValueError(f"Unsupported image layout for torch batch: shape={tuple(imgs_t.shape)}")
+
+    if not torch.is_floating_point(imgs_t):
+        imgs_t = imgs_t.float().div_(255.0)
+    else:
+        imgs_t = imgs_t.float()
+        # Preserve legacy normalization behavior when dataloader emits [0,255] float tensors.
+        if float(imgs_t.max().item()) > 1.0:
+            imgs_t = imgs_t / 255.0
+
+    target = int(cfg.IMGSZ)
+    if imgs_t.shape[2] != target or imgs_t.shape[3] != target:
+        if torch_f is None:
+            return None
+        imgs_t = torch_f.interpolate(imgs_t, size=(target, target), mode="bilinear", align_corners=False)
+
+    imgs_t = imgs_t.permute(0, 2, 3, 1).contiguous()
+    return imgs_t.detach().cpu().numpy().astype(np.float32, copy=False)
+
+
 
 def _prepare_images(batch: Dict[str, Any], cfg: AppConfig) -> np.ndarray:
+    imgs_torch = _prepare_images_torch_fast(batch, cfg)
+    if imgs_torch is not None:
+        return imgs_torch
+
     imgs = _to_numpy(batch["img"])
     if imgs.ndim != 4:
         raise ValueError(f"Ultralytics batch['img'] must be rank-4, got shape={imgs.shape}")
@@ -145,26 +196,39 @@ def _prepare_padded_labels(batch: Dict[str, Any], cfg: AppConfig, batch_size: in
     keypoints_np = _normalize_keypoints(keypoints_np, num_targets, num_kpt, kpt_vals)
 
     labels = np.zeros((batch_size, int(cfg.MAX_OBJS), feature_dim), dtype=np.float32)
-    per_image_counts = np.zeros((batch_size,), dtype=np.int32)
-    dropped = 0
+    if num_targets == 0:
+        return labels
 
-    for row in range(num_targets):
-        img_i = int(batch_idx[row])
-        if img_i < 0 or img_i >= batch_size:
-            continue
+    # Preserve per-image target order while avoiding per-target Python loops.
+    order = np.argsort(batch_idx, kind="stable")
+    sorted_batch = batch_idx[order]
 
-        dst = int(per_image_counts[img_i])
-        if dst >= int(cfg.MAX_OBJS):
-            dropped += 1
-            continue
+    in_range = (sorted_batch >= 0) & (sorted_batch < batch_size)
+    if not np.all(in_range):
+        order = order[in_range]
+        sorted_batch = sorted_batch[in_range]
 
-        labels[img_i, dst, 0] = cls[row]
-        labels[img_i, dst, 1:5] = np.clip(bboxes[row], 0.0, 1.0)
+    if sorted_batch.size == 0:
+        return labels
 
-        if keypoints_np is not None and num_kpt > 0:
-            labels[img_i, dst, 5:] = keypoints_np[row].reshape(-1)
+    counts = np.bincount(sorted_batch, minlength=batch_size).astype(np.int32, copy=False)
+    starts = np.zeros_like(counts)
+    if counts.size > 1:
+        starts[1:] = np.cumsum(counts[:-1], dtype=np.int32)
+    local_idx = np.arange(sorted_batch.shape[0], dtype=np.int32) - starts[sorted_batch]
 
-        per_image_counts[img_i] += 1
+    keep = local_idx < int(cfg.MAX_OBJS)
+    dropped = int(local_idx.shape[0] - np.count_nonzero(keep))
+
+    src = order[keep]
+    img_slot = sorted_batch[keep]
+    obj_slot = local_idx[keep]
+
+    labels[img_slot, obj_slot, 0] = cls[src]
+    labels[img_slot, obj_slot, 1:5] = np.clip(bboxes[src], 0.0, 1.0)
+
+    if keypoints_np is not None and num_kpt > 0:
+        labels[img_slot, obj_slot, 5:] = keypoints_np[src].reshape(src.shape[0], -1)
 
     if dropped > 0:
         logging.warning(
@@ -205,12 +269,12 @@ def _build_rep_dataset_gen(source_loader: Any, cfg: AppConfig) -> Any:
 
 
 
-def _make_ultralytics_cfg(cfg: AppConfig) -> Any:
+def _make_ultralytics_cfg(cfg: AppConfig, task: str) -> Any:
     from ultralytics.cfg import get_cfg
     from ultralytics.utils import DEFAULT_CFG
 
     overrides = {
-        "task": "pose",
+        "task": str(task),
         "data": str(cfg.DATA_YAML),
         "imgsz": int(cfg.IMGSZ),
         "batch": int(cfg.BATCH_SIZE),
@@ -234,15 +298,32 @@ def _make_ultralytics_cfg(cfg: AppConfig) -> Any:
 
 
 def build_ultralytics_pose_data(cfg: AppConfig) -> UltralyticsTFDataBundle:
-    """Build Ultralytics pose dataloaders and adapt them to TensorFlow tensors."""
+    """Build Ultralytics pose/detect dataloaders and adapt them to TensorFlow tensors."""
     if cfg.DATA_YAML is None:
         raise ValueError("DATA_YAML is required for Ultralytics data backend.")
 
     from ultralytics.data import build_dataloader, build_yolo_dataset
     from ultralytics.data.utils import check_det_dataset
 
-    yolo_cfg = _make_ultralytics_cfg(cfg)
     data_info = check_det_dataset(str(cfg.DATA_YAML), autodownload=False)
+    requested_task = str(getattr(cfg, "ULTRA_TASK", "pose")).strip().lower()
+    if requested_task not in {"pose", "detect"}:
+        raise ValueError(
+            "Ultralytics TensorFlow bridge currently supports ULTRA_TASK in {'pose', 'detect'}, "
+            f"got {cfg.ULTRA_TASK!r}."
+        )
+
+    kpt_shape = data_info.get("kpt_shape")
+    has_keypoints = isinstance(kpt_shape, (list, tuple)) and len(kpt_shape) >= 2
+
+    effective_task = requested_task
+    if requested_task == "pose" and not has_keypoints:
+        logging.warning(
+            "[Data] ULTRA_TASK='pose' but dataset has no kpt_shape; auto-fallback to detect mode."
+        )
+        effective_task = "detect"
+    cfg.ULTRA_TASK = effective_task
+    yolo_cfg = _make_ultralytics_cfg(cfg, effective_task)
 
     dataset_nc = int(data_info.get("nc", cfg.NUM_CLS))
     if dataset_nc != int(cfg.NUM_CLS):
@@ -253,8 +334,7 @@ def build_ultralytics_pose_data(cfg: AppConfig) -> UltralyticsTFDataBundle:
         )
         cfg.NUM_CLS = dataset_nc
 
-    kpt_shape = data_info.get("kpt_shape")
-    if isinstance(kpt_shape, (list, tuple)) and len(kpt_shape) >= 2:
+    if effective_task == "pose" and has_keypoints:
         kpt_num = int(kpt_shape[0])
         kpt_vals = int(kpt_shape[1])
         if kpt_num != int(cfg.NUM_KPT) or kpt_vals != int(cfg.KPT_VALS):
@@ -267,6 +347,12 @@ def build_ultralytics_pose_data(cfg: AppConfig) -> UltralyticsTFDataBundle:
             )
             cfg.NUM_KPT = kpt_num
             cfg.KPT_VALS = kpt_vals
+    elif effective_task == "detect" and int(cfg.NUM_KPT) != 0:
+        logging.warning(
+            "[Data] ULTRA_TASK='detect' overrides NUM_KPT from %d to 0 for detection labels.",
+            int(cfg.NUM_KPT),
+        )
+        cfg.NUM_KPT = 0
 
     stride = max(int(s) for s in cfg.STRIDES) if cfg.STRIDES else 32
 

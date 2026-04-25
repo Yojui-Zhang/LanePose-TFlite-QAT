@@ -84,3 +84,50 @@ class RepVGGQuantizeConfig(tfmot.quantization.keras.QuantizeConfig):
 
     def get_config(self):
         return {}
+
+
+class DeformableDepthwiseQuantizeConfig(tfmot.quantization.keras.QuantizeConfig):
+    """
+    QuantizeConfig for DeformableDepthwiseConv2D.
+    Quantizes:
+    - depthwise kernel (main conv weight)
+    - offset adaptor kernel (offset/mask predictor)
+    """
+
+    def get_weights_and_quantizers(self, layer):
+        q = tfmot.quantization.keras.quantizers.LastValueQuantizer(
+            num_bits=8, per_axis=False, symmetric=True, narrow_range=True
+        )
+        out = []
+        if hasattr(layer, "depthwise_kernel") and layer.depthwise_kernel is not None:
+            out.append((layer.depthwise_kernel, q))
+        if hasattr(layer, "offset_conv") and layer.offset_conv is not None:
+            if hasattr(layer.offset_conv, "kernel") and layer.offset_conv.kernel is not None:
+                out.append((layer.offset_conv.kernel, q))
+        return out
+
+    def get_activations_and_quantizers(self, layer):
+        del layer
+        return []
+
+    def set_quantize_weights(self, layer, quantize_weights):
+        iterator = iter(quantize_weights)
+        if hasattr(layer, "depthwise_kernel") and layer.depthwise_kernel is not None:
+            layer.depthwise_kernel = next(iterator)
+        if hasattr(layer, "offset_conv") and layer.offset_conv is not None:
+            if hasattr(layer.offset_conv, "kernel") and layer.offset_conv.kernel is not None:
+                layer.offset_conv.kernel = next(iterator)
+
+    def set_quantize_activations(self, layer, quantize_activations):
+        del layer, quantize_activations
+
+    def get_output_quantizers(self, layer):
+        del layer
+        return [
+            tfmot.quantization.keras.quantizers.MovingAverageQuantizer(
+                num_bits=8, per_axis=False, symmetric=False, narrow_range=False
+            )
+        ]
+
+    def get_config(self):
+        return {}

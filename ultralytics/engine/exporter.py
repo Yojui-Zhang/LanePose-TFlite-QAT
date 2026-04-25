@@ -1001,7 +1001,14 @@ class Exporter:
         import onnx2tf  # scoped for after ONNX export for reduced conflict during import
 
         LOGGER.info(f"{prefix} starting TFLite export with onnx2tf {onnx2tf.__version__}...")
-        keras_model = onnx2tf.convert(
+        onnx2tf_device = str(os.environ.get("ULTRALYTICS_ONNX2TF_DEVICE", "cpu")).strip().lower()
+        if onnx2tf_device not in {"cpu", "gpu", "auto"}:
+            LOGGER.warning(
+                f"{prefix} invalid ULTRALYTICS_ONNX2TF_DEVICE={onnx2tf_device!r}, falling back to 'cpu'."
+            )
+            onnx2tf_device = "cpu"
+
+        convert_kwargs = dict(
             input_onnx_file_path=f_onnx,
             output_folder_path=str(f),
             not_use_onnxsim=True,
@@ -1014,6 +1021,43 @@ class Exporter:
             disable_group_convolution=self.args.format in {"tfjs", "edgetpu"},  # fix error with group convolution
             optimization_for_gpu_delegate=True,
         )
+
+        def _is_cuda_context_error(exc: Exception) -> bool:
+            text = str(exc)
+            return (
+                "CUDA_ERROR_INVALID_HANDLE" in text
+                or "failed call to cuLaunchKernel" in text
+                or "device:GPU" in text and "InternalError" in text
+            )
+
+        def _convert_with_device(*, force_cpu: bool):
+            if force_cpu:
+                # Keep TensorFlow conversion away from GPU to avoid PyTorch/TF CUDA context conflicts.
+                try:
+                    tf.config.set_visible_devices([], "GPU")
+                    LOGGER.info(f"{prefix} onnx2tf device policy: CPU isolation enabled.")
+                except RuntimeError as e:
+                    LOGGER.warning(
+                        f"{prefix} could not hide TF GPUs after runtime init ({e}); forcing /CPU:0 placement."
+                    )
+                with tf.device("/CPU:0"):
+                    return onnx2tf.convert(**convert_kwargs)
+            return onnx2tf.convert(**convert_kwargs)
+
+        if onnx2tf_device == "cpu":
+            keras_model = _convert_with_device(force_cpu=True)
+        elif onnx2tf_device == "gpu":
+            keras_model = _convert_with_device(force_cpu=False)
+        else:  # auto
+            try:
+                keras_model = _convert_with_device(force_cpu=False)
+            except Exception as e:
+                if not _is_cuda_context_error(e):
+                    raise
+                LOGGER.warning(
+                    f"{prefix} onnx2tf GPU path failed with CUDA context error; retrying on CPU. error={e}"
+                )
+                keras_model = _convert_with_device(force_cpu=True)
         YAML.save(f / "metadata.yaml", self.metadata)  # add metadata.yaml
 
         # Remove/rename TFLite models

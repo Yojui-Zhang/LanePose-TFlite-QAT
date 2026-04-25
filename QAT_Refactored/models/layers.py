@@ -4,8 +4,8 @@ import tensorflow as tf
 import numpy as np
 from typing import Optional, Tuple
 
-from tensorflow import keras as K
-from tensorflow.keras import layers as L
+import tf_keras as K
+from tf_keras import layers as L
 
 # ==============================================================================
 # Helper Functions for RepVGG Fusion
@@ -97,6 +97,349 @@ def dw_conv_bn_act(x: tf.Tensor, out_ch: int, k: int = 3, s: int = 1,
         x = L.ReLU(max_value=6.0, name=f'{prefix}/pw_relu6' if prefix else None)(x)
         
     return x
+
+
+@K.utils.register_keras_serializable(package="QAT")
+class DeformableDepthwiseConv2D(L.Layer):
+    """
+    TensorFlow deformable depthwise convolution (DCN-like fallback).
+    - Learns offsets/masks from an adaptor conv.
+    - Supports prior-only / residual-only / prior+residual modes.
+    - Can switch to standard depthwise fallback for export compatibility.
+    """
+
+    _VALID_MODES = {"baseline", "prior_only", "residual_only", "prior_residual"}
+
+    def __init__(
+        self,
+        kernel_size: int = 3,
+        strides: int = 1,
+        padding: str = "same",
+        mode: str = "prior_residual",
+        use_mask: bool = True,
+        prior_scale: float = 0.35,
+        offset_clamp: Optional[float] = None,
+        deform_enabled: bool = True,
+        force_fallback: bool = False,
+        mask_init_bias: float = 2.0,
+        eps: float = 1e-6,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if mode not in self._VALID_MODES:
+            raise ValueError(f"mode must be one of {sorted(self._VALID_MODES)}, got {mode}")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError(f"kernel_size must be positive odd integer, got {kernel_size}")
+        if strides <= 0:
+            raise ValueError(f"strides must be > 0, got {strides}")
+        if padding.lower() not in {"same", "valid"}:
+            raise ValueError(f"padding must be 'same' or 'valid', got {padding}")
+
+        self.kernel_size = int(kernel_size)
+        self.strides = int(strides)
+        self.padding = str(padding).lower()
+        self.mode = str(mode)
+        self.use_mask = bool(use_mask)
+        self.prior_scale = float(prior_scale)
+        self.offset_clamp = (
+            float(offset_clamp)
+            if offset_clamp is not None
+            else float(max(self.kernel_size, 2))
+        )
+        self.deform_enabled = bool(deform_enabled)
+        self.force_fallback = bool(force_fallback)
+        self.mask_init_bias = float(mask_init_bias)
+        self.eps = float(eps)
+
+        self.channels: Optional[int] = None
+        self.depthwise_kernel: Optional[tf.Variable] = None
+        self.bias: Optional[tf.Variable] = None
+        self.gamma: Optional[tf.Variable] = None
+        self.offset_conv: Optional[L.Conv2D] = None
+        self._kernel_offsets: Optional[tf.Tensor] = None
+        self._sobel_x: Optional[tf.Tensor] = None
+        self._sobel_y: Optional[tf.Tensor] = None
+        self._base_grid: Optional[tf.Tensor] = None
+
+    def build(self, input_shape):
+        channels = int(input_shape[-1])
+        if channels <= 0:
+            raise ValueError(f"input channels must be > 0, got {channels}")
+        self.channels = channels
+
+        self.depthwise_kernel = self.add_weight(
+            name="depthwise_kernel",
+            shape=(self.kernel_size, self.kernel_size, channels, 1),
+            initializer="he_uniform",
+            trainable=True,
+        )
+        self.bias = self.add_weight(
+            name="bias",
+            shape=(channels,),
+            initializer="zeros",
+            trainable=True,
+        )
+        self.gamma = self.add_weight(
+            name="gamma",
+            shape=(),
+            initializer="zeros",
+            trainable=True,
+        )
+
+        num_offsets = 2 * self.kernel_size * self.kernel_size
+        num_masks = self.kernel_size * self.kernel_size if self.use_mask else 0
+        out_channels = num_offsets + num_masks
+
+        self.offset_conv = L.Conv2D(
+            filters=out_channels,
+            kernel_size=3,
+            strides=self.strides,
+            padding=self.padding,
+            use_bias=True,
+            kernel_initializer="zeros",
+            bias_initializer="zeros",
+            name=f"{self.name}_offset_conv",
+        )
+        self.offset_conv.build(input_shape)
+        if self.use_mask:
+            zero_offsets = tf.zeros([num_offsets], dtype=self.offset_conv.bias.dtype)
+            one_masks = tf.fill(
+                [num_masks],
+                tf.cast(self.mask_init_bias, dtype=self.offset_conv.bias.dtype),
+            )
+            self.offset_conv.bias.assign(tf.concat([zero_offsets, one_masks], axis=0))
+
+        pad = self.kernel_size // 2
+        k_range = tf.range(self.kernel_size, dtype=tf.float32)
+        ky, kx = tf.meshgrid(k_range, k_range, indexing="ij")
+        rel_y = ky - float(pad)
+        rel_x = kx - float(pad)
+        rel = tf.stack([rel_y, rel_x], axis=-1)  # [k, k, 2]
+        rel = tf.reshape(rel, [1, 1, 1, self.kernel_size * self.kernel_size, 2])
+        self._kernel_offsets = rel
+
+        sobel_x = tf.constant(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            dtype=tf.float32,
+        )
+        sobel_y = tf.constant(
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+            dtype=tf.float32,
+        )
+        self._sobel_x = tf.reshape(sobel_x, [3, 3, 1, 1])
+        self._sobel_y = tf.reshape(sobel_y, [3, 3, 1, 1])
+
+        static_h = input_shape[1]
+        static_w = input_shape[2]
+        if self.padding == "same" and self.strides == 1 and static_h is not None and static_w is not None:
+            y_base = tf.cast(tf.range(int(static_h)) + pad, tf.float32)
+            x_base = tf.cast(tf.range(int(static_w)) + pad, tf.float32)
+            gy, gx = tf.meshgrid(y_base, x_base, indexing="ij")
+            base = tf.stack([gy, gx], axis=-1)  # [H, W, 2]
+            self._base_grid = tf.reshape(base, [1, int(static_h), int(static_w), 1, 2])
+        super().build(input_shape)
+
+    def switch_to_fallback(self) -> None:
+        self.force_fallback = True
+
+    def _depthwise_fallback(self, x: tf.Tensor) -> tf.Tensor:
+        assert self.depthwise_kernel is not None and self.bias is not None
+        y = tf.nn.depthwise_conv2d(
+            x,
+            self.depthwise_kernel,
+            strides=[1, self.strides, self.strides, 1],
+            padding=self.padding.upper(),
+        )
+        return tf.nn.bias_add(y, self.bias)
+
+    def _build_prior_offsets(self, x: tf.Tensor, out_h: tf.Tensor, out_w: tf.Tensor) -> tf.Tensor:
+        assert self._sobel_x is not None and self._sobel_y is not None
+        x_mean = tf.reduce_mean(x, axis=-1, keepdims=True)
+        x_pad = tf.pad(x_mean, [[0, 0], [1, 1], [1, 1], [0, 0]], mode="REFLECT")
+
+        sobel_x = tf.cast(self._sobel_x, dtype=x_pad.dtype)
+        sobel_y = tf.cast(self._sobel_y, dtype=x_pad.dtype)
+        dy = tf.nn.conv2d(x_pad, sobel_y, strides=[1, 1, 1, 1], padding="VALID")
+        dx = tf.nn.conv2d(x_pad, sobel_x, strides=[1, 1, 1, 1], padding="VALID")
+
+        mag_raw = tf.sqrt(tf.square(dy) + tf.square(dx) + self.eps)
+        mag_max = tf.reduce_max(mag_raw, axis=[1, 2, 3], keepdims=True)
+        mag = mag_raw / (mag_max + self.eps)
+
+        dy = (dy / (mag_raw + self.eps)) * mag
+        dx = (dx / (mag_raw + self.eps)) * mag
+
+        same_h = tf.equal(tf.shape(dy)[1], out_h)
+        same_w = tf.equal(tf.shape(dy)[2], out_w)
+        need_resize = tf.logical_not(tf.logical_and(same_h, same_w))
+
+        def _resize():
+            target_hw = tf.stack([out_h, out_w])
+            return (
+                tf.image.resize(dy, target_hw, method="bilinear"),
+                tf.image.resize(dx, target_hw, method="bilinear"),
+            )
+
+        dy, dx = tf.cond(need_resize, _resize, lambda: (dy, dx))
+
+        prior = tf.stack([dy, dx], axis=-1)  # [B, H, W, 1, 2]
+        return prior * float(self.prior_scale)
+
+    @staticmethod
+    def _gather_bhwk(image: tf.Tensor, yy: tf.Tensor, xx: tf.Tensor) -> tf.Tensor:
+        # Flattened batched gather avoids materializing a large [B,H,W,K,3] index tensor.
+        b = tf.shape(image)[0]
+        width = tf.shape(image)[2]
+        channels = tf.shape(image)[3]
+        flat = tf.reshape(image, [b, -1, channels])  # [B, H*W, C]
+        linear_idx = (yy * width) + xx  # [B, Hout, Wout, K]
+        return tf.gather(flat, linear_idx, axis=1, batch_dims=1)
+
+    def _bilinear_sample(self, image: tf.Tensor, y: tf.Tensor, x: tf.Tensor) -> tf.Tensor:
+        h = tf.shape(image)[1]
+        w = tf.shape(image)[2]
+
+        y0 = tf.floor(y)
+        x0 = tf.floor(x)
+        y1 = y0 + 1.0
+        x1 = x0 + 1.0
+
+        y0i = tf.clip_by_value(tf.cast(y0, tf.int32), 0, h - 1)
+        x0i = tf.clip_by_value(tf.cast(x0, tf.int32), 0, w - 1)
+        y1i = tf.clip_by_value(tf.cast(y1, tf.int32), 0, h - 1)
+        x1i = tf.clip_by_value(tf.cast(x1, tf.int32), 0, w - 1)
+
+        y0f = tf.cast(y0i, tf.float32)
+        x0f = tf.cast(x0i, tf.float32)
+        y1f = tf.cast(y1i, tf.float32)
+        x1f = tf.cast(x1i, tf.float32)
+
+        wa = (y1f - y) * (x1f - x)
+        wb = (y1f - y) * (x - x0f)
+        wc = (y - y0f) * (x1f - x)
+        wd = (y - y0f) * (x - x0f)
+
+        ia = self._gather_bhwk(image, y0i, x0i)
+        ib = self._gather_bhwk(image, y0i, x1i)
+        ic = self._gather_bhwk(image, y1i, x0i)
+        idd = self._gather_bhwk(image, y1i, x1i)
+
+        wa = tf.expand_dims(wa, axis=-1)
+        wb = tf.expand_dims(wb, axis=-1)
+        wc = tf.expand_dims(wc, axis=-1)
+        wd = tf.expand_dims(wd, axis=-1)
+        return wa * ia + wb * ib + wc * ic + wd * idd
+
+    def _sample_patches(self, x: tf.Tensor, offsets: tf.Tensor) -> tf.Tensor:
+        assert self._kernel_offsets is not None
+        if self.padding == "same":
+            pad = self.kernel_size // 2
+            x = tf.pad(x, [[0, 0], [pad, pad], [pad, pad], [0, 0]])
+        else:
+            pad = 0
+
+        if self._base_grid is not None:
+            base = self._base_grid
+        else:
+            out_h = tf.shape(offsets)[1]
+            out_w = tf.shape(offsets)[2]
+            y_base = tf.cast(tf.range(out_h) * self.strides + pad, tf.float32)
+            x_base = tf.cast(tf.range(out_w) * self.strides + pad, tf.float32)
+            gy, gx = tf.meshgrid(y_base, x_base, indexing="ij")
+            base = tf.stack([gy, gx], axis=-1)  # [H, W, 2]
+            base = tf.reshape(base, [1, out_h, out_w, 1, 2])
+
+        coords = base + self._kernel_offsets + offsets
+        y = coords[..., 0]
+        xcoord = coords[..., 1]
+        return self._bilinear_sample(x, y, xcoord)
+
+    def call(self, x: tf.Tensor, training=None):
+        del training
+        if (
+            self.mode == "baseline"
+            or (not self.deform_enabled)
+            or self.force_fallback
+        ):
+            return self._depthwise_fallback(x)
+
+        assert self.offset_conv is not None
+        assert self.depthwise_kernel is not None and self.bias is not None and self.gamma is not None
+
+        params = self.offset_conv(x)
+        num_offsets = 2 * self.kernel_size * self.kernel_size
+        mode = self.mode
+        need_residual = mode != "prior_only"
+        if self.use_mask:
+            if need_residual:
+                delta, mask_logits = tf.split(
+                    params,
+                    [num_offsets, self.kernel_size * self.kernel_size],
+                    axis=-1,
+                )
+            else:
+                _, mask_logits = tf.split(
+                    params,
+                    [num_offsets, self.kernel_size * self.kernel_size],
+                    axis=-1,
+                )
+                delta = None
+            mask = tf.sigmoid(mask_logits)
+        else:
+            delta = params if need_residual else None
+            mask = None
+
+        if need_residual:
+            out_h = tf.shape(delta)[1]
+            out_w = tf.shape(delta)[2]
+            delta = tf.reshape(
+                delta,
+                [-1, out_h, out_w, self.kernel_size * self.kernel_size, 2],
+            )
+            delta = tf.tanh(delta) * float(self.offset_clamp)
+        else:
+            out_h = tf.shape(params)[1]
+            out_w = tf.shape(params)[2]
+
+        gamma = tf.sigmoid(self.gamma)
+        if mode == "prior_only":
+            offsets = self._build_prior_offsets(x, out_h, out_w)
+        elif mode == "residual_only":
+            offsets = gamma * delta
+        else:
+            prior = self._build_prior_offsets(x, out_h, out_w)
+            offsets = prior + gamma * delta
+        offsets = tf.clip_by_value(offsets, -self.offset_clamp, self.offset_clamp)
+
+        sampled = self._sample_patches(x, offsets)  # [B, H, W, K, C]
+        if mask is not None:
+            sampled *= tf.expand_dims(mask, axis=-1)
+
+        kernel_flat = tf.reshape(
+            self.depthwise_kernel,
+            [self.kernel_size * self.kernel_size, self.channels],
+        )
+        y = tf.reduce_sum(sampled * kernel_flat[None, None, None, :, :], axis=3)
+        return tf.nn.bias_add(y, self.bias)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update(
+            {
+                "kernel_size": self.kernel_size,
+                "strides": self.strides,
+                "padding": self.padding,
+                "mode": self.mode,
+                "use_mask": self.use_mask,
+                "prior_scale": self.prior_scale,
+                "offset_clamp": self.offset_clamp,
+                "deform_enabled": self.deform_enabled,
+                "force_fallback": self.force_fallback,
+                "mask_init_bias": self.mask_init_bias,
+                "eps": self.eps,
+            }
+        )
+        return cfg
 
 def sppf_block(x: tf.Tensor, out_ch: int, k: int = 5, name: Optional[str] = None) -> tf.Tensor:
     """Spatial Pyramid Pooling - Fast (SPPF)."""
@@ -372,15 +715,15 @@ class ChannelAttention(L.Layer):
         super().build(input_shape)
 
     def call(self, x):
-        avg = L.GlobalAveragePooling2D(keepdims=True, name=f"{self.name}/gap")(x)
-        mx = L.GlobalMaxPooling2D(keepdims=True, name=f"{self.name}/gmp")(x)
-        
+        avg = tf.reduce_mean(x, axis=[1, 2], keepdims=True)
+        mx = tf.reduce_max(x, axis=[1, 2], keepdims=True)
+
         # Shared MLP
         a1 = self.mlp2(self.mlp1(avg))
         a2 = self.mlp2(self.mlp1(mx))
-        
-        scale = L.Activation('sigmoid', name=f"{self.name}/sigmoid")(L.Add()([a1, a2]))
-        return L.Multiply(name=f"{self.name}/scale")([x, scale])
+
+        scale = tf.sigmoid(a1 + a2)
+        return x * scale
 
     def get_config(self):
         cfg = super().get_config()
@@ -396,12 +739,11 @@ class SpatialAttention(L.Layer):
                              name=f"{self.name}/conv")
 
     def call(self, x):
-        # Use simple reduction ops
         avg = tf.reduce_mean(x, axis=-1, keepdims=True)
         mx = tf.reduce_max(x, axis=-1, keepdims=True)
-        cat = L.Concatenate(axis=-1)([avg, mx])
+        cat = tf.concat([avg, mx], axis=-1)
         scale = self.conv(cat)
-        return L.Multiply(name=f"{self.name}/scale")([x, scale])
+        return x * scale
 
     def get_config(self):
         cfg = super().get_config()

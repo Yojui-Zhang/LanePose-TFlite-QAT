@@ -25,7 +25,14 @@ os.environ.setdefault("YOLO_CONFIG_DIR", str((Path.cwd() / ".ultralytics").resol
 @dataclass(frozen=True)
 class KDLossConfig:
     temperature: float = 1.0
+    cls_distill: str = "bce"         # bce | softmax_kl
+    dfl_distill: str = "kldiv"       # kldiv | smoothl1
+    fg_threshold: float = 0.0        # 0 disables threshold masking
+    fg_topk: int = 0                 # 0 disables topk masking
+    fg_min_pos: int = 0              # 0 disables min-pos guarantee
+    fg_apply_to: str = "cls"         # cls | dfl | both
     aux_kd_head_label_loss: bool = False
+    composition: str = "dynamic_kd_deploy"  # dynamic_kd_deploy | fixed_kd_deploy | pure_kd
     balance: LossBalanceConfig = field(default_factory=LossBalanceConfig)
     log_interval_steps: int = 50
 
@@ -78,6 +85,59 @@ def _align_feature_maps(student: torch.Tensor, teacher: torch.Tensor) -> tuple[t
     return student, teacher
 
 
+def _build_kd_foreground_mask(
+    t_cls: torch.Tensor,
+    *,
+    temperature: float,
+    threshold: float,
+    topk: int,
+    min_pos: int,
+) -> Optional[torch.Tensor]:
+    """
+    Why: YOLO head 的空間位置大多為背景；若 KD 對所有位置平均，梯度會被背景主導而削弱 mAP 增益。
+    Mask 以 teacher 的 per-location confidence 生成，保留更可能為前景的位置做蒸餾。
+    Returns:
+        mask: bool tensor of shape (B, H, W) or None when disabled.
+    """
+    if t_cls.ndim != 4:
+        raise ValueError(f"t_cls must be 4D (B,C,H,W), got {t_cls.shape}")
+    if threshold <= 0.0 and topk <= 0 and min_pos <= 0:
+        return None
+
+    temp = max(float(temperature), 1e-6)
+    # YOLO cls 是 multi-label（sigmoid），此處以 teacher sigmoid 機率作 confidence
+    probs = torch.sigmoid(t_cls / temp)  # (B, C, H, W)
+    conf = probs.amax(dim=1)             # (B, H, W)
+
+    b, h, w = conf.shape
+    hw = int(h * w)
+    conf_flat = conf.reshape(b, hw)
+
+    mask_flat = None
+    if threshold > 0.0:
+        if threshold > 1.0:
+            raise ValueError(f"fg_threshold must be in [0,1], got {threshold}")
+        mask_flat = conf_flat > float(threshold)
+
+    if topk > 0:
+        k = min(int(topk), hw)
+        idx = torch.topk(conf_flat, k=k, dim=1, largest=True, sorted=False).indices  # (B, k)
+        topk_mask = torch.zeros((b, hw), device=conf.device, dtype=torch.bool)
+        topk_mask.scatter_(1, idx, True)
+        mask_flat = topk_mask if mask_flat is None else (mask_flat | topk_mask)
+
+    if min_pos > 0:
+        k = min(int(min_pos), hw)
+        idx = torch.topk(conf_flat, k=k, dim=1, largest=True, sorted=False).indices
+        min_mask = torch.zeros((b, hw), device=conf.device, dtype=torch.bool)
+        min_mask.scatter_(1, idx, True)
+        mask_flat = min_mask if mask_flat is None else (mask_flat | min_mask)
+
+    if mask_flat is None:
+        return None
+    return mask_flat.reshape(b, h, w)
+
+
 
 def _align_keypoints(student: torch.Tensor, teacher: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Align keypoint tensor shape from teacher to student."""
@@ -101,12 +161,25 @@ def _compute_feature_kd_loss(
     *,
     reg_max: int,
     temperature: float,
+    cls_distill: str,
+    dfl_distill: str,
+    fg_threshold: float,
+    fg_topk: int,
+    fg_min_pos: int,
+    fg_apply_to: str,
     device: torch.device,
 ) -> torch.Tensor:
     kd_dfl = torch.zeros((), device=device)
     kd_cls = torch.zeros((), device=device)
     levels = min(len(student_feats), len(teacher_feats))
     dfl_channels = int(reg_max * 4)
+
+    if cls_distill not in {"bce", "softmax_kl"}:
+        raise ValueError(f"Unsupported cls_distill: {cls_distill}")
+    if dfl_distill not in {"kldiv", "smoothl1"}:
+        raise ValueError(f"Unsupported dfl_distill: {dfl_distill}")
+    if fg_apply_to not in {"cls", "dfl", "both"}:
+        raise ValueError(f"Unsupported fg_apply_to: {fg_apply_to}")
 
     for i in range(levels):
         s_map = student_feats[i]
@@ -116,19 +189,76 @@ def _compute_feature_kd_loss(
         d = min(dfl_channels, c)
         cls_c = max(c - d, 0)
 
+        # foreground mask（以 teacher cls 建立），可選擇套用到 cls / dfl / both
+        mask_hw: Optional[torch.Tensor] = None
+        if cls_c > 0 and (fg_threshold > 0.0 or fg_topk > 0 or fg_min_pos > 0):
+            t_cls_for_mask = t_map[:, d : d + cls_c]
+            mask_hw = _build_kd_foreground_mask(
+                t_cls_for_mask,
+                temperature=float(temperature),
+                threshold=float(fg_threshold),
+                topk=int(fg_topk),
+                min_pos=int(fg_min_pos),
+            )
+
+        temp = max(float(temperature), 1e-6)
+
+        # ---------------------------
+        # DFL distill
+        # ---------------------------
         if d > 0:
-            kd_dfl = kd_dfl + F.smooth_l1_loss(s_map[:, :d], t_map[:, :d], reduction="mean")
+            s_dfl = s_map[:, :d]
+            t_dfl = t_map[:, :d]
+
+            # 若 channel 被裁切導致非完整 4*reg_max，KL 形狀會不合法，回退 smoothl1
+            if dfl_distill == "kldiv" and d == dfl_channels:
+                b, _, h, w = s_dfl.shape
+                # (B, 4, reg_max, H, W) -> (B, H, W, 4, reg_max) -> (-1, reg_max)
+                s_logits = (s_dfl / temp).reshape(b, 4, reg_max, h, w).permute(0, 3, 4, 1, 2).reshape(-1, reg_max)
+                t_logits = (t_dfl / temp).reshape(b, 4, reg_max, h, w).permute(0, 3, 4, 1, 2).reshape(-1, reg_max)
+
+                kl = F.kl_div(
+                    F.log_softmax(s_logits, dim=-1),
+                    F.softmax(t_logits, dim=-1),
+                    reduction="none",
+                ).sum(dim=-1)  # (-1,)
+
+                if mask_hw is not None and fg_apply_to in {"dfl", "both"}:
+                    mask_loc = mask_hw.reshape(-1).repeat_interleave(4)  # 每個位置對應 4 個 bbox 分量
+                    kl = kl[mask_loc]
+                if kl.numel() > 0:
+                    kd_dfl = kd_dfl + kl.mean() * (temp**2)
+            else:
+                kd_dfl = kd_dfl + F.smooth_l1_loss(s_dfl, t_dfl, reduction="mean")
+
+        # ---------------------------
+        # CLS distill
+        # ---------------------------
         if cls_c > 0:
             s_cls = s_map[:, d : d + cls_c]
             t_cls = t_map[:, d : d + cls_c]
-            temp = max(float(temperature), 1e-6)
             s_logits = (s_cls / temp).permute(0, 2, 3, 1).reshape(-1, cls_c)
             t_logits = (t_cls / temp).permute(0, 2, 3, 1).reshape(-1, cls_c)
-            kd_cls = kd_cls + F.kl_div(
-                F.log_softmax(s_logits, dim=-1),
-                F.softmax(t_logits, dim=-1),
-                reduction="batchmean",
-            ) * (temp**2)
+
+            if cls_distill == "bce":
+                # Why: YOLO cls 為 multi-label sigmoid（非互斥 softmax），用 BCE 蒸餾更契合 loss 幾何
+                t_probs = torch.sigmoid(t_logits)
+                bce = F.binary_cross_entropy_with_logits(s_logits, t_probs, reduction="none").mean(dim=1)  # (N,)
+                if mask_hw is not None and fg_apply_to in {"cls", "both"}:
+                    bce = bce[mask_hw.reshape(-1)]
+                if bce.numel() > 0:
+                    kd_cls = kd_cls + bce.mean() * (temp**2)
+            else:
+                # 保留舊行為：softmax KL（互斥假設）
+                kl = F.kl_div(
+                    F.log_softmax(s_logits, dim=-1),
+                    F.softmax(t_logits, dim=-1),
+                    reduction="none",
+                ).sum(dim=-1)  # (N,)
+                if mask_hw is not None and fg_apply_to in {"cls", "both"}:
+                    kl = kl[mask_hw.reshape(-1)]
+                if kl.numel() > 0:
+                    kd_cls = kd_cls + kl.mean() * (temp**2)
 
     if levels > 0:
         kd_dfl = kd_dfl / float(levels)
@@ -183,7 +313,8 @@ class KDPoseLoss(v8PoseLoss):
         self._teacher_dtype: Optional[torch.dtype] = None
         fixed_alpha = cfg.balance.fixed_kd_weight
         logging.info(
-            "[KD] Balance enabled: strategy=%s shared=%s fixed_alpha=%s params=%d",
+            "[KD] Balance enabled: composition=%s strategy=%s shared=%s fixed_alpha=%s params=%d",
+            cfg.composition,
             cfg.balance.strategy,
             cfg.balance.shared_param_group,
             "None" if fixed_alpha is None else f"{float(fixed_alpha):.6f}",
@@ -268,6 +399,12 @@ class KDPoseLoss(v8PoseLoss):
             teacher_feats=t_feats,
             reg_max=self.reg_max,
             temperature=float(self.kd_cfg.temperature),
+            cls_distill=str(self.kd_cfg.cls_distill),
+            dfl_distill=str(self.kd_cfg.dfl_distill),
+            fg_threshold=float(self.kd_cfg.fg_threshold),
+            fg_topk=int(self.kd_cfg.fg_topk),
+            fg_min_pos=int(self.kd_cfg.fg_min_pos),
+            fg_apply_to=str(self.kd_cfg.fg_apply_to),
             device=self.device,
         )
 
@@ -295,6 +432,7 @@ class KDPoseLoss(v8PoseLoss):
             deploy_loss=deploy_total,
             kd_loss=kd_total,
             shared_params=self._shared_params,
+            composition=self.kd_cfg.composition,
         )
         step = self.balancer.step
         if step % self._log_interval == 0:
@@ -431,6 +569,12 @@ class KDDetectLoss(v8DetectionLoss):
             teacher_feats=t_feats,
             reg_max=self.reg_max,
             temperature=float(self.kd_cfg.temperature),
+            cls_distill=str(self.kd_cfg.cls_distill),
+            dfl_distill=str(self.kd_cfg.dfl_distill),
+            fg_threshold=float(self.kd_cfg.fg_threshold),
+            fg_topk=int(self.kd_cfg.fg_topk),
+            fg_min_pos=int(self.kd_cfg.fg_min_pos),
+            fg_apply_to=str(self.kd_cfg.fg_apply_to),
             device=self.device,
         )
         # Keep KD scalar in the same batch-scaled convention as Ultralytics deploy loss.
@@ -452,6 +596,7 @@ class KDDetectLoss(v8DetectionLoss):
             deploy_loss=deploy_total,
             kd_loss=kd_total,
             shared_params=self._shared_params,
+            composition=self.kd_cfg.composition,
         )
         step = self.balancer.step
         if step % self._log_interval == 0:

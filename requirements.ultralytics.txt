@@ -1,0 +1,21 @@
+# Ultralytics / PyTorch profile
+# Use in a dedicated env:
+#   python -m pip install -r requirement.txt -r requirements.ultralytics.txt
+#
+# This project imports local `./ultralytics` source by default.
+# The packages below provide runtime dependencies.
+
+--extra-index-url https://pypi.ngc.nvidia.com
+
+torch
+torchvision
+ultralytics>=8.3.0,<9.0.0
+
+onnx>=1.12.0,<1.18.0
+onnxruntime
+onnxscript
+onnx2tf>=1.26.3
+onnxslim>=0.1.59
+sng4onnx>=1.0.1
+onnx_graphsurgeon>=0.3.26
+ai-edge-litert>=1.2.0,<1.4.0

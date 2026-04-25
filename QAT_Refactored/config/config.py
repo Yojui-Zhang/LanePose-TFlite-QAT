@@ -87,6 +87,16 @@ class AppConfig:
     KD_BALANCE_EPS: float = 1e-6
     KD_BALANCE_FIXED_KD_WEIGHT: Optional[float] = None
     KD_BALANCE_LOG_INTERVAL: int = 50
+
+    # KD distillation specifics (Ultralytics kd-deploy mode)
+    KD_TEMPERATURE: float = 1.0
+    KD_CLS_DISTILL: str = "bce"          # bce | softmax_kl
+    KD_DFL_DISTILL: str = "kldiv"        # kldiv | smoothl1
+    KD_FG_THRESHOLD: float = 0.0         # [0,1], 0 disables
+    KD_FG_TOPK: int = 0                  # 0 disables
+    KD_FG_MIN_POS: int = 0               # 0 disables
+    KD_FG_APPLY_TO: str = "cls"          # cls | dfl | both
+    ULTRA_KD_LOSS_COMPOSITION: str = "dynamic_kd_deploy"  # dynamic_kd_deploy | fixed_kd_deploy | pure_kd
     
     # ===================================================
     # Loss Function Selection
@@ -111,10 +121,19 @@ class AppConfig:
     USE_AMP: bool = False
     TRAIN_SUPERVISION: str = 'label'  # 'label' or 'distill'
     TRAIN_ENGINE: str = "tf-legacy"  # "ultralytics" or "tf-legacy"
+    TF_LEGACY_BACKBONE: str = "yolo-repvgg"  # yolo-repvgg | cira-lite
+    TF_CIRA_WIDTH_MULT: float = 0.3
+    TF_CIRA_USE_ATTENTION: bool = True
+    TF_CIRA_USE_DEFORM: bool = True
     QAT_LOSS_MODE: str = "kd-deploy"  # "original" (strict Ultralytics parity) or "kd-deploy"
-    DATA_BACKEND: str = "ultralytics"  # "ultralytics" or "native"
+    DATA_BACKEND: str = "ultralytics"  # "ultralytics" or "native" "cira"
     DATA_YAML: Optional[Path] = field(default_factory=lambda: Path("./dataset/lanepose-carkeypoint.yaml"))
+    ULTRA_BACKBONE: str = "custom"  # custom | yolo | cira
     ULTRA_MODEL: str = "yolo11n-pose.pt"
+    ULTRA_MODEL_YOLO_POSE: str = "cfg/models/v8/yolov8-pose.yaml"
+    ULTRA_MODEL_YOLO_DETECT: str = "cfg/models/v8/yolov8.yaml"
+    ULTRA_MODEL_CIRA_POSE: str = "ultralytics/cfg/models/Yojui/yolov8_CIRA-Pose.yaml"
+    ULTRA_MODEL_CIRA_DETECT: str = "ultralytics/cfg/models/Yojui/yolov8_CIRA-Lite.yaml"
     ULTRA_TASK: str = "pose"
     ULTRA_DEVICE: str = "0"
     ULTRA_NAME: str = "train_qat"
@@ -127,6 +146,11 @@ class AppConfig:
     ULTRA_EXPORT_DATE: Optional[str] = None  # set fixed ISO datetime for bitwise-stable export metadata
     ULTRA_EXPORT_DATA: Optional[Path] = None
     ULTRA_EXPORT_FRACTION: float = 1.0
+    # Device policy for TensorFlow onnx2tf conversion during Ultralytics export.
+    # cpu: force CPU to avoid PyTorch/TF CUDA context conflicts in a shared process.
+    # gpu: keep legacy behavior.
+    # auto: try GPU first, fallback to CPU on CUDA handle/runtime failures.
+    ULTRA_ONNX2TF_DEVICE: str = "cpu"
     ULTRA_NMS_EXPORT: bool = False
     ULTRA_WORKERS: int = 4
     ULTRA_CACHE: bool = False
@@ -257,6 +281,13 @@ class AppConfig:
         # 5. Data backend validation
         if train_engine not in {"ultralytics", "tf-legacy"}:
             errors.append(f"TRAIN_ENGINE must be 'ultralytics' or 'tf-legacy', got {self.TRAIN_ENGINE}")
+        if str(self.TF_LEGACY_BACKBONE).lower() not in {"yolo-repvgg", "cira-lite"}:
+            errors.append(
+                "TF_LEGACY_BACKBONE must be one of ['cira-lite', 'yolo-repvgg'], "
+                f"got {self.TF_LEGACY_BACKBONE}"
+            )
+        if float(self.TF_CIRA_WIDTH_MULT) <= 0.0:
+            errors.append(f"TF_CIRA_WIDTH_MULT must be > 0, got {self.TF_CIRA_WIDTH_MULT}")
         if str(self.QAT_LOSS_MODE).lower() not in {"original", "kd-deploy"}:
             errors.append(
                 f"QAT_LOSS_MODE must be 'original' or 'kd-deploy', got {self.QAT_LOSS_MODE}"
@@ -270,8 +301,36 @@ class AppConfig:
                 "ULTRA_TASK must be one of ['classify', 'detect', 'obb', 'pose', 'segment'], "
                 f"got {self.ULTRA_TASK}"
             )
+        if str(self.ULTRA_BACKBONE).lower() not in {"custom", "yolo", "cira"}:
+            errors.append(
+                "ULTRA_BACKBONE must be one of ['custom', 'yolo', 'cira'], "
+                f"got {self.ULTRA_BACKBONE}"
+            )
+        if str(self.ULTRA_BACKBONE).lower() in {"yolo", "cira"} and str(self.ULTRA_TASK).lower() not in {
+            "pose",
+            "detect",
+        }:
+            errors.append(
+                "ULTRA_BACKBONE in {'yolo', 'cira'} requires ULTRA_TASK in {'pose', 'detect'}, "
+                f"got {self.ULTRA_TASK}"
+            )
+        if not str(self.ULTRA_MODEL).strip():
+            errors.append("ULTRA_MODEL must be non-empty")
+        if not str(self.ULTRA_MODEL_YOLO_POSE).strip():
+            errors.append("ULTRA_MODEL_YOLO_POSE must be non-empty")
+        if not str(self.ULTRA_MODEL_YOLO_DETECT).strip():
+            errors.append("ULTRA_MODEL_YOLO_DETECT must be non-empty")
+        if not str(self.ULTRA_MODEL_CIRA_POSE).strip():
+            errors.append("ULTRA_MODEL_CIRA_POSE must be non-empty")
+        if not str(self.ULTRA_MODEL_CIRA_DETECT).strip():
+            errors.append("ULTRA_MODEL_CIRA_DETECT must be non-empty")
         if self.ULTRA_EXPORT_DATA is not None and not Path(self.ULTRA_EXPORT_DATA).exists():
             errors.append(f"ULTRA_EXPORT_DATA not found: {self.ULTRA_EXPORT_DATA}")
+        if str(self.ULTRA_ONNX2TF_DEVICE).lower() not in {"cpu", "gpu", "auto"}:
+            errors.append(
+                "ULTRA_ONNX2TF_DEVICE must be one of ['auto', 'cpu', 'gpu'], "
+                f"got {self.ULTRA_ONNX2TF_DEVICE}"
+            )
         if self.ULTRA_WORKERS < 0:
             errors.append(f"ULTRA_WORKERS must be >= 0, got {self.ULTRA_WORKERS}")
         if self.ULTRA_SEED < 0:
@@ -323,6 +382,30 @@ class AppConfig:
                 "TFLITE_QUANT_MODE must be one of "
                 f"{sorted(valid_quant_modes)}, got {self.TFLITE_QUANT_MODE}"
             )
+
+        # 8. KD-specific validation (only meaningful in kd-deploy)
+        if str(getattr(self, "QAT_LOSS_MODE", "")).lower() == "kd-deploy":
+            if str(self.ULTRA_KD_LOSS_COMPOSITION).lower() not in {"dynamic_kd_deploy", "fixed_kd_deploy", "pure_kd"}:
+                errors.append(
+                    "ULTRA_KD_LOSS_COMPOSITION must be in "
+                    "{dynamic_kd_deploy, fixed_kd_deploy, pure_kd}, "
+                    f"got {self.ULTRA_KD_LOSS_COMPOSITION}"
+                )
+            if float(self.KD_TEMPERATURE) <= 0.0:
+                errors.append(f"KD_TEMPERATURE must be > 0, got {self.KD_TEMPERATURE}")
+            if str(self.KD_CLS_DISTILL) not in {"bce", "softmax_kl"}:
+                errors.append(f"KD_CLS_DISTILL must be in {{bce, softmax_kl}}, got {self.KD_CLS_DISTILL}")
+            if str(self.KD_DFL_DISTILL) not in {"kldiv", "smoothl1"}:
+                errors.append(f"KD_DFL_DISTILL must be in {{kldiv, smoothl1}}, got {self.KD_DFL_DISTILL}")
+            thr = float(self.KD_FG_THRESHOLD)
+            if not (0.0 <= thr <= 1.0):
+                errors.append(f"KD_FG_THRESHOLD must be in [0,1], got {self.KD_FG_THRESHOLD}")
+            if int(self.KD_FG_TOPK) < 0:
+                errors.append(f"KD_FG_TOPK must be >= 0, got {self.KD_FG_TOPK}")
+            if int(self.KD_FG_MIN_POS) < 0:
+                errors.append(f"KD_FG_MIN_POS must be >= 0, got {self.KD_FG_MIN_POS}")
+            if str(self.KD_FG_APPLY_TO) not in {"cls", "dfl", "both"}:
+                errors.append(f"KD_FG_APPLY_TO must be in {{cls, dfl, both}}, got {self.KD_FG_APPLY_TO}")
 
         if errors:
             logging.critical("="*40)

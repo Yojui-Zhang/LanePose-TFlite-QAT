@@ -1,0 +1,10 @@
+# TensorFlow legacy QAT profile
+# Use in a dedicated env:
+#   python -m pip install -r requirement.txt -r requirements.qat-tflegacy.txt
+#
+# Keep this profile isolated from PyTorch CUDA stacks.
+
+tensorflow[and-cuda]==2.15.0.post1
+tf-keras>=2.15.0,<2.16.0
+tensorflow-model-optimization==0.8.0
+protobuf>=4.25.3,<5

@@ -4,6 +4,7 @@ import argparse
 import csv
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -36,6 +37,14 @@ OOM_HINTS = (
     "\nkilled\n",
 )
 
+_KD_LINE_RE = re.compile(
+    r"\[KD\]\s+step=(?P<step>\d+)\s+"
+    r"supervised_loss=(?P<sup>[0-9eE\.\+\-]+)\s+"
+    r"kd_loss=(?P<kd>[0-9eE\.\+\-]+)\s+"
+    r"alpha_kd=(?P<alpha>[0-9eE\.\+\-]+)\s+"
+    r"grad_ratio_sup_over_kd=(?P<ratio>None|[0-9eE\.\+\-]+)"
+)
+
 
 @dataclass(frozen=True)
 class TrainSpec:
@@ -60,6 +69,16 @@ class TrainSpec:
     weight_decay: float
     export_fraction: float
     qat_kd_weight: Optional[float]
+
+    # KD distillation specifics (forwarded to train_pose.py; only used when mode == "kd-deploy")
+    qat_kd_temperature: float
+    qat_kd_cls_distill: str
+    qat_kd_dfl_distill: str
+    qat_kd_fg_threshold: float
+    qat_kd_fg_topk: int
+    qat_kd_fg_min_pos: int
+    qat_kd_fg_apply_to: str
+
     qat_balance_log_interval: int
     qat_balance_min: Optional[float]
     qat_balance_max: Optional[float]
@@ -73,6 +92,7 @@ class TrainSpec:
     project: Path
     name: str
     teacher_dir: Optional[Path] = None
+    kd_loss_composition: Optional[str] = None
 
     @property
     def run_dir(self) -> Path:
@@ -264,6 +284,18 @@ def _build_train_cmd(spec: TrainSpec, batch: int, workers: int) -> list[str]:
         cmd.extend(["--qat-teacher-exported-dir", str(spec.teacher_dir)])
     if spec.mode == "kd-deploy":
         cmd.extend(["--qat-balance-log-interval", str(spec.qat_balance_log_interval)])
+        if spec.kd_loss_composition is not None:
+            cmd.extend(["--qat-kd-loss-composition", str(spec.kd_loss_composition)])
+
+        # KD specifics (new)
+        cmd.extend(["--qat-kd-temperature", str(spec.qat_kd_temperature)])
+        cmd.extend(["--qat-kd-cls-distill", str(spec.qat_kd_cls_distill)])
+        cmd.extend(["--qat-kd-dfl-distill", str(spec.qat_kd_dfl_distill)])
+        cmd.extend(["--qat-kd-fg-threshold", str(spec.qat_kd_fg_threshold)])
+        cmd.extend(["--qat-kd-fg-topk", str(spec.qat_kd_fg_topk)])
+        cmd.extend(["--qat-kd-fg-min-pos", str(spec.qat_kd_fg_min_pos)])
+        cmd.extend(["--qat-kd-fg-apply-to", str(spec.qat_kd_fg_apply_to)])
+
         if spec.qat_kd_weight is not None:
             cmd.extend(["--qat-kd-weight", str(spec.qat_kd_weight)])
         if spec.qat_balance_min is not None:
@@ -616,6 +648,45 @@ def _contract_jitter(fp32_model: Path, int8_model: Path, *, samples: int = 16, s
 
     return float(np.mean(diffs))
 
+def _extract_ultralytics_map(metrics: Any, task: str) -> tuple[float, float]:
+    # Why: Ultralytics 在 detect/pose 的 metric 容器不同，統一抽取 (map50, map50-95)。
+    mobj = None
+    if task == "pose" and hasattr(metrics, "pose"):
+        mobj = getattr(metrics, "pose", None)
+    if mobj is None and hasattr(metrics, "box"):
+        mobj = getattr(metrics, "box", None)
+    if mobj is None:
+        return (float("nan"), float("nan"))
+    map50 = float(getattr(mobj, "map50", float("nan")))
+    map5095 = float(getattr(mobj, "map", float("nan")))
+    return (map50, map5095)
+
+def _val_tflite_map(
+    *,
+    model_path: Path,
+    task: str,
+    data_yaml: Path,
+    imgsz: int,
+    split: str,
+    out_dir: Path,
+    name: str,
+) -> tuple[float, float]:
+    model = YOLO(str(model_path), task=task)
+    metrics = model.val(
+        data=str(data_yaml),
+        imgsz=int(imgsz),
+        split=str(split),
+        device="cpu",
+        batch=1,
+        workers=0,
+        verbose=False,
+        plots=False,
+        save=False,
+        project=str(out_dir),
+        name=str(name),
+        exist_ok=True,
+    )
+    return _extract_ultralytics_map(metrics, task=task)
 
 def _read_map_metric(run_dir: Path, task: str) -> float:
     csv_path = run_dir / "results.csv"
@@ -643,6 +714,72 @@ def _read_map_metric(run_dir: Path, task: str) -> float:
     return float("nan")
 
 
+def _find_latest_attempt_log(spec: TrainSpec) -> Path | None:
+    log_dir = spec.project / "_logs"
+    if not log_dir.exists():
+        return None
+    candidates = sorted(log_dir.glob(f"{spec.name}.attempt*.log"))
+    if not candidates:
+        return None
+    # Why: retry 可能產生 attempt2/3；以 mtime 選最新可對應實際成功那次
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _parse_kd_stats_from_log(
+    *,
+    log_path: Path | None,
+    max_weight: float,
+) -> dict[str, float]:
+    if log_path is None or (not log_path.exists()):
+        return {
+            "kd_log_steps": float("nan"),
+            "alpha_kd_min": float("nan"),
+            "alpha_kd_median": float("nan"),
+            "alpha_kd_max": float("nan"),
+            "alpha_kd_sat_ratio": float("nan"),
+            "grad_ratio_median": float("nan"),
+        }
+
+    text = log_path.read_text(encoding="utf-8", errors="ignore")
+    alphas: list[float] = []
+    ratios: list[float] = []
+    for m in _KD_LINE_RE.finditer(text):
+        try:
+            alphas.append(float(m.group("alpha")))
+        except Exception:
+            continue
+        r = m.group("ratio")
+        if r != "None":
+            try:
+                ratios.append(float(r))
+            except Exception:
+                pass
+
+    if not alphas:
+        return {
+            "kd_log_steps": 0.0,
+            "alpha_kd_min": float("nan"),
+            "alpha_kd_median": float("nan"),
+            "alpha_kd_max": float("nan"),
+            "alpha_kd_sat_ratio": float("nan"),
+            "grad_ratio_median": float("nan"),
+        }
+
+    a = np.asarray(alphas, dtype=np.float64)
+    max_w = float(max_weight)
+    sat_thr = max_w * (1.0 - 1e-6)
+    sat_ratio = float(np.mean(a >= sat_thr))
+    grad_med = float(np.median(np.asarray(ratios, dtype=np.float64))) if ratios else float("nan")
+    return {
+        "kd_log_steps": float(a.size),
+        "alpha_kd_min": float(np.min(a)),
+        "alpha_kd_median": float(np.median(a)),
+        "alpha_kd_max": float(np.max(a)),
+        "alpha_kd_sat_ratio": sat_ratio,
+        "grad_ratio_median": grad_med,
+    }
+
+
 def _now_ts() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -666,9 +803,21 @@ def _stable_field_order(fieldnames: set[str]) -> list[str]:
         "artifact_int8_tflite",
         "artifact_err",
         "map50_95",
+        "kd_log_steps",
+        "alpha_kd_min",
+        "alpha_kd_median",
+        "alpha_kd_max",
+        "alpha_kd_sat_ratio",
+        "grad_ratio_median",
         "lat_fp32_ms",
         "lat_int8_ms",
         "contract_jitter",
+        "tflite_map_ok",
+        "tflite_map_err",
+        "map50_fp32_tflite",
+        "map50_95_fp32_tflite",
+        "map50_int8_tflite",
+        "map50_95_int8_tflite",
         "export_ok",
         "contract_ok",
         "latency_ok",
@@ -698,6 +847,18 @@ def _write_csv(rows: list[dict[str, Any]], out_path: Path) -> None:
         writer.writeheader()
         for r in rows:
             writer.writerow(r)
+
+def _as_float(value: Any) -> float:
+    # Why: 欄位擴充後舊列可能是 ""，直接 float("") 會炸；統一轉成 NaN。
+    if value is None:
+        return float("nan")
+    s = str(value).strip()
+    if not s:
+        return float("nan")
+    try:
+        return float(s)
+    except Exception:
+        return float("nan")
 
 
 def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
@@ -826,9 +987,11 @@ def _compute_deltas(rows: list[dict[str, Any]], study: str) -> list[dict[str, An
                         "seed": seed,
                         "lhs": lhs_name,
                         "rhs": baseline,
-                        "delta_map50_95": float(lhs["map50_95"]) - float(rhs["map50_95"]),
-                        "delta_int8_latency_ms": float(lhs["lat_int8_ms"]) - float(rhs["lat_int8_ms"]),
-                        "delta_contract_jitter": float(lhs["contract_jitter"]) - float(rhs["contract_jitter"]),
+                        "delta_map50_95": _as_float(lhs.get("map50_95")) - _as_float(rhs.get("map50_95")),
+                        "delta_int8_map50": _as_float(lhs.get("map50_int8_tflite")) - _as_float(rhs.get("map50_int8_tflite")),
+                        "delta_int8_map50_95": _as_float(lhs.get("map50_95_int8_tflite")) - _as_float(rhs.get("map50_95_int8_tflite")),
+                        "delta_int8_latency_ms": _as_float(lhs.get("lat_int8_ms")) - _as_float(rhs.get("lat_int8_ms")),
+                        "delta_contract_jitter": _as_float(lhs.get("contract_jitter")) - _as_float(rhs.get("contract_jitter")),
                     }
                 )
         return out
@@ -849,12 +1012,67 @@ def _compute_deltas(rows: list[dict[str, Any]], study: str) -> list[dict[str, An
                 "seed": seed,
                 "lhs": left,
                 "rhs": right,
-                "delta_map50_95": float(lhs["map50_95"]) - float(rhs["map50_95"]),
-                "delta_int8_latency_ms": float(lhs["lat_int8_ms"]) - float(rhs["lat_int8_ms"]),
-                "delta_contract_jitter": float(lhs["contract_jitter"]) - float(rhs["contract_jitter"]),
+                "delta_map50_95": _as_float(lhs.get("map50_95")) - _as_float(rhs.get("map50_95")),
+                "delta_int8_map50": _as_float(lhs.get("map50_int8_tflite")) - _as_float(rhs.get("map50_int8_tflite")),
+                "delta_int8_map50_95": _as_float(lhs.get("map50_95_int8_tflite")) - _as_float(rhs.get("map50_95_int8_tflite")),
+                "delta_int8_latency_ms": _as_float(lhs.get("lat_int8_ms")) - _as_float(rhs.get("lat_int8_ms")),
+                "delta_contract_jitter": _as_float(lhs.get("contract_jitter")) - _as_float(rhs.get("contract_jitter")),
+
             }
         )
     return out
+
+
+def _compute_deltas_with_baseline(
+    rows: list[dict[str, Any]],
+    study: str,
+    *,
+    baseline_variant: str,
+) -> list[dict[str, Any]]:
+    """
+    Why: Study-B variants are now CLI-gated. Baseline may be deploy_only/kd_only/kd_deploy,
+    so delta computation must not assume a fixed pair.
+    """
+    if study != "B":
+        return _compute_deltas(rows, study)
+
+    grouped: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
+    for row in rows:
+        if row["study"] != "B":
+            continue
+        key = (str(row["dataset"]), int(row["seed"]))
+        grouped.setdefault(key, {})[str(row["variant"])] = row
+
+    out: list[dict[str, Any]] = []
+    for (dataset, seed), variants in sorted(grouped.items()):
+        if baseline_variant not in variants:
+            continue
+        rhs = variants[baseline_variant]
+        for lhs_name, lhs in sorted(variants.items()):
+            if lhs_name == baseline_variant:
+                continue
+            out.append(
+                {
+                    "study": "B",
+                    "dataset": dataset,
+                    "seed": seed,
+                    "lhs": lhs_name,
+                    "rhs": baseline_variant,
+                    "delta_map50_95": _as_float(lhs.get("map50_95")) - _as_float(rhs.get("map50_95")),
+                    "delta_int8_map50": _as_float(lhs.get("map50_int8_tflite")) - _as_float(rhs.get("map50_int8_tflite")),
+                    "delta_int8_map50_95": _as_float(lhs.get("map50_95_int8_tflite")) - _as_float(rhs.get("map50_95_int8_tflite")),
+                    "delta_int8_latency_ms": _as_float(lhs.get("lat_int8_ms")) - _as_float(rhs.get("lat_int8_ms")),
+                    "delta_contract_jitter": _as_float(lhs.get("contract_jitter")) - _as_float(rhs.get("contract_jitter")),
+                }
+            )
+    return out
+
+
+def _normalize_study_b_variant_name(name: str) -> str:
+    raw = str(name).strip()
+    if raw == "kd_only":
+        return "KdDepoly_half"
+    return raw
 
 
 def _build_specs(
@@ -887,6 +1105,25 @@ def _build_specs(
     kitti_shufflenetv2_model: Optional[Path],
     kitti_cira_lite_model: Optional[Path],
     qat_kd_weight: Optional[float],
+
+    qat_kd_temperature: float,
+    qat_kd_cls_distill: str,
+    qat_kd_dfl_distill: str,
+    qat_kd_fg_threshold: float,
+    qat_kd_fg_topk: int,
+    qat_kd_fg_min_pos: int,
+    qat_kd_fg_apply_to: str,
+    include_a_cira: bool,
+    include_a_kitti_cira_lite: bool,
+    include_a_kitti_mobilenetv3: bool,
+    include_a_kitti_ghostnetv2: bool,
+    include_a_kitti_shufflenetv2: bool,
+    include_b_deploy_only: bool,
+    include_b_kd_only: bool,
+    include_b_pure_kd: bool,
+    include_b_kd_deploy: bool,
+    b_kd_only_weight: float,
+
     qat_balance_log_interval: int,
     qat_balance_min: Optional[float],
     qat_balance_max: Optional[float],
@@ -957,6 +1194,15 @@ def _build_specs(
                 weight_decay=float(weight_decay),
                 export_fraction=float(export_fraction),
                 qat_kd_weight=qat_kd_weight,
+
+                qat_kd_temperature=float(qat_kd_temperature),
+                qat_kd_cls_distill=str(qat_kd_cls_distill),
+                qat_kd_dfl_distill=str(qat_kd_dfl_distill),
+                qat_kd_fg_threshold=float(qat_kd_fg_threshold),
+                qat_kd_fg_topk=int(qat_kd_fg_topk),
+                qat_kd_fg_min_pos=int(qat_kd_fg_min_pos),
+                qat_kd_fg_apply_to=str(qat_kd_fg_apply_to),
+
                 qat_balance_log_interval=int(qat_balance_log_interval),
                 qat_balance_min=qat_balance_min,
                 qat_balance_max=qat_balance_max,
@@ -970,22 +1216,23 @@ def _build_specs(
             )
 
             if "A" in studies:
-                # Study A：以 yolo 為 baseline，其他有提供模型路徑的 variant 會自動加入
+                # Study A: yolo baseline is always included. Other variants require explicit include flags.
                 if dataset == "kitti":
-                    variant_keys = [
-                        k
-                        for k in (
-                            "yolo",
-                            "cira",
-                            "cira-lite",
-                            "mobilenetv3",
-                            "ghostnetv2",
-                            "shufflenetv2",
-                        )
-                        if k in cfg
-                    ]
+                    variant_keys = ["yolo"]
+                    if include_a_cira and "cira" in cfg:
+                        variant_keys.append("cira")
+                    if include_a_kitti_cira_lite and "cira-lite" in cfg:
+                        variant_keys.append("cira-lite")
+                    if include_a_kitti_mobilenetv3 and "mobilenetv3" in cfg:
+                        variant_keys.append("mobilenetv3")
+                    if include_a_kitti_ghostnetv2 and "ghostnetv2" in cfg:
+                        variant_keys.append("ghostnetv2")
+                    if include_a_kitti_shufflenetv2 and "shufflenetv2" in cfg:
+                        variant_keys.append("shufflenetv2")
                 else:
-                    variant_keys = [k for k in ("yolo", "cira") if k in cfg]
+                    variant_keys = ["yolo"]
+                    if include_a_cira and "cira" in cfg:
+                        variant_keys.append("cira")
 
                 for variant_key in variant_keys:
                     specs.append(
@@ -1004,30 +1251,97 @@ def _build_specs(
             if "B" in studies:
                 student_model = acc_student_model if dataset == "acc" else kitti_student_model
                 teacher_dir = acc_teacher if dataset == "acc" else kitti_teacher
-                specs.append(
-                    TrainSpec(
-                        study="B",
-                        variant="deploy_only",
-                        mode="original",
-                        model=student_model,
-                        project=data_root / "paper_runs" / dataset / "B_kd_vs_deploy",
-                        name=f"B_{dataset}_deploy_only_seed{seed}",
-                        teacher_dir=None,
-                        **common,
+
+                if include_b_deploy_only:
+                    specs.append(
+                        TrainSpec(
+                            study="B",
+                            variant="deploy_only",
+                            mode="original",
+                            model=student_model,
+                            project=data_root / "paper_runs" / dataset / "B_kd_vs_deploy",
+                            name=f"B_{dataset}_deploy_only_seed{seed}",
+                            teacher_dir=None,
+                            **common,
+                        )
                     )
-                )
-                specs.append(
-                    TrainSpec(
-                        study="B",
-                        variant="kd_deploy",
-                        mode="kd-deploy",
-                        model=student_model,
-                        project=data_root / "paper_runs" / dataset / "B_kd_vs_deploy",
-                        name=f"B_{dataset}_kd_deploy_seed{seed}",
-                        teacher_dir=teacher_dir,
-                        **common,
+
+                if include_b_kd_only:
+                    kd_only_common = dict(common)
+                    kd_only_common["qat_kd_weight"] = float(b_kd_only_weight)
+                    # Why: 固定 alpha 的 run，避免動態 balance 參數造成解讀混亂
+                    kd_only_common["qat_balance_min"] = 1.0
+                    kd_only_common["qat_balance_max"] = 1.0
+                    kd_only_common["qat_balance_warmup_steps"] = 0
+                    kd_only_common["qat_balance_deploy_ramp_steps"] = 0
+                    kd_only_common["qat_balance_update_interval"] = 1
+                    specs.append(
+                        TrainSpec(
+                            study="B",
+                            variant="KdDepoly_half",
+                            mode="kd-deploy",
+                            model=student_model,
+                            project=data_root / "paper_runs" / dataset / "B_kd_vs_deploy",
+                            name=f"B_{dataset}_KdDepoly_half_seed{seed}",
+                            teacher_dir=teacher_dir,
+                            kd_loss_composition="fixed_kd_deploy",
+                            **kd_only_common,
+                        )
                     )
-                )
+
+                if include_b_pure_kd:
+                    pure_kd_common = dict(common)
+                    pure_kd_common["qat_kd_weight"] = None
+                    specs.append(
+                        TrainSpec(
+                            study="B",
+                            variant="pure_kd",
+                            mode="kd-deploy",
+                            model=student_model,
+                            project=data_root / "paper_runs" / dataset / "B_kd_vs_deploy",
+                            name=f"B_{dataset}_pure_kd_seed{seed}",
+                            teacher_dir=teacher_dir,
+                            kd_loss_composition="pure_kd",
+                            **pure_kd_common,
+                        )
+                    )
+
+                if include_b_kd_deploy:
+                    kd_deploy_common = dict(common)
+                    kd_deploy_common["qat_kd_weight"] = None
+                    if kd_deploy_common["qat_balance_max"] is None:
+                        kd_deploy_common["qat_balance_max"] = 1.25
+                    else:
+                        kd_deploy_common["qat_balance_max"] = min(float(kd_deploy_common["qat_balance_max"]), 1.25)
+                    if kd_deploy_common["qat_balance_warmup_steps"] is None:
+                        kd_deploy_common["qat_balance_warmup_steps"] = 4000
+                    else:
+                        kd_deploy_common["qat_balance_warmup_steps"] = max(int(kd_deploy_common["qat_balance_warmup_steps"]), 4000)
+                    if kd_deploy_common["qat_balance_deploy_ramp_steps"] is None:
+                        kd_deploy_common["qat_balance_deploy_ramp_steps"] = 1600
+                    else:
+                        kd_deploy_common["qat_balance_deploy_ramp_steps"] = max(
+                            int(kd_deploy_common["qat_balance_deploy_ramp_steps"]), 1600
+                        )
+                    if kd_deploy_common["qat_balance_update_interval"] is None:
+                        kd_deploy_common["qat_balance_update_interval"] = 20
+                    else:
+                        kd_deploy_common["qat_balance_update_interval"] = max(
+                            int(kd_deploy_common["qat_balance_update_interval"]), 20
+                        )
+                    specs.append(
+                        TrainSpec(
+                            study="B",
+                            variant="kd_deploy",
+                            mode="kd-deploy",
+                            model=student_model,
+                            project=data_root / "paper_runs" / dataset / "B_kd_vs_deploy",
+                            name=f"B_{dataset}_kd_deploy_seed{seed}",
+                            teacher_dir=teacher_dir,
+                            kd_loss_composition="dynamic_kd_deploy",
+                            **kd_deploy_common,
+                        )
+                    )
     return specs
 
 
@@ -1054,26 +1368,133 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--export-fraction", type=float, default=0.25)
     parser.add_argument(
+        "--eval-tflite-map",
+        action="store_true",
+        help="Evaluate exported TFLite (FP32/INT8) via Ultralytics val() and write mAP into CSV.",
+    )
+    parser.add_argument(
+        "--tflite-map-split",
+        type=str,
+        default="val",
+        choices=["train", "val", "test"],
+        help="Dataset split used for TFLite mAP evaluation.",
+    )
+    parser.add_argument(
         "--qat-kd-weight",
         type=float,
         default=None,
         help="Optional fixed alpha_kd passed to kd-deploy runs.",
     )
+
+    # Study-B extra variant
+    parser.add_argument(
+        "--include-b-kd-only",
+        dest="include_b_kd_only",
+        action="store_true",
+        help="Include Study-B variant 'KdDepoly_half' (fixed alpha KD+deploy; deprecated kd_only alias).",
+    )
+    # Backward-compatible alias
+    parser.add_argument("--include-kd-only", dest="include_b_kd_only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--include-b-pure-kd",
+        action="store_true",
+        help="Include Study-B variant 'pure_kd' (reserved for true pure-KD mode).",
+    )
+    parser.add_argument(
+        "--include-b-deploy-only",
+        action="store_true",
+        help="Include Study-B variant 'deploy_only' (original loss, no KD).",
+    )
+    parser.add_argument(
+        "--include-b-kd-deploy",
+        action="store_true",
+        help="Include Study-B variant 'kd_deploy' (dynamic KD+deploy balancing).",
+    )
+    parser.add_argument(
+        "--b-kd-only-weight",
+        type=float,
+        default=1.0,
+        help="Fixed alpha for Study-B 'KdDepoly_half' variant (default=1.0).",
+    )
+    parser.add_argument(
+        "--b-delta-baseline",
+        type=str,
+        default="deploy_only",
+        choices=["deploy_only", "kd_only", "KdDepoly_half", "pure_kd", "kd_deploy"],
+        help="Baseline variant for Study-B delta report.",
+    )
+
+    # KD distillation specifics (forward to train_pose.py; used in kd-deploy runs)
+    parser.add_argument("--qat-kd-temperature", type=float, default=1.0)
+    parser.add_argument("--qat-kd-cls-distill", type=str, default="bce", choices=["bce", "softmax_kl"])
+    parser.add_argument("--qat-kd-dfl-distill", type=str, default="kldiv", choices=["kldiv", "smoothl1"])
+    parser.add_argument("--qat-kd-fg-threshold", type=float, default=0.0)
+    parser.add_argument("--qat-kd-fg-topk", type=int, default=0)
+    parser.add_argument("--qat-kd-fg-min-pos", type=int, default=0)
+    parser.add_argument("--qat-kd-fg-apply-to", type=str, default="cls", choices=["cls", "dfl", "both"])
+
     parser.add_argument(
         "--qat-balance-log-interval",
         type=int,
         default=50,
         help="Step interval for KD scalars logging in kd-deploy runs.",
     )
-    parser.add_argument("--qat-balance-min", type=float, default=None)
-    parser.add_argument("--qat-balance-max", type=float, default=None)
-    parser.add_argument("--qat-balance-warmup-steps", type=int, default=None)
-    parser.add_argument("--qat-balance-max-step-change", type=float, default=None)
-    parser.add_argument("--qat-balance-adapt-power", type=float, default=None)
-    parser.add_argument("--qat-balance-strategy", type=str, default=None, help="Strategy: e.g. grad_norm")
-    parser.add_argument("--qat-balance-shared-group", type=str, default=None, help="Shared group: e.g. head")
-    parser.add_argument("--qat-balance-deploy-ramp-steps", type=int, default=None, help="Ramp up steps for deployment loss")
-    parser.add_argument("--qat-balance-update-interval", type=int, default=None, help="Interval for balance updates")
+    parser.add_argument(
+        "--qat-balance-min",
+        type=float,
+        default=0.2,
+        help="Lower bound for alpha_kd (must be >= 0).",
+    )
+    parser.add_argument(
+        "--qat-balance-max",
+        type=float,
+        default=5.0,
+        help="Upper bound for alpha_kd (must be >= qat-balance-min).",
+    )
+    parser.add_argument(
+        "--qat-balance-warmup-steps",
+        type=int,
+        default=0,
+        help="Number of initial steps to keep balance weights unchanged.",
+    )
+    parser.add_argument(
+        "--qat-balance-max-step-change",
+        type=float,
+        default=1.2,
+        help="Maximum multiplicative change per update step (must be >= 1).",
+    )
+    parser.add_argument(
+        "--qat-balance-adapt-power",
+        type=float,
+        default=0.5,
+        help="Smoothing factor for dynamic balancing updates, must be in (0,1].",
+    )
+    parser.add_argument(
+        "--qat-balance-strategy",
+        type=str,
+        default="grad_norm",
+        choices=["grad_norm", "dwa", "ratio"],
+        help="Balancing strategy in kd-deploy mode.",
+    )
+    parser.add_argument(
+        "--qat-balance-shared-group",
+        type=str,
+        default="head",
+        choices=["head", "all"],
+        help="Shared parameter group used by grad-norm balancing.",
+    )
+    parser.add_argument(
+        "--qat-balance-deploy-ramp-steps",
+        type=int,
+        default=1000,
+        help="Ramp up steps for deployment loss (must be >= 0).",
+    )
+    parser.add_argument(
+        "--qat-balance-update-interval",
+        type=int,
+        default=10,
+        help="Interval (steps) for balance updates (must be >= 1).",
+    )
     parser.add_argument("--device-acc", type=str, default="0")
     parser.add_argument("--device-kitti", type=str, default="1")
     parser.add_argument("--seeds", type=str, default="0,1,2")
@@ -1113,7 +1534,32 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=str(QAT_ROOT / "ultralytics/cfg/models/Yojui/yolov8_CIRA-Lite.yaml"),
     )
-    # Study A additional baselines (optional; if empty, will not be included)
+    parser.add_argument(
+        "--include-a-cira",
+        action="store_true",
+        help="Include Study-A CIRA variant (acc and kitti).",
+    )
+    parser.add_argument(
+        "--include-a-kitti-cira-lite",
+        action="store_true",
+        help="Include Study-A KITTI cira-lite variant.",
+    )
+    parser.add_argument(
+        "--include-a-kitti-mobilenetv3",
+        action="store_true",
+        help="Include Study-A KITTI mobilenetv3 variant.",
+    )
+    parser.add_argument(
+        "--include-a-kitti-ghostnetv2",
+        action="store_true",
+        help="Include Study-A KITTI ghostnetv2 variant.",
+    )
+    parser.add_argument(
+        "--include-a-kitti-shufflenetv2",
+        action="store_true",
+        help="Include Study-A KITTI shufflenetv2 variant.",
+    )
+    # Study A additional baselines (optional model paths)
     parser.add_argument("--kitti-mobilenetv3-model", type=str, default="")
     parser.add_argument("--kitti-ghostnetv2-model", type=str, default="")
     parser.add_argument("--kitti-shufflenetv2-model", type=str, default="")
@@ -1154,9 +1600,9 @@ def main() -> None:
         raise ValueError(
             f"--qat-balance-max-step-change must be >= 1.0, got {args.qat_balance_max_step_change}"
         )
-    if args.qat_balance_adapt_power is not None and float(args.qat_balance_adapt_power) <= 0.0:
+    if args.qat_balance_adapt_power is not None and not (0.0 < float(args.qat_balance_adapt_power) <= 1.0):
         raise ValueError(
-            f"--qat-balance-adapt-power must be > 0, got {args.qat_balance_adapt_power}"
+            f"--qat-balance-adapt-power must be in (0,1], got {args.qat_balance_adapt_power}"
         )
 
     data_root = Path(args.data_root).resolve()
@@ -1168,12 +1614,45 @@ def main() -> None:
     datasets = _parse_csv_list(args.datasets)
     studies = _parse_csv_list(args.studies)
     seeds = _parse_seeds(args.seeds)
+
+    # KD args validation (defensive; keeps paper runner fail-fast)
+    if float(args.qat_kd_temperature) <= 0.0:
+        raise ValueError(f"--qat-kd-temperature must be > 0, got {args.qat_kd_temperature}")
+    thr = float(args.qat_kd_fg_threshold)
+    if not (0.0 <= thr <= 1.0):
+        raise ValueError(f"--qat-kd-fg-threshold must be in [0,1], got {args.qat_kd_fg_threshold}")
+    if int(args.qat_kd_fg_topk) < 0:
+        raise ValueError(f"--qat-kd-fg-topk must be >= 0, got {args.qat_kd_fg_topk}")
+    if int(args.qat_kd_fg_min_pos) < 0:
+        raise ValueError(f"--qat-kd-fg-min-pos must be >= 0, got {args.qat_kd_fg_min_pos}")
+    if args.include_b_kd_only and float(args.b_kd_only_weight) < 0.0:
+        raise ValueError(f"--b-kd-only-weight must be >= 0, got {args.b_kd_only_weight}")
+
     for dataset in datasets:
         if dataset not in {"acc", "kitti"}:
             raise ValueError(f"Unsupported dataset: {dataset}")
     for study in studies:
         if study not in {"A", "B"}:
             raise ValueError(f"Unsupported study: {study}")
+
+    if args.include_a_kitti_mobilenetv3 and not str(args.kitti_mobilenetv3_model).strip():
+        raise ValueError("--include-a-kitti-mobilenetv3 requires --kitti-mobilenetv3-model")
+    if args.include_a_kitti_ghostnetv2 and not str(args.kitti_ghostnetv2_model).strip():
+        raise ValueError("--include-a-kitti-ghostnetv2 requires --kitti-ghostnetv2-model")
+    if args.include_a_kitti_shufflenetv2 and not str(args.kitti_shufflenetv2_model).strip():
+        raise ValueError("--include-a-kitti-shufflenetv2 requires --kitti-shufflenetv2-model")
+
+    selected_b_variants = [
+        bool(args.include_b_deploy_only),
+        bool(args.include_b_kd_only),
+        bool(args.include_b_pure_kd),
+        bool(args.include_b_kd_deploy),
+    ]
+    if "B" in studies and not any(selected_b_variants):
+        raise ValueError(
+            "Study-B requested but no variant selected. Add one or more of "
+            "--include-b-deploy-only / --include-b-kd-only / --include-b-pure-kd / --include-b-kd-deploy."
+        )
 
     if args.smoke:
         logging.info("[Smoke] Applying smoke defaults (epochs=1, batch=2, workers=0, single seed)")
@@ -1185,28 +1664,33 @@ def main() -> None:
 
     acc_yaml = QAT_ROOT / "dataset/lanepose-carkeypoint.yaml"
     kitti_yaml = QAT_ROOT / "dataset/KITTI.yaml"
-    optional_a_models: list[Path] = []
-    if str(args.kitti_mobilenetv3_model).strip():
-        optional_a_models.append(Path(args.kitti_mobilenetv3_model))
-    if str(args.kitti_ghostnetv2_model).strip():
-        optional_a_models.append(Path(args.kitti_ghostnetv2_model))
-    if str(args.kitti_shufflenetv2_model).strip():
-        optional_a_models.append(Path(args.kitti_shufflenetv2_model))
-    if str(args.kitti_cira_lite_model).strip():
-        optional_a_models.append(Path(args.kitti_cira_lite_model))
-
-    _require_paths(
-        [
-            QAT_ROOT / "train_pose.py",
-            acc_yaml,
-            kitti_yaml,
-            Path(args.acc_teacher),
-            Path(args.kitti_teacher_model),
-            Path(args.acc_student_model),
-            Path(args.kitti_student_model),
-        ]
-        + optional_a_models
+    kitti_teacher_provided = bool(args.kitti_teacher)
+    args.b_delta_baseline = _normalize_study_b_variant_name(str(args.b_delta_baseline))
+    needs_kd_teacher = "B" in studies and (
+        bool(args.include_b_kd_only) or bool(args.include_b_pure_kd) or bool(args.include_b_kd_deploy)
     )
+
+    required_paths: list[Path] = [
+        QAT_ROOT / "train_pose.py",
+        acc_yaml,
+        kitti_yaml,
+        Path(args.acc_student_model),
+        Path(args.kitti_student_model),
+    ]
+    if "B" in studies and "acc" in datasets and needs_kd_teacher:
+        required_paths.append(Path(args.acc_teacher))
+    if "B" in studies and "kitti" in datasets and needs_kd_teacher:
+        required_paths.append(Path(args.kitti_teacher_model))
+    if args.include_a_kitti_cira_lite and str(args.kitti_cira_lite_model).strip():
+        required_paths.append(Path(args.kitti_cira_lite_model))
+    if args.include_a_kitti_mobilenetv3 and str(args.kitti_mobilenetv3_model).strip():
+        required_paths.append(Path(args.kitti_mobilenetv3_model))
+    if args.include_a_kitti_ghostnetv2 and str(args.kitti_ghostnetv2_model).strip():
+        required_paths.append(Path(args.kitti_ghostnetv2_model))
+    if args.include_a_kitti_shufflenetv2 and str(args.kitti_shufflenetv2_model).strip():
+        required_paths.append(Path(args.kitti_shufflenetv2_model))
+
+    _require_paths(required_paths)
 
     if args.smoke:
         smoke_root = data_root / "_smoke_data"
@@ -1216,14 +1700,13 @@ def main() -> None:
         logging.info("[Smoke] kitti yaml: %s", kitti_yaml)
 
     acc_teacher = Path(args.acc_teacher).resolve()
-    if not _teacher_pt_exists(acc_teacher):
+    if "B" in studies and "acc" in datasets and needs_kd_teacher and not _teacher_pt_exists(acc_teacher):
         raise FileNotFoundError(
             f"ACC teacher path exists but no .pt found under: {acc_teacher}"
         )
 
-    kitti_teacher_provided = bool(args.kitti_teacher)
     kitti_teacher = Path(args.kitti_teacher).resolve() if kitti_teacher_provided else None
-    if "B" in studies and "kitti" in datasets and (
+    if "B" in studies and "kitti" in datasets and needs_kd_teacher and (
         kitti_teacher is None or not _teacher_pt_exists(kitti_teacher)
     ):
         teacher_epochs = int(args.teacher_epochs) if int(args.teacher_epochs) > 0 else int(args.epochs)
@@ -1249,7 +1732,33 @@ def main() -> None:
             weight_decay=float(args.weight_decay),
             export_fraction=float(args.export_fraction),
             qat_kd_weight=None,
+            qat_kd_temperature=float(args.qat_kd_temperature),
+            qat_kd_cls_distill=str(args.qat_kd_cls_distill),
+            qat_kd_dfl_distill=str(args.qat_kd_dfl_distill),
+            qat_kd_fg_threshold=float(args.qat_kd_fg_threshold),
+            qat_kd_fg_topk=int(args.qat_kd_fg_topk),
+            qat_kd_fg_min_pos=int(args.qat_kd_fg_min_pos),
+            qat_kd_fg_apply_to=str(args.qat_kd_fg_apply_to),
             qat_balance_log_interval=int(args.qat_balance_log_interval),
+            qat_balance_min=(None if args.qat_balance_min is None else float(args.qat_balance_min)),
+            qat_balance_max=(None if args.qat_balance_max is None else float(args.qat_balance_max)),
+            qat_balance_warmup_steps=(
+                None if args.qat_balance_warmup_steps is None else int(args.qat_balance_warmup_steps)
+            ),
+            qat_balance_max_step_change=(
+                None if args.qat_balance_max_step_change is None else float(args.qat_balance_max_step_change)
+            ),
+            qat_balance_adapt_power=(
+                None if args.qat_balance_adapt_power is None else float(args.qat_balance_adapt_power)
+            ),
+            qat_balance_strategy=args.qat_balance_strategy,
+            qat_balance_shared_group=args.qat_balance_shared_group,
+            qat_balance_deploy_ramp_steps=(
+                None if args.qat_balance_deploy_ramp_steps is None else int(args.qat_balance_deploy_ramp_steps)
+            ),
+            qat_balance_update_interval=(
+                None if args.qat_balance_update_interval is None else int(args.qat_balance_update_interval)
+            ),
             project=data_root / "paper_runs" / "kitti" / "teacher",
             name=f"B_kitti_teacher_seed{seeds[0]}",
             teacher_dir=None,
@@ -1260,9 +1769,11 @@ def main() -> None:
             _run_train_with_retry(teacher_spec, dry_run=args.dry_run)
         kitti_teacher = teacher_spec.run_dir
 
-    if "B" in studies and "kitti" in datasets and kitti_teacher is None:
+    if "B" in studies and "kitti" in datasets and needs_kd_teacher and kitti_teacher is None:
         raise ValueError("KITTI teacher is required for study B")
     if (
+        needs_kd_teacher
+        and
         kitti_teacher is not None
         and (not args.dry_run or kitti_teacher_provided)
         and not _teacher_pt_exists(kitti_teacher)
@@ -1290,7 +1801,7 @@ def main() -> None:
         acc_data=acc_yaml,
         kitti_data=kitti_yaml,
         acc_teacher=acc_teacher,
-        kitti_teacher=(kitti_teacher or Path(args.acc_teacher).resolve()),
+        kitti_teacher=(kitti_teacher or Path(args.kitti_student_model).resolve()),
         kitti_student_model=Path(args.kitti_student_model).resolve(),
         acc_student_model=Path(args.acc_student_model).resolve(),
         kitti_mobilenetv3_model=(
@@ -1316,6 +1827,25 @@ def main() -> None:
         qat_kd_weight=(
             None if args.qat_kd_weight is None else float(args.qat_kd_weight)
         ),
+
+        qat_kd_temperature=float(args.qat_kd_temperature),
+        qat_kd_cls_distill=str(args.qat_kd_cls_distill),
+        qat_kd_dfl_distill=str(args.qat_kd_dfl_distill),
+        qat_kd_fg_threshold=float(args.qat_kd_fg_threshold),
+        qat_kd_fg_topk=int(args.qat_kd_fg_topk),
+        qat_kd_fg_min_pos=int(args.qat_kd_fg_min_pos),
+        qat_kd_fg_apply_to=str(args.qat_kd_fg_apply_to),
+        include_a_cira=bool(args.include_a_cira),
+        include_a_kitti_cira_lite=bool(args.include_a_kitti_cira_lite),
+        include_a_kitti_mobilenetv3=bool(args.include_a_kitti_mobilenetv3),
+        include_a_kitti_ghostnetv2=bool(args.include_a_kitti_ghostnetv2),
+        include_a_kitti_shufflenetv2=bool(args.include_a_kitti_shufflenetv2),
+        include_b_deploy_only=bool(args.include_b_deploy_only),
+        include_b_kd_only=bool(args.include_b_kd_only),
+        include_b_pure_kd=bool(args.include_b_pure_kd),
+        include_b_kd_deploy=bool(args.include_b_kd_deploy),
+        b_kd_only_weight=float(args.b_kd_only_weight),
+
         qat_balance_log_interval=int(args.qat_balance_log_interval),
         qat_balance_min=(None if args.qat_balance_min is None else float(args.qat_balance_min)),
         qat_balance_max=(None if args.qat_balance_max is None else float(args.qat_balance_max)),
@@ -1377,6 +1907,12 @@ def main() -> None:
         export_err = ""
         contract_err = ""
         latency_err = ""
+        tflite_map_ok = False
+        tflite_map_err = "" if args.eval_tflite_map else "disabled (--eval-tflite-map not set)"
+        map50_fp32_tflite = float("nan")
+        map50_95_fp32_tflite = float("nan")
+        map50_int8_tflite = float("nan")
+        map50_95_int8_tflite = float("nan")
         artifact_dir = ""
         artifact_best_pt = ""
         artifact_fp32_tflite = ""
@@ -1425,6 +1961,33 @@ def main() -> None:
                 contract_err = repr(e)
                 logging.error(f"[Contract Failed] {spec.name}@{spec.imgsz}: {e}")
  
+            # tflite mAP：不應被 contract/latency 失敗牽連
+            if args.eval_tflite_map and export_ok:
+                try:
+                    out_dir = exports_dir / "tflite_val"
+                    map50_fp32_tflite, map50_95_fp32_tflite = _val_tflite_map(
+                        model_path=fp32_copy,
+                        task=spec.task,
+                        data_yaml=spec.data_yaml,
+                        imgsz=spec.imgsz,
+                        split=args.tflite_map_split,
+                        out_dir=out_dir,
+                        name="fp32",
+                    )
+                    map50_int8_tflite, map50_95_int8_tflite = _val_tflite_map(
+                        model_path=int8_copy,
+                        task=spec.task,
+                        data_yaml=spec.data_yaml,
+                        imgsz=spec.imgsz,
+                        split=args.tflite_map_split,
+                        out_dir=out_dir,
+                        name="int8",
+                    )
+                    tflite_map_ok = True
+                except Exception as e:
+                    tflite_map_err = repr(e)
+                    logging.error(f"[TFLite mAP Failed] {spec.name}@{spec.imgsz}: {e}")
+ 
 
         except Exception as e:
             # Capture specific export failures (e.g., CIRA ONNX issues) without stopping the whole script
@@ -1450,6 +2013,21 @@ def main() -> None:
 
         map50_95 = _read_map_metric(run_dir, task=spec.task)
 
+
+        kd_stats: dict[str, float] = {
+            "kd_log_steps": float("nan"),
+            "alpha_kd_min": float("nan"),
+            "alpha_kd_median": float("nan"),
+            "alpha_kd_max": float("nan"),
+            "alpha_kd_sat_ratio": float("nan"),
+            "grad_ratio_median": float("nan"),
+        }
+        if spec.mode == "kd-deploy":
+            log_path = _find_latest_attempt_log(spec)
+            max_w = float(spec.qat_balance_max) if spec.qat_balance_max is not None else 5.0
+            kd_stats = _parse_kd_stats_from_log(log_path=log_path, max_weight=max_w)
+ 
+
         rows.append(
             {
                 "run_ts": run_ts,
@@ -1469,9 +2047,16 @@ def main() -> None:
                 "artifact_int8_tflite": artifact_int8_tflite,
                 "artifact_err": artifact_err,
                 "map50_95": map50_95,
+                **kd_stats,
                 "lat_fp32_ms": lat_fp32_ms,
                 "lat_int8_ms": lat_int8_ms,
                 "contract_jitter": contract_jitter,
+                "tflite_map_ok": tflite_map_ok,
+                "tflite_map_err": tflite_map_err,
+                "map50_fp32_tflite": map50_fp32_tflite,
+                "map50_95_fp32_tflite": map50_95_fp32_tflite,
+                "map50_int8_tflite": map50_int8_tflite,
+                "map50_95_int8_tflite": map50_95_int8_tflite,
                 "export_ok": export_ok,
                 "contract_ok": contract_ok,
                 "latency_ok": latency_ok,
@@ -1489,7 +2074,11 @@ def main() -> None:
     _write_csv(merged_rows, all_runs_csv)
 
     delta_a = _compute_deltas(merged_rows, "A")
-    delta_b = _compute_deltas(merged_rows, "B")
+    delta_b = _compute_deltas_with_baseline(
+        merged_rows,
+        "B",
+        baseline_variant=str(args.b_delta_baseline),
+    )
     _write_csv(delta_a, report_root / "delta_A.csv")
     _write_csv(delta_b, report_root / "delta_B.csv")
 
@@ -1509,15 +2098,19 @@ def main() -> None:
         report_lines.append(
             f"- {row['dataset']} seed={row['seed']} lhs={row['lhs']}: "
             f"delta_map50_95={row['delta_map50_95']:.6f}, "
+            f"delta_int8_map50={row['delta_int8_map50']:.6f}, "
+            f"delta_int8_map50_95={row['delta_int8_map50_95']:.6f}, "
             f"delta_int8_latency_ms={row['delta_int8_latency_ms']:.6f}, "
             f"delta_contract_jitter={row['delta_contract_jitter']:.6f}"
         )
     report_lines.append("")
-    report_lines.append("## Delta B (KD+deploy - deploy-only)")
+    report_lines.append(f"## Delta B (lhs - {args.b_delta_baseline})")
     for row in delta_b:
         report_lines.append(
             f"- {row['dataset']} seed={row['seed']}: "
             f"delta_map50_95={row['delta_map50_95']:.6f}, "
+            f"delta_int8_map50={row['delta_int8_map50']:.6f}, "
+            f"delta_int8_map50_95={row['delta_int8_map50_95']:.6f}, "
             f"delta_int8_latency_ms={row['delta_int8_latency_ms']:.6f}, "
             f"delta_contract_jitter={row['delta_contract_jitter']:.6f}"
         )

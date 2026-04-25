@@ -1314,10 +1314,9 @@ class TopologicalOffsetPrior(nn.Module):
             dx = F.interpolate(dx, size=out_hw, mode="bilinear", align_corners=False)
 
         rep = self.dg * self.k * self.k
-        dy_rep = dy.repeat(1, rep, 1, 1)
-        dx_rep = dx.repeat(1, rep, 1, 1)
-
-        prior = torch.stack([dy_rep, dx_rep], dim=2).reshape(b, 2 * rep, out_hw[0], out_hw[1])
+        # Why: TensorRT 8.6 can mis-infer the 5D stack->reshape export here. Build the
+        # interleaved [dy, dx, dy, dx, ...] channels directly in 4D to keep ONNX simpler.
+        prior = torch.cat([dy, dx], dim=1).repeat(1, rep, 1, 1)
         return prior.to(dtype=feat.dtype)
 
 
@@ -1440,7 +1439,7 @@ class ConformableConv2d(nn.Module):
         self.mode = mode
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.mode == "baseline" or (not self.deform_enabled):
+        if self.mode == "baseline" or (not self.deform_enabled) or self.force_fallback:
             return F.conv2d(x, self.weight, self.bias, stride=self.s, padding=self.p, dilation=self.d, groups=self.g)
 
         feat = self.tpg(x)

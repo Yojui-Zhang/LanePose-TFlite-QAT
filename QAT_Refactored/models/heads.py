@@ -1,6 +1,6 @@
 import tensorflow as tf
-from tensorflow import keras as K
-from tensorflow.keras import layers as L
+import tf_keras as K
+from tf_keras import layers as L
 from typing import Tuple, List, Optional
 
 @K.utils.register_keras_serializable(package="QAT")
@@ -42,14 +42,10 @@ class TeacherCompatHead(L.Layer):
            
         This matches C++ access: data[channel * NUM_BOXES + anchor_idx]
         """
-        # 1. BHWC -> BCHW
-        x = L.Permute((3, 1, 2))(x)
-        
-        # 2. Flatten spatial dims (H*W = N_stride)
-        # Note: We use dynamic reshape (-1) here to handle variable batch size, 
-        # but C dimension is fixed.
-        x = L.Reshape((self.C, -1))(x) 
-        return x
+        # Use pure tensor ops to avoid creating transient Keras layers in call().
+        x = tf.transpose(x, perm=[0, 3, 1, 2])  # BHWC -> BCHW
+        shape = tf.shape(x)
+        return tf.reshape(x, [shape[0], shape[1], shape[2] * shape[3]])
 
     def call(self, feats: Tuple[tf.Tensor, tf.Tensor, tf.Tensor]) -> tf.Tensor:
         """
@@ -73,7 +69,7 @@ class TeacherCompatHead(L.Layer):
         
         # 3. Concatenate all strides along Anchor dimension (Last dim)
         # Result: (B, C, N_total)
-        return L.Concatenate(axis=2, name=f"{self.name}/concat_anchors")([bcn3, bcn4, bcn5])
+        return tf.concat([bcn3, bcn4, bcn5], axis=2)
 
     def get_config(self):
         cfg = super().get_config()
@@ -132,7 +128,7 @@ class U8PoseCompatHead(L.Layer):
 
     def _to_bchw(self, t):
         # Keras (BHWC) -> Loss Expectation (BCHW)
-        return L.Permute((3, 1, 2))(t)
+        return tf.transpose(t, perm=[0, 3, 1, 2])
 
     def call(self, feats, training=False):
         p3, p4, p5 = feats
@@ -149,7 +145,7 @@ class U8PoseCompatHead(L.Layer):
             k = self.out_kpt[i](k)
 
             # Concatenate [Cls, Box] for consistency with loss function expectations
-            rc = L.Concatenate(axis=-1)([c, r])
+            rc = tf.concat([c, r], axis=-1)
             
             feats_out.append(self._to_bchw(rc))
             kpts_out.append(self._to_bchw(k))

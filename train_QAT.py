@@ -1,6 +1,7 @@
 # Source File: train_QAT.py
 import os
 import sys
+import argparse
 import math
 import random
 
@@ -32,7 +33,7 @@ from QAT_Refactored.utils.loading import try_load_keras_model
 from QAT_Refactored.utils.checks import validate_data_access
 from QAT_Refactored.data.pipeline import DataPipeline
 from QAT_Refactored.data.ultralytics_bridge import build_ultralytics_pose_data
-from QAT_Refactored.models.builder import build_student_qat
+from QAT_Refactored.core.backbone_selector import BackboneModelSet, resolve_backbone_model
 from QAT_Refactored.core.engine import Trainer
 from QAT_Refactored.core.exporter import Exporter
 
@@ -163,6 +164,18 @@ def construct_models(config: AppConfig) -> Tuple[tf.keras.Model, Optional[tf.ker
         logging.info("[Model] Teacher loaded.")
 
     # B. Build Student (QAT)
+    # TFMOT is only required for tf-legacy QAT construction. Keep this import local so
+    # Ultralytics routes can run in environments that intentionally omit tfmot.
+    try:
+        from QAT_Refactored.models.builder import build_student_qat
+    except ModuleNotFoundError as exc:
+        if exc.name == "tensorflow_model_optimization":
+            raise ModuleNotFoundError(
+                "TRAIN_ENGINE=tf-legacy requires tensorflow_model_optimization; "
+                "Ultralytics routes do not."
+            ) from exc
+        raise
+
     qat_model = build_student_qat(config)
     
     # C. Resume Weights
@@ -228,15 +241,30 @@ def _normalize_quant_mode(mode: str) -> str:
     raise ValueError(f"Unsupported TFLITE_QUANT_MODE: {mode}")
 
 
+def _resolve_ultra_model_source(config: AppConfig) -> tuple[str, str]:
+    return resolve_backbone_model(
+        backbone=str(config.ULTRA_BACKBONE),
+        task=str(config.ULTRA_TASK),
+        custom_model=str(config.ULTRA_MODEL),
+        models=BackboneModelSet(
+            yolo_pose=str(config.ULTRA_MODEL_YOLO_POSE),
+            yolo_detect=str(config.ULTRA_MODEL_YOLO_DETECT),
+            cira_pose=str(config.ULTRA_MODEL_CIRA_POSE),
+            cira_detect=str(config.ULTRA_MODEL_CIRA_DETECT),
+        ),
+    )
+
+
 def _build_ultralytics_train_overrides(config: AppConfig) -> dict[str, Any]:
     if config.DATA_YAML is None:
         raise ValueError("DATA_YAML is required for TRAIN_ENGINE=ultralytics")
 
+    model_source, backbone_mode = _resolve_ultra_model_source(config)
     run_dir = Path(config.OUTPUT_DIR)
     project = run_dir.parent if run_dir.parent != Path("") else Path(".")
 
     overrides: dict[str, Any] = {
-        "model": str(config.ULTRA_MODEL),
+        "model": model_source,
         "data": str(config.DATA_YAML),
         "task": str(config.ULTRA_TASK),
         "epochs": int(config.EPOCHS),
@@ -265,6 +293,12 @@ def _build_ultralytics_train_overrides(config: AppConfig) -> dict[str, Any]:
         "fraction": float(config.ULTRA_FRACTION),
         "close_mosaic": int(config.ULTRA_CLOSE_MOSAIC),
     }
+    logging.info(
+        "[train_QAT] backbone=%s task=%s model=%s",
+        backbone_mode,
+        str(config.ULTRA_TASK),
+        model_source,
+    )
     if config.ULTRA_OPTIMIZER is not None:
         overrides["optimizer"] = str(config.ULTRA_OPTIMIZER)
     if config.ULTRA_LR0 is not None:
@@ -297,11 +331,20 @@ def _export_ultralytics_tflite(best_pt: Path, config: AppConfig) -> tuple[Path, 
     elif quant_mode == "fp16":
         export_kwargs["half"] = True
 
+    onnx2tf_device = str(config.ULTRA_ONNX2TF_DEVICE).strip().lower()
+    if onnx2tf_device not in {"cpu", "gpu", "auto"}:
+        raise ValueError(
+            "ULTRA_ONNX2TF_DEVICE must be one of {'cpu', 'gpu', 'auto'}, "
+            f"got {config.ULTRA_ONNX2TF_DEVICE!r}"
+        )
+
     prev_export_date = os.environ.get("ULTRALYTICS_EXPORT_DATE")
+    prev_onnx2tf_device = os.environ.get("ULTRALYTICS_ONNX2TF_DEVICE")
     if config.ULTRA_EXPORT_DATE:
         os.environ["ULTRALYTICS_EXPORT_DATE"] = str(config.ULTRA_EXPORT_DATE)
     else:
         os.environ.pop("ULTRALYTICS_EXPORT_DATE", None)
+    os.environ["ULTRALYTICS_ONNX2TF_DEVICE"] = onnx2tf_device
     try:
         export_model = YOLO(str(best_pt), task=str(config.ULTRA_TASK))
         export_path = Path(str(export_model.export(**export_kwargs)))
@@ -310,6 +353,10 @@ def _export_ultralytics_tflite(best_pt: Path, config: AppConfig) -> tuple[Path, 
             os.environ.pop("ULTRALYTICS_EXPORT_DATE", None)
         else:
             os.environ["ULTRALYTICS_EXPORT_DATE"] = prev_export_date
+        if prev_onnx2tf_device is None:
+            os.environ.pop("ULTRALYTICS_ONNX2TF_DEVICE", None)
+        else:
+            os.environ["ULTRALYTICS_ONNX2TF_DEVICE"] = prev_onnx2tf_device
 
     aliases = _create_int8_export_aliases(export_path) if quant_mode == "int8" else []
     return export_path, aliases
@@ -337,8 +384,9 @@ def _run_train_qat_ultralytics_original(config: AppConfig) -> None:
             "Switch QAT_LOSS_MODE='kd-deploy' to enable KD."
         )
 
-    yolo = YOLO(str(config.ULTRA_MODEL), task=str(config.ULTRA_TASK))
-    yolo.train(**_build_ultralytics_train_overrides(config))
+    train_overrides = _build_ultralytics_train_overrides(config)
+    yolo = YOLO(str(train_overrides["model"]), task=str(config.ULTRA_TASK))
+    yolo.train(**train_overrides)
     trainer = yolo.trainer
 
     best_pt = _resolve_best_or_last_ckpt(str(trainer.best), str(trainer.last))
@@ -401,8 +449,15 @@ def _run_train_qat_ultralytics_kd(config: AppConfig) -> None:
         ),
     )
     kd_cfg = KDLossConfig(
-        temperature=1.0,
+        temperature=float(config.KD_TEMPERATURE),
+        cls_distill=str(config.KD_CLS_DISTILL),
+        dfl_distill=str(config.KD_DFL_DISTILL),
+        fg_threshold=float(config.KD_FG_THRESHOLD),
+        fg_topk=int(config.KD_FG_TOPK),
+        fg_min_pos=int(config.KD_FG_MIN_POS),
+        fg_apply_to=str(config.KD_FG_APPLY_TO),
         aux_kd_head_label_loss=bool(config.AUX_KD_HEAD_LABEL_LOSS),
+        composition=str(config.ULTRA_KD_LOSS_COMPOSITION),
         balance=balance_cfg,
         log_interval_steps=int(config.KD_BALANCE_LOG_INTERVAL),
     )
@@ -531,9 +586,170 @@ def run_train_qat(config_overrides: Optional[dict[str, Any]] = None) -> None:
     logging.info(f"[Output] Results: {cfg.OUTPUT_DIR}")
 
 
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value!r}")
+
+
+def _coerce_override_value(key: str, raw_value: str) -> Any:
+    if not hasattr(cfg, key):
+        raise AttributeError(f"Unknown AppConfig field override: {key}")
+
+    path_fields = {
+        "DATA_ROOT",
+        "OUTPUT_DIR",
+        "EXPORTED_TEACHER_DIR",
+        "RESUME_WEIGHTS",
+        "DATA_YAML",
+        "ULTRA_EXPORT_DATA",
+    }
+    list_fields = {"TRAIN_PATTERNS", "VAL_PATTERNS"}
+    nullable_string_fields = {"VAL_PATTERN"}
+
+    text = str(raw_value).strip()
+    lowered = text.lower()
+    if lowered in {"none", "null"}:
+        if key in nullable_string_fields or key in path_fields:
+            return None
+        current = getattr(cfg, key)
+        if current is None:
+            return None
+
+    if key in path_fields:
+        return text
+
+    if key in list_fields:
+        if not text:
+            return []
+        return [item.strip() for item in text.split(",") if item.strip()]
+
+    if key in nullable_string_fields:
+        return text
+
+    current = getattr(cfg, key)
+    if isinstance(current, bool):
+        return _parse_bool(text)
+    if isinstance(current, int) and not isinstance(current, bool):
+        return int(text)
+    if isinstance(current, float):
+        return float(text)
+    if isinstance(current, Path):
+        return text
+    if isinstance(current, (list, tuple)):
+        return [item.strip() for item in text.split(",") if item.strip()]
+    if current is None:
+        if lowered in {"1", "true", "t", "yes", "y", "on", "0", "false", "f", "no", "n", "off"}:
+            return _parse_bool(text)
+        try:
+            return int(text)
+        except ValueError:
+            pass
+        try:
+            return float(text)
+        except ValueError:
+            pass
+    return text
+
+
+def _parse_assignment(expr: str) -> tuple[str, str]:
+    if "=" not in expr:
+        raise ValueError(f"Invalid --override format: {expr!r}. Expected KEY=VALUE.")
+    key, value = expr.split("=", 1)
+    key = key.strip()
+    if not key:
+        raise ValueError(f"Invalid --override format: {expr!r}. Key is empty.")
+    return key, value
+
+
+def _collect_cli_overrides(tokens: list[str]) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        if not token.startswith("--"):
+            raise ValueError(
+                f"Unexpected CLI token {token!r}. Expected --FIELD value or --FIELD=value."
+            )
+
+        payload = token[2:]
+        if not payload:
+            raise ValueError("Encountered empty flag '--'.")
+
+        if "=" in payload:
+            key, raw = payload.split("=", 1)
+        else:
+            key = payload
+            if idx + 1 < len(tokens) and not tokens[idx + 1].startswith("--"):
+                raw = tokens[idx + 1]
+                idx += 1
+            else:
+                raw = "true"
+
+        overrides[key] = _coerce_override_value(key, raw)
+        idx += 1
+    return overrides
+
+
+def _build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="train_QAT entrypoint. Pass AppConfig fields as --FIELD value."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Apply CLI overrides and validate config, then exit without training.",
+    )
+    parser.add_argument(
+        "--print-overrides",
+        action="store_true",
+        help="Print parsed AppConfig overrides before execution.",
+    )
+    parser.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Additional override (repeatable), e.g. --override ULTRA_TASK=detect",
+    )
+    return parser
+
+
+def _parse_cli_overrides(argv: list[str]) -> tuple[dict[str, Any], bool, bool]:
+    parser = _build_cli_parser()
+    args, unknown = parser.parse_known_args(argv)
+    overrides = _collect_cli_overrides(unknown)
+
+    for item in args.override:
+        key, value = _parse_assignment(item)
+        overrides[key] = _coerce_override_value(key, value)
+
+    return overrides, bool(args.dry_run), bool(args.print_overrides)
+
+
 def main() -> None:
     try:
-        run_train_qat()
+        cli_overrides, dry_run, print_overrides = _parse_cli_overrides(sys.argv[1:])
+
+        if print_overrides:
+            if cli_overrides:
+                logging.info("[train_QAT] CLI overrides: %s", cli_overrides)
+            else:
+                logging.info("[train_QAT] CLI overrides: <none>")
+
+        if dry_run:
+            if cli_overrides:
+                _apply_config_overrides(cfg, cli_overrides)
+            cfg.validate()
+            logging.info("[train_QAT] Dry-run config validation passed.")
+            return
+
+        run_train_qat(config_overrides=cli_overrides or None)
     except KeyboardInterrupt:
         logging.warning("\n[train_QAT] Interrupted by user.")
         sys.exit(0)

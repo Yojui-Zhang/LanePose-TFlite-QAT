@@ -1,29 +1,16 @@
-# One-click install:
-#   python -m pip install -r requirement.txt
+# Shared dependencies for all modes.
 #
-# NOTE:
-# - onnx_graphsurgeon is distributed on NVIDIA index as well.
-# - If your environment is offline, installation will fail until network is available.
---extra-index-url https://pypi.ngc.nvidia.com
+# Choose ONE profile per environment:
+# 1) Ultralytics profile:
+#    python -m pip install -r requirement.txt -r requirements.ultralytics.txt
+# 2) TensorFlow legacy QAT profile:
+#    python -m pip install -r requirement.txt -r requirements.qat-tflegacy.txt
+#
+# Do not install both profiles in the same environment.
 
-# Core
-numpy
-pandas
-opencv-python
-tqdm
-matplotlib
-pyyaml
-protobuf>=5
-
-# TensorFlow / QAT stack
-tensorflow-model-optimization==0.8.0
-tf-keras>=2.15.0
-
-# Ultralytics TFLite export stack (Route 2)
-onnx>=1.12.0,<1.18.0
-onnxruntime
-onnx2tf>=1.26.3
-onnxslim>=0.1.59
-sng4onnx>=1.0.1
-onnx_graphsurgeon>=0.3.26
-ai-edge-litert>=1.2.0,<1.4.0
+numpy>=1.26,<2.0
+pandas>=2.1,<3.0
+opencv-python>=4.8,<5.0
+tqdm>=4.66,<5.0
+matplotlib>=3.8,<4.0
+pyyaml>=6.0,<7.0

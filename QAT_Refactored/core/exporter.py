@@ -1,3 +1,4 @@
+import os
 import tensorflow as tf
 import numpy as np
 import logging
@@ -5,7 +6,7 @@ from pathlib import Path
 from typing import Dict, Optional, Generator, Tuple, List, Set
 
 from QAT_Refactored.config.config import AppConfig
-from QAT_Refactored.models.layers import RepVGGBlock
+from QAT_Refactored.models.layers import DeformableDepthwiseConv2D, RepVGGBlock
 from QAT_Refactored.utils.tensor_layout import ensure_bcn_tf
 
 class ExportModule(tf.Module):
@@ -60,6 +61,18 @@ class Exporter:
         return None
 
     @staticmethod
+    def _unwrap_deform(layer: tf.keras.layers.Layer) -> Optional[tf.keras.layers.Layer]:
+        candidates: List[tf.keras.layers.Layer] = [layer]
+        for attr in ("layer", "_layer", "wrapped_layer", "inner_layer"):
+            inner = getattr(layer, attr, None)
+            if isinstance(inner, tf.keras.layers.Layer):
+                candidates.append(inner)
+        for cand in candidates:
+            if isinstance(cand, DeformableDepthwiseConv2D):
+                return cand
+        return None
+
+    @staticmethod
     def _iter_children(layer: tf.keras.layers.Layer) -> List[tf.keras.layers.Layer]:
         # Why: Keras container 用 .layers；wrapper 常用 .layer；統一遞迴入口避免漏掃。
         children: List[tf.keras.layers.Layer] = []
@@ -90,10 +103,12 @@ class Exporter:
 
         logging.info("[Exporter] Fusing RepVGG Blocks...")
         fused_count = 0
+        deform_fallback_count = 0
         visited: Set[int] = set()
+        deform_seen: Set[int] = set()
 
         def _fuse_layer(layer: tf.keras.layers.Layer) -> None:
-            nonlocal fused_count
+            nonlocal fused_count, deform_fallback_count
 
             lid = id(layer)
             if lid in visited:
@@ -105,6 +120,13 @@ class Exporter:
                 if hasattr(rep, "switch_to_deploy"):
                     rep.switch_to_deploy()
                     fused_count += 1
+            deform = self._unwrap_deform(layer)
+            if deform is not None and hasattr(deform, "switch_to_fallback"):
+                did = id(deform)
+                if did not in deform_seen and not bool(getattr(deform, "force_fallback", False)):
+                    deform.switch_to_fallback()
+                    deform_seen.add(did)
+                    deform_fallback_count += 1
 
             for sub in self._iter_children(layer):
                 _fuse_layer(sub)
@@ -116,6 +138,11 @@ class Exporter:
             logging.warning("[Exporter] ⚠️ No RepVGGBlocks found to fuse.")
         else:
             logging.info(f"[Exporter] Successfully fused {fused_count} blocks.")
+        if deform_fallback_count > 0:
+            logging.info(
+                "[Exporter] Enabled export fallback (standard depthwise) for %d deform layers.",
+                deform_fallback_count,
+            )
 
 
     def export_saved_model(self, model: tf.keras.Model, output_path: Path) -> None:
@@ -203,8 +230,7 @@ class Exporter:
         - Input:  (1, H, W, 3) float32 (RGB, NHWC)
         - Output: (1, C, N) float32 where C=4+NUM_CLASS+NUM_KPT*3 and N=NUM_BOXES
         """
-        interpreter = tf.lite.Interpreter(model_path=str(model_path))
-        interpreter.allocate_tensors()
+        interpreter = self._build_contract_interpreter(model_path)
 
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
@@ -263,3 +289,39 @@ class Exporter:
             "[Exporter] TFLite contract validated for TFlite.h "
             f"(input={in_shape}, output={out_shape}, range=[{ymin:.4f}, {ymax:.4f}])."
         )
+
+    @staticmethod
+    def _build_contract_interpreter(model_path: Path) -> tf.lite.Interpreter:
+        """
+        Contract validation should not fail only because an optional CPU delegate
+        (e.g. XNNPACK) is unavailable in the runtime environment.
+        """
+        interpreter = tf.lite.Interpreter(model_path=str(model_path))
+        try:
+            interpreter.allocate_tensors()
+            return interpreter
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if "xnnpack" not in message:
+                raise
+            logging.warning(
+                "[Exporter] XNNPACK allocate_tensors failed during contract check; "
+                "retrying without delegates."
+            )
+            os.environ["TF_LITE_DISABLE_XNNPACK"] = "1"
+            try:
+                fallback = tf.lite.Interpreter(
+                    model_path=str(model_path),
+                    experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_REF,
+                    num_threads=1,
+                )
+                fallback.allocate_tensors()
+                return fallback
+            except Exception:
+                fallback = tf.lite.Interpreter(
+                    model_path=str(model_path),
+                    experimental_delegates=[],
+                    num_threads=1,
+                )
+                fallback.allocate_tensors()
+                return fallback

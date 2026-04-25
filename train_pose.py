@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import Any, Sequence
 
+from QAT_Refactored.core.backbone_selector import BackboneModelSet, resolve_backbone_model
 from QAT_Refactored.core.ultralytics_route2 import (
     UltralyticsExportConfig,
     UltralyticsRoute2Runner,
@@ -100,6 +101,35 @@ def _read_qat_patterns_from_data_yaml(data_yaml: str) -> tuple[list[str], list[s
     return train_patterns, val_patterns, raw
 
 
+def _infer_task_from_data_yaml(data_yaml: str) -> str:
+    _, _, raw = _read_qat_patterns_from_data_yaml(data_yaml)
+    return "pose" if isinstance(raw.get("kpt_shape"), (list, tuple)) else "detect"
+
+
+def _resolve_backbone_model_from_args(
+    args: argparse.Namespace,
+    task: str | None,
+) -> tuple[str, str]:
+    requested = str(args.qat_backbone).strip().lower()
+    if requested == "auto":
+        source = str(args.model).strip()
+        if not source:
+            raise ValueError("--model must be non-empty when --qat-backbone=auto")
+        return source, "custom"
+
+    return resolve_backbone_model(
+        backbone=requested,
+        task=task,
+        custom_model=str(args.model),
+        models=BackboneModelSet(
+            yolo_pose=str(args.qat_yolo_pose_model),
+            yolo_detect=str(args.qat_yolo_detect_model),
+            cira_pose=str(args.qat_cira_pose_model),
+            cira_detect=str(args.qat_cira_detect_model),
+        ),
+    )
+
+
 def _build_kd_deploy_overrides(args: argparse.Namespace, imgsz: tuple[int, int]) -> tuple[dict[str, Any], dict[str, Any]]:
     if imgsz[0] != imgsz[1]:
         raise ValueError("kd-deploy mode requires square --imgsz because train_QAT uses single IMGSZ.")
@@ -115,6 +145,7 @@ def _build_kd_deploy_overrides(args: argparse.Namespace, imgsz: tuple[int, int])
             "kd-deploy mode currently supports --task pose or --task detect, "
             f"got {requested_task!r}."
         )
+    model_source, backbone_mode = _resolve_backbone_model_from_args(args, requested_task)
 
     balance_strategy = str(args.qat_balance_strategy).strip().lower()
     if balance_strategy not in {"grad_norm", "dwa", "ratio"}:
@@ -156,8 +187,8 @@ def _build_kd_deploy_overrides(args: argparse.Namespace, imgsz: tuple[int, int])
         )
 
     balance_adapt_power = float(args.qat_balance_adapt_power)
-    if balance_adapt_power <= 0.0:
-        raise ValueError(f"qat-balance-adapt-power must be > 0, got {balance_adapt_power}")
+    if not (0.0 < balance_adapt_power <= 1.0):
+        raise ValueError(f"qat-balance-adapt-power must be in (0,1], got {balance_adapt_power}")
 
     balance_renorm_sum = float(args.qat_balance_renorm_sum)
     if balance_renorm_sum <= 0.0:
@@ -172,6 +203,28 @@ def _build_kd_deploy_overrides(args: argparse.Namespace, imgsz: tuple[int, int])
         kd_weight = float(args.qat_kd_weight)
         if kd_weight < 0.0:
             raise ValueError(f"qat-kd-weight must be >= 0, got {kd_weight}")
+
+    kd_loss_composition = str(args.qat_kd_loss_composition).strip().lower()
+    if kd_loss_composition not in {"dynamic_kd_deploy", "fixed_kd_deploy", "pure_kd"}:
+        raise ValueError(
+            "qat-kd-loss-composition must be one of "
+            "{dynamic_kd_deploy, fixed_kd_deploy, pure_kd}, "
+            f"got {args.qat_kd_loss_composition}"
+        )
+
+    kd_temp = float(args.qat_kd_temperature)
+    if kd_temp <= 0.0:
+        raise ValueError(f"qat-kd-temperature must be > 0, got {kd_temp}")
+
+    fg_thr = float(args.qat_kd_fg_threshold)
+    if not (0.0 <= fg_thr <= 1.0):
+        raise ValueError(f"qat-kd-fg-threshold must be in [0,1], got {fg_thr}")
+    fg_topk = int(args.qat_kd_fg_topk)
+    if fg_topk < 0:
+        raise ValueError(f"qat-kd-fg-topk must be >= 0, got {fg_topk}")
+    fg_min_pos = int(args.qat_kd_fg_min_pos)
+    if fg_min_pos < 0:
+        raise ValueError(f"qat-kd-fg-min-pos must be >= 0, got {fg_min_pos}")
 
     balance_log_interval = int(args.qat_balance_log_interval)
     if balance_log_interval < 1:
@@ -234,7 +287,11 @@ def _build_kd_deploy_overrides(args: argparse.Namespace, imgsz: tuple[int, int])
             raise ValueError(f"weight-decay must be >= 0, got {weight_decay}")
 
     aux_kd_head_label_loss = bool(args.qat_aux_kd_head_label_loss)
-    if teacher_dir is None and not aux_kd_head_label_loss:
+    if kd_loss_composition == "pure_kd":
+        if teacher_dir is None:
+            raise ValueError("pure_kd requires --qat-teacher-exported-dir")
+        aux_kd_head_label_loss = False
+    elif teacher_dir is None and not aux_kd_head_label_loss:
         # Keep KD branch active when no teacher is provided.
         aux_kd_head_label_loss = True
 
@@ -253,7 +310,12 @@ def _build_kd_deploy_overrides(args: argparse.Namespace, imgsz: tuple[int, int])
         "QAT_LOSS_MODE": "kd-deploy",
         "DATA_BACKEND": "ultralytics",
         "DATA_YAML": str(Path(args.data).resolve()),
-        "ULTRA_MODEL": str(args.model),
+        "ULTRA_BACKBONE": backbone_mode,
+        "ULTRA_MODEL": model_source,
+        "ULTRA_MODEL_YOLO_POSE": str(args.qat_yolo_pose_model),
+        "ULTRA_MODEL_YOLO_DETECT": str(args.qat_yolo_detect_model),
+        "ULTRA_MODEL_CIRA_POSE": str(args.qat_cira_pose_model),
+        "ULTRA_MODEL_CIRA_DETECT": str(args.qat_cira_detect_model),
         "ULTRA_TASK": requested_task,
         "ULTRA_DEVICE": str(args.device),
         "ULTRA_NAME": f"{args.name}_qat",
@@ -281,6 +343,7 @@ def _build_kd_deploy_overrides(args: argparse.Namespace, imgsz: tuple[int, int])
         "TRAIN_SUPERVISION": train_supervision,
         "EXPORTED_TEACHER_DIR": teacher_dir,
         "AUX_KD_HEAD_LABEL_LOSS": aux_kd_head_label_loss,
+        "ULTRA_KD_LOSS_COMPOSITION": kd_loss_composition,
         "KD_BALANCE_STRATEGY": balance_strategy,
         "KD_BALANCE_SHARED_PARAM_GROUP": balance_shared_group,
         "KD_BALANCE_EMA_DECAY": balance_ema_decay,
@@ -295,6 +358,16 @@ def _build_kd_deploy_overrides(args: argparse.Namespace, imgsz: tuple[int, int])
         "KD_BALANCE_EPS": balance_eps,
         "KD_BALANCE_FIXED_KD_WEIGHT": kd_weight,
         "KD_BALANCE_LOG_INTERVAL": balance_log_interval,
+
+        # KD distillation specifics
+        "KD_TEMPERATURE": kd_temp,
+        "KD_CLS_DISTILL": str(args.qat_kd_cls_distill),
+        "KD_DFL_DISTILL": str(args.qat_kd_dfl_distill),
+        "KD_FG_THRESHOLD": fg_thr,
+        "KD_FG_TOPK": fg_topk,
+        "KD_FG_MIN_POS": fg_min_pos,
+        "KD_FG_APPLY_TO": str(args.qat_kd_fg_apply_to),
+    
         "OUTPUT_DIR": (Path(args.project) / f"{args.name}_qat"),
         "TFLITE_QUANT_MODE": quant_mode,
         "USE_AMP": False,
@@ -310,6 +383,8 @@ def _build_kd_deploy_overrides(args: argparse.Namespace, imgsz: tuple[int, int])
         overrides["KPT_VALS"] = int(kpt_shape[1])
 
     balance_info = {
+        "backbone": backbone_mode,
+        "model": model_source,
         "strategy": balance_strategy,
         "shared_group": balance_shared_group,
         "ema_decay": balance_ema_decay,
@@ -319,6 +394,7 @@ def _build_kd_deploy_overrides(args: argparse.Namespace, imgsz: tuple[int, int])
         "min_weight": balance_min,
         "max_weight": balance_max,
         "fixed_kd_weight": kd_weight,
+        "composition": kd_loss_composition,
         "log_interval": balance_log_interval,
     }
     return overrides, balance_info
@@ -352,6 +428,40 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="cfg/models/v8/yolov8-pose.yaml",
         help="Model source: .pt, .yaml, or built-in model name.",
+    )
+    parser.add_argument(
+        "--qat-backbone",
+        type=str,
+        default="auto",
+        choices=["auto", "yolo", "cira"],
+        help=(
+            "Backbone family switch for QAT routes. "
+            "'auto' uses --model directly; 'yolo'/'cira' resolve model yaml by task."
+        ),
+    )
+    parser.add_argument(
+        "--qat-yolo-pose-model",
+        type=str,
+        default="cfg/models/v8/yolov8-pose.yaml",
+        help="Model source used when --qat-backbone=yolo and task=pose.",
+    )
+    parser.add_argument(
+        "--qat-yolo-detect-model",
+        type=str,
+        default="cfg/models/v8/yolov8.yaml",
+        help="Model source used when --qat-backbone=yolo and task=detect.",
+    )
+    parser.add_argument(
+        "--qat-cira-pose-model",
+        type=str,
+        default="./ultralytics/cfg/models/Yojui/yolov8_CIRA-Pose.yaml",
+        help="Model source used when --qat-backbone=cira and task=pose.",
+    )
+    parser.add_argument(
+        "--qat-cira-detect-model",
+        type=str,
+        default="./ultralytics/cfg/models/Yojui/yolov8_CIRA-Lite.yaml",
+        help="Model source used when --qat-backbone=cira and task=detect.",
     )
     parser.add_argument(
         "--data",
@@ -512,7 +622,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--qat-balance-adapt-power",
         type=float,
         default=0.5,
-        help="Adaptation exponent used by dynamic balancing updates.",
+        help="Smoothing factor for dynamic balancing updates, must be in (0,1].",
     )
     parser.add_argument(
         "--qat-balance-renorm-sum",
@@ -532,6 +642,41 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional fixed KD weight alpha. When set, dynamic balancing updates are bypassed.",
     )
+    parser.add_argument(
+        "--qat-kd-loss-composition",
+        type=str,
+        default="dynamic_kd_deploy",
+        choices=["dynamic_kd_deploy", "fixed_kd_deploy", "pure_kd"],
+        help="Effective KD loss composition for kd-deploy route.",
+    )
+
+    # KD distillation specifics
+    parser.add_argument("--qat-kd-temperature", type=float, default=1.0, help="KD temperature (>0).")
+    parser.add_argument(
+        "--qat-kd-cls-distill",
+        type=str,
+        default="bce",
+        choices=["bce", "softmax_kl"],
+        help="CLS distillation: YOLO recommends bce (sigmoid multi-label).",
+    )
+    parser.add_argument(
+        "--qat-kd-dfl-distill",
+        type=str,
+        default="kldiv",
+        choices=["kldiv", "smoothl1"],
+        help="DFL distillation: kldiv matches distributional regression (reg_max bins).",
+    )
+    parser.add_argument("--qat-kd-fg-threshold", type=float, default=0.0, help="Foreground threshold in [0,1], 0 disables.")
+    parser.add_argument("--qat-kd-fg-topk", type=int, default=0, help="Foreground top-k locations per image, 0 disables.")
+    parser.add_argument("--qat-kd-fg-min-pos", type=int, default=0, help="Guarantee at least N locations per image, 0 disables.")
+    parser.add_argument(
+        "--qat-kd-fg-apply-to",
+        type=str,
+        default="cls",
+        choices=["cls", "dfl", "both"],
+        help="Apply foreground mask to cls/dfl/both KD losses.",
+    )
+
     parser.add_argument(
         "--qat-balance-log-interval",
         type=int,
@@ -582,9 +727,15 @@ def main() -> None:
         print(f"[Route2] output_dir: {out['output_dir']}")
         return
 
+    task_hint: str | None = str(args.task).strip().lower() if args.task is not None else None
+    if task_hint is None and str(args.qat_backbone).strip().lower() != "auto":
+        task_hint = _infer_task_from_data_yaml(args.data)
+    resolved_model, resolved_backbone = _resolve_backbone_model_from_args(args, task_hint)
+    route2_task = args.task if args.task is not None else task_hint
+
     train_cfg = UltralyticsTrainConfig(
         ultralytics_root=Path(args.ultralytics_root),
-        model=args.model,
+        model=resolved_model,
         data=args.data,
         epochs=args.epochs,
         batch=args.batch,
@@ -599,7 +750,7 @@ def main() -> None:
         resume=args.resume,
         exist_ok=not args.strict_run,
         cache=args.cache,
-        task=args.task,
+        task=route2_task,
         seed=int(args.seed),
         deterministic=not args.non_deterministic,
         close_mosaic=int(args.close_mosaic),
@@ -629,6 +780,8 @@ def main() -> None:
         print("[Route2] skip_train mode completed.")
     else:
         print("[Route2] training completed.")
+    print(f"[Route2] backbone: {resolved_backbone}")
+    print(f"[Route2] model: {resolved_model}")
     if "export_path" in out:
         print(f"[Route2] tflite: {out['export_path']}")
     if "export_aliases" in out:

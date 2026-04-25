@@ -1,6 +1,26 @@
 import os
 import sys
 import logging
+import warnings
+
+def _patch_protobuf_message_factory() -> None:
+    """
+    TensorFlow 2.15 still calls MessageFactory.GetPrototype(), but protobuf 6.x
+    removed that method. Add a small compatibility shim before importing TF.
+    """
+    try:
+        from google.protobuf import message_factory
+    except Exception:
+        return
+
+    if hasattr(message_factory.MessageFactory, "GetPrototype"):
+        return
+
+    def _get_prototype(self, descriptor):  # type: ignore[unused-argument]
+        return message_factory.GetMessageClass(descriptor)
+
+    message_factory.MessageFactory.GetPrototype = _get_prototype  # type: ignore[attr-defined]
+
 
 def setup_environment() -> None:
     """
@@ -12,6 +32,14 @@ def setup_environment() -> None:
     os.environ["TF_USE_LEGACY_KERAS"] = "1"
     os.environ["KERAS_BACKEND"] = "tensorflow"
     os.environ["KERAS_FORCE_REBATCH"] = "1"
+    # TFMOT + tf_keras may emit false-positive initializer compatibility warnings
+    # when objects come from keras.src. This warning is non-fatal and noisy.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"The `keras\.initializers\.serialize\(\)` API should only be used.*",
+        module=r"tf_keras\.src\.initializers(\.__init__)?",
+    )
+    _patch_protobuf_message_factory()
     
     # 2. 設定基礎 Logging
     logging.basicConfig(

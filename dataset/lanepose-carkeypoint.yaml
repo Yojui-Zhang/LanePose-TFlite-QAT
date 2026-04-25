@@ -1,54 +1,54 @@
 # dataset path
 train: 
 
-  # - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/20220830/images
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/20240321_night/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/20220830/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/20240321_night/images
   - /media/es912/新增磁碟區/M11313027/Dataset/acc_dataset/images
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/s3_20230803/images
+  - /media/es912/新增磁碟區/M11313027/Dataset/s3_20230803/images
 
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/Traffic_dataset_20240720_345_k/images
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/yolov8data2_20250804/images
+  - /media/es912/新增磁碟區/M11313027/Dataset/Traffic_dataset_20240720_345_k/images
+  - /media/es912/新增磁碟區/M11313027/Dataset/yolov8data2_20250804/images
 
 
 # # ============================================================= No Check =================================================================
 
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/20240116-nocheck/images
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/20240603-nocheck/images
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/20240803-nocheck/images
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/20240923-BigSun-nocheck/images
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/20241010-nocheck/images
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/20241126-Bridge-nocheck/images
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/20250213-nocheck/images
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/vecow-demo-nocheck/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/20240116-nocheck/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/20240603-nocheck/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/20240803-nocheck/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/20240923-BigSun-nocheck/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/20241010-nocheck/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/20241126-Bridge-nocheck/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/20250213-nocheck/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/vecow-demo-nocheck/images
 
 
 # # ============================================================= Rotate Enhance =================================================================
 
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/20220830_enhance/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/20220830_enhance/images
 
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/acc_dataset_enhance/images
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/s3_20230803_enhance/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/acc_dataset_enhance/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/s3_20230803_enhance/images
   
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/Traffic_dataset_20240720_345_k_enhance/images
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/yolov8data2_20250804_enhance/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/Traffic_dataset_20240720_345_k_enhance/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/yolov8data2_20250804_enhance/images
   
 # # ============================================================= Stable Diffsion Enhance =================================================================
 
-# #   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/20220830-Stable_Diffusion-enhance/images
-# #   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/20240321_night-Stable_Diffusion-enhance/images
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/acc_dataset-Stable_Diffusion-enhance/images
-#   - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/s3_20230803-Stable_Diffusion-enhance/images
+#   - /media/es912/新增磁碟區/M11313027/Dataset/20220830-Stable_Diffusion-enhance/images
+#   - /media/es912/新增磁碟區/M11313027/Dataset/20240321_night-Stable_Diffusion-enhance/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/acc_dataset-Stable_Diffusion-enhance/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/s3_20230803-Stable_Diffusion-enhance/images
 
 
 val: 
 
-  # - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/20220830/images
-  # - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/20240321_night/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/20220830/images
+  # - /media/es912/新增磁碟區/M11313027/Dataset/20240321_night/images
   - /media/es912/新增磁碟區/M11313027/Dataset/acc_dataset/images
-  # - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/s3_20230803/images
+  - /media/es912/新增磁碟區/M11313027/Dataset/s3_20230803/images
   
-  # - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/Traffic_dataset_20240720_345_k/images
-  # - /home/jovyan/datasets/es912/B10913118/_Dataset/KeyPoint/15point_7class_carkeypoint/yolov8data2_20250804/images
+  - /media/es912/新增磁碟區/M11313027/Dataset/Traffic_dataset_20240720_345_k/images
+  - /media/es912/新增磁碟區/M11313027/Dataset/yolov8data2_20250804/images
 
 
 # Keypoints
