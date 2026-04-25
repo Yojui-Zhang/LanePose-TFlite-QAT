@@ -1,3 +1,6 @@
+import sys
+sys.path.append('/usr/lib/python3.10/dist-packages') # 讓 TensorRT 墊底載入
+
 import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
@@ -112,8 +115,8 @@ def generate_cache(onnx_path, data_dir, cache_file):
     print(f"成功生成 {cache_file}！")
 
 if __name__ == "__main__":
-    ONNX_MODEL = "cira_pose_baseline_original_trt.onnx"
-    DATASET_DIR = "/home/Disk/Desktop/AI/dataset/lanepose/acc_datasets/images"
-    CACHE_OUTPUT = "CIRA-Baseline-calibration.cache"
+    ONNX_MODEL = "CIRA_AS-QAT-trained_trt.onnx"
+    DATASET_DIR = "/media/nvidia/SSD/M11313027/Dataset/Transform-A"
+    CACHE_OUTPUT = "CIRA_AS-QAT-calibration.cache"
     
     generate_cache(ONNX_MODEL, DATASET_DIR, CACHE_OUTPUT)
